@@ -61,8 +61,8 @@ def extract_book_pages(path: str, fmt: str):
 
     try:
         with TemporaryDirectory() as tdir:
-            book_fmt, opfpath, input_fmt = extract_book(path, tdir, log=_default_log)
-            container = SimpleContainer(tdir, opfpath, _default_log)
+            book_fmt, opfpath, input_fmt = extract_book(path, tdir)
+            container = SimpleContainer(tdir, opfpath)
             pages = []
             for name, is_linear in container.spine_names:
                 root = container.parsed(name)
@@ -75,21 +75,24 @@ def extract_book_pages(path: str, fmt: str):
         return ('error', f'extraction failed: {e}')
 
 
-def pick_format(formats: dict[str, str], priority: list[str]) -> tuple[str, str] | None:
-    """Choose the best (fmt, path) from a book's formats using the priority list."""
+def pick_format(formats, priority: list[str]) -> str | None:
+    """Choose the best format name from a book's available formats.
+
+    `formats` is the tuple of format names returned by ``new_api.formats()``.
+    Returns the chosen format name (string), or None if there are none.
+    """
     if not formats:
         return None
-    by_fmt = {f.upper(): (f, p) for f, p in formats.items()}
+    have = {f.upper(): f for f in formats}
     for want in priority:
-        hit = by_fmt.get(want.upper())
-        if hit:
+        hit = have.get(want.upper())
+        if hit is not None:
             return hit
-    # fallback: first available extractable-ish format
-    for f, p in formats.items():
+    # fallback: first available extractable-ish format (we can't parse LSF/LRF)
+    for f in formats:
         if f.upper() not in {'LSF', 'LRF'}:
-            return (f, p)
-    f, p = next(iter(formats.items()))
-    return (f, p)
+            return f
+    return next(iter(formats))
 
 
 class Indexer(threading.Thread):
@@ -132,10 +135,9 @@ class Indexer(threading.Thread):
                 failed.pop(str(bid), None)
         for bid in lib_ids:
             formats = api.formats(bid)
-            pick = pick_format(formats, settings.format_priority)
-            if pick is None:
+            fmt = pick_format(formats, settings.format_priority)
+            if fmt is None:
                 continue
-            fmt, path = pick
             try:
                 md = api.format_metadata(bid, fmt)
             except Exception:
@@ -199,11 +201,10 @@ class Indexer(threading.Thread):
             self.store.clear_book(book_id)
             self.store.remove_dirty(book_id)
             return
-        pick = pick_format(formats, settings.format_priority)
-        if pick is None:
+        fmt = pick_format(formats, settings.format_priority)
+        if fmt is None:
             self.store.remove_dirty(book_id)
             return
-        fmt, path = pick
         try:
             md = api.format_metadata(book_id, fmt)
         except Exception:
@@ -211,7 +212,21 @@ class Indexer(threading.Thread):
 
         self.current_book_id = book_id
         self._status('extracting', book_id, fmt=fmt)
-        kind, payload = extract_book_pages(path, fmt)
+        try:
+            path = api.format(book_id, fmt, as_path=True) or None
+        except Exception as e:
+            self._fail(book_id, f'could not read {fmt} file: {e}')
+            return
+        if not path:
+            self._fail(book_id, f'no readable {fmt} file for book {book_id}')
+            return
+        try:
+            kind, payload = extract_book_pages(path, fmt)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         if kind == 'error':
             self._fail(book_id, payload)
             return
@@ -290,12 +305,12 @@ class Indexer(threading.Thread):
 
         api = self.get_new_api()
         settings = self.settings_provider()
-        formats = api.formats(book_id) if api is not None else {}
-        pick = pick_format(formats, settings.format_priority) if formats else None
-        if pick is not None and api is not None:
+        formats = api.formats(book_id) if api is not None else ()
+        fmt = pick_format(formats, settings.format_priority) if formats else None
+        if fmt is not None and api is not None:
             try:
-                md = api.format_metadata(book_id, pick[0])
-                self.store.set_meta(file_info_key(book_id), f'{pick[0]}|{md.get("size")}|{md.get("mtime")}')
+                md = api.format_metadata(book_id, fmt)
+                self.store.set_meta(file_info_key(book_id), f'{fmt}|{md.get("size")}|{md.get("mtime")}')
             except Exception:
                 pass
         failed = {}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import threading
 
-from qt.core import QToolButton, pyqtSignal
+from qt.core import QDialog, QDialogButtonBox, QTextEdit, QToolButton, QTimer, QVBoxLayout, pyqtSignal
 
 from calibre.gui2.actions import InterfaceAction
 from calibre.utils.localization import _
@@ -32,6 +32,45 @@ def _plugin_icon(name):
     return None
 
 
+class StatusDialog(QDialog):
+    '''Live index-status view: fixed-size window, scrollable text, 1s refresh.'''
+
+    def __init__(self, parent, action):
+        super().__init__(parent)
+        self.action = action
+        self.setWindowTitle(_('Semantic search status'))
+        self.resize(680, 440)
+        lay = QVBoxLayout(self)
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        lay.addWidget(self.text)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.accepted.connect(self.close)
+        bb.rejected.connect(self.close)
+        lay.addWidget(bb)
+        self.timer = QTimer(self)
+        self.timer.setInterval(1000)
+        self.timer.timeout.connect(self.refresh)
+        self.refresh()
+        self.timer.start()
+
+    def refresh(self):
+        try:
+            text = '\n'.join(self.action.status_lines())
+        except Exception as e:
+            text = f'status unavailable: {e!r}'
+        if text == self.text.toPlainText():
+            return
+        sb = self.text.verticalScrollBar()
+        pos = sb.value() if sb is not None else 0
+        self.text.setPlainText(text)
+        self.text.verticalScrollBar().setValue(pos)
+
+    def closeEvent(self, e):
+        self.timer.stop()
+        super().closeEvent(e)
+
+
 class SemanticSearchAction(InterfaceAction):
     name = 'Semantic Search'
     action_spec = (_('Semantic search'), 'semantic_search.png', _('Search books by meaning (semantic search)'), None)
@@ -47,6 +86,8 @@ class SemanticSearchAction(InterfaceAction):
         self.indexer = None
         self.search_action = None
         self._reconcile_thread = None
+        self._last_status = None
+        self._status_dialog = None
         self._status_sig.connect(self._on_status)
 
     # -- lifecycle -----------------------------------------------------------
@@ -163,6 +204,7 @@ class SemanticSearchAction(InterfaceAction):
     # -- status ----------------------------------------------------------------
 
     def _on_status(self, d):
+        self._last_status = d
         state = d.get('state', '')
         if state == 'idle':
             tip = _('Search books by meaning')
@@ -204,22 +246,61 @@ class SemanticSearchAction(InterfaceAction):
                 d.edit.setText(q)
         d.show()
 
-    def show_status(self):
-        if not self._ensure_started():
-            return
+    def status_lines(self):
+        if self.store is None:
+            return ['Store not started.']
         books = self.store.indexed_books()
         dirty = self.store.dirty_book_ids()
         n_chunks = sum(b['n_chunks'] for b in books)
-        lines = [
-            f'Indexed books: {len(books)}',
-            f'Total chunks: {n_chunks}',
-            f'Pending (dirty): {len(dirty)}',
-        ]
-        if self.indexer is not None and self.indexer.current_book_id is not None:
-            lines.append(f'Currently indexing book id {self.indexer.current_book_id}')
-        from calibre.gui2 import info_dialog
+        api = self._api()
+        lines = [f'Indexed books: {len(books)}']
+        if api is not None:
+            try:
+                lines.append(f'Library books: {len(api.all_book_ids())}')
+            except Exception:
+                pass
+        lines += [f'Total chunks: {n_chunks}', f'Pending (dirty): {len(dirty)}']
+        st = self._last_status
+        if st and st.get('state') in ('extracting', 'embedding', 'saving'):
+            line = f"Currently indexing book id {st.get('book_id')}: {st.get('state')}"
+            if st.get('total'):
+                line += f" {st.get('done')}/{st.get('total')}"
+            lines.append(line)
+        import json
 
-        info_dialog(self.gui, 'Semantic search status', '\n'.join(lines), show=True)
+        try:
+            failed = json.loads(self.store.get_meta('failed', '{}') or '{}')
+        except Exception:
+            failed = {}
+        if failed and api is not None:
+            lines.append('')
+            lines.append(f'Failed books: {len(failed)}')
+            for bid_str, info in sorted(failed.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
+                try:
+                    bid = int(bid_str)
+                except ValueError:
+                    continue
+                title = None
+                try:
+                    md = api.get_metadata(bid)
+                    title = getattr(md, 'title', None)
+                except Exception:
+                    pass
+                label = title or f'book {bid}'
+                lines.append(f'{label} [id {bid}]: {(info or {}).get("error", "unknown error")}')
+        return lines
+
+    def show_status(self):
+        if not self._ensure_started():
+            return
+        d = self._status_dialog
+        if d is not None and d.isVisible():
+            d.raise_()
+            d.activateWindow()
+            return
+        d = StatusDialog(self.gui, self)
+        self._status_dialog = d
+        d.show()
 
     def reindex_all(self):
         if not self._ensure_started():
@@ -234,10 +315,10 @@ class SemanticSearchAction(InterfaceAction):
             formats = api.formats(bid)
             if not formats:
                 continue
-            pick = pick_format(formats, settings.format_priority)
-            if pick is None:
+            fmt = pick_format(formats, settings.format_priority)
+            if fmt is None:
                 continue
-            self.store.add_dirty(bid, pick[0], 'reindex')
+            self.store.add_dirty(bid, fmt, 'reindex')
 
     def extract_attributes_menu(self):
         from calibre.gui2 import info_dialog
