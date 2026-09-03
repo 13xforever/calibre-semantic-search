@@ -20,11 +20,15 @@ attributes in custom columns.
 - A local OpenAI-compatible embedding server, e.g. Ollama:
   - `ollama pull nomic-embed-text` (or any model you like)
   - default URL: `http://localhost:11434`
-- Optional: an AI provider configured under *Preferences > AI* (any
-  text-to-text plugin) for attribute extraction.
+- Optional: a text-to-text AI provider configured under *Preferences > Plugins
+  > AI Provider* (e.g. OpenAI compatible) for attribute extraction.
 - Optional: the `lancedb` Python package if you want the LanceDB vector
-  backend (`pip install lancedb`). The default SQLite backend needs nothing
-  extra; numpy is used automatically if present.
+  backend. The default SQLite backend needs nothing extra; numpy is used
+  automatically if present. You can install lancedb yourself (`pip install
+  lancedb`, into calibre's Python) or from inside the plugin: *Settings >
+  Indexing* shows an **Install lancedb...** button that runs pip for you and
+  falls back to a `--user` install on permission errors. Restart calibre after
+  installing.
 
 ## Install
 

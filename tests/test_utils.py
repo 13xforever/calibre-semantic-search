@@ -1,3 +1,4 @@
+import sys
 import unittest
 
 import os as _os, sys as _sys
@@ -67,6 +68,53 @@ class TestSettingsRoundtrip(unittest.TestCase):
         en = s.enabled_attributes()
         self.assertNotIn(s.attributes[0].name, [a.name for a in en])
         self.assertEqual(len(en), len(s.attributes) - 1)
+
+
+class TestLanceInstall(unittest.TestCase):
+    def test_pip_command(self):
+        cmd = utils.pip_install_command()
+        self.assertEqual(cmd[:4], [sys.executable, '-m', 'pip', 'install'])
+        self.assertEqual(cmd[-1], 'lancedb')
+
+    def _fake_popen(self, results):
+        calls = []
+
+        class FakeProc:
+            def __init__(self, rc, lines):
+                self._rc = rc
+                self.stdout = iter(lines)
+
+            def wait(self):
+                return self._rc
+
+        def popen(cmd, **kw):
+            calls.append(list(cmd))
+            rc, lines = results.pop(0)
+            return FakeProc(rc, lines)
+
+        return popen, calls
+
+    def test_retry_with_user_then_success(self):
+        popen, calls = self._fake_popen([(1, ['error: permission denied']), (0, ['Successfully installed lancedb'])])
+        seen = []
+        ok, msg = utils.install_lancedb(progress=seen.append, _popen=popen)
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('--user', calls[0])
+        self.assertIn('--user', calls[1])
+        self.assertTrue(any('Successfully installed' in l for l in seen))
+
+    def test_both_attempts_fail(self):
+        popen, calls = self._fake_popen([(1, ['first error']), (2, ['still boom'])])
+        ok, msg = utils.install_lancedb(_popen=popen)
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertIn('still boom', msg)
+
+    def test_lancedb_status_shape(self):
+        installed, info = utils.lancedb_status()
+        self.assertIsInstance(installed, bool)
+        self.assertIsInstance(info, str)
 
 
 if __name__ == '__main__':

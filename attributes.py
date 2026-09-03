@@ -138,7 +138,7 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
 
         llm = plugin_for_purpose(AICapabilities.text_to_text)
         if llm is None:
-            raise RuntimeError('no text-to-text AI provider configured (Preferences > AI)')
+            raise RuntimeError('no text-to-text AI provider configured (Preferences > Plugins > AI Provider)')
     colmap = ensure_columns(new_api, settings)
     schema = build_schema_class(fields)
     chunks = _chunks_for_book(store, book_id)

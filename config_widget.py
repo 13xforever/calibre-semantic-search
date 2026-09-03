@@ -10,7 +10,9 @@ from qt.core import (
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QLineEdit,
+    QMessageBox,
     QObject,
     QPlainTextEdit,
     QPushButton,
@@ -19,14 +21,16 @@ from qt.core import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QThread,
     QVBoxLayout,
     QWidget,
     Qt,
+    pyqtSignal,
 )
 
 from calibre.utils.localization import _
 
-from .utils import AttrField, Settings
+from .utils import AttrField, Settings, install_lancedb, lancedb_status
 
 
 class _HelpFilter(QObject):
@@ -42,6 +46,15 @@ class _HelpFilter(QObject):
             if text:
                 self.box.setPlainText(text)
         return False
+
+
+class _LanceInstallWorker(QThread):
+    line = pyqtSignal(str)
+    finished_ok = pyqtSignal(bool, str)
+
+    def run(self):
+        ok, msg = install_lancedb(progress=self.line.emit)
+        self.finished_ok.emit(ok, msg)
 
 
 HELP_DEFAULT = _('Hover over an option to see what it does.')
@@ -133,7 +146,9 @@ HELP_ATTR_DESC = _(
 HELP_ATTR_TABLE = _(
     "Attribute fields extracted by the LLM into calibre custom columns. Toggle 'Enabled', edit names, "
     "types and descriptions, then run 'Extract attributes...' from the Semantic search menu. Changing "
-    'the schema marks affected books for re-extraction.'
+    "the schema marks affected books for re-extraction.\n\n"
+    'Extraction needs a text-to-text AI provider configured under Preferences > Plugins > AI Provider '
+    '(separate from the embedding model). Search and indexing work without it.'
 )
 
 
@@ -141,6 +156,7 @@ class SettingsWidget(QDialog):
     def __init__(self, settings: Settings):
         super().__init__()
         self.s = settings
+        self._worker = None
         self.setWindowTitle(_('Semantic search settings'))
         self.resize(760, 610)
         v = QVBoxLayout(self)
@@ -154,7 +170,6 @@ class SettingsWidget(QDialog):
         self.e_base_url = QLineEdit(self.s.embed.base_url)
         self.e_model = QLineEdit(self.s.embed.model)
         self.e_api_key = QLineEdit(self.s.embed.api_key)
-        self.e_api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.e_batch = QSpinBox()
         self.e_batch.setRange(1, 512)
         self.e_batch.setValue(self.s.embed.batch_size)
@@ -195,6 +210,14 @@ class SettingsWidget(QDialog):
         self.i_attrmode.addItems(['sampled', 'fulltext'])
         self.i_attrmode.setCurrentText(self.s.attr_mode)
         f2.addRow(_('Vector backend:'), self.i_backend)
+        lance_row = QHBoxLayout()
+        self.lance_status = QLabel()
+        self.b_install_lance = QPushButton(_('Install lancedb...'))
+        self.b_install_lance.clicked.connect(self._install_lancedb)
+        lance_row.addWidget(self.lance_status, 1)
+        lance_row.addWidget(self.b_install_lance)
+        f2.addRow('', lance_row)
+        self.i_backend.currentTextChanged.connect(lambda _t: self._update_lance_status())
         f2.addRow(_('Format priority:'), self.i_formats)
         f2.addRow(_('Target chunk size (chars):'), self.i_target)
         f2.addRow(_('Overlap (chars):'), self.i_overlap)
@@ -205,6 +228,13 @@ class SettingsWidget(QDialog):
         # -- Attributes tab ------------------------------------------------------
         att_tab = QWidget()
         av = QVBoxLayout(att_tab)
+        attr_note = QLabel(
+            _('Note: attribute extraction uses the text-to-text LLM configured under '
+              'Preferences > Plugins > AI Provider (any provider). This is separate from the embedding model — '
+              'a chat model such as llama3.1 or qwen2.5 works well.')
+        )
+        attr_note.setWordWrap(True)
+        av.addWidget(attr_note)
         self.attr_table = QTableWidget(len(self.s.attributes), 4)
         self.attr_table.setHorizontalHeaderLabels([_('Enabled'), _('Name'), _('Type'), _('Description')])
         self.attr_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
@@ -259,6 +289,8 @@ class SettingsWidget(QDialog):
         box.rejected.connect(self.reject)
         v.addWidget(box)
 
+        self._update_lance_status()
+
     def _bind_help(self, text: str, *widgets):
         """Give widgets a tooltip and make hovering them update the help box."""
         for w in widgets:
@@ -285,6 +317,74 @@ class SettingsWidget(QDialog):
         r = self.attr_table.currentRow()
         if r >= 0:
             self.attr_table.removeRow(r)
+
+    # -- lancedb install ---------------------------------------------------------
+
+    def _update_lance_status(self):
+        ok, info = lancedb_status()
+        if ok:
+            self.lance_status.setText(_('lancedb {v} detected.').format(v=info))
+            self.b_install_lance.hide()
+            return
+        self.b_install_lance.show()
+        backend = self.i_backend.currentText()
+        if backend == 'lancedb':
+            self.lance_status.setText(_('lancedb is not installed — required for this backend.'))
+        elif backend == 'auto':
+            self.lance_status.setText(_("lancedb is not installed — 'auto' will use SQLite."))
+        else:
+            self.lance_status.setText('')
+
+    def _install_lancedb(self):
+        if self._worker is not None:
+            return
+        self._worker = _LanceInstallWorker()
+        self._worker.line.connect(lambda l: self.lance_status.setText(l[-140:]))
+        self._worker.finished_ok.connect(self._lance_install_done)
+        self.b_install_lance.setEnabled(False)
+        self.lance_status.setText(_("Installing lancedb into calibre's Python — this can take a few minutes..."))
+        self._worker.start()
+
+    def _lance_install_done(self, ok, msg):
+        self._worker = None
+        if ok:
+            import importlib
+
+            importlib.invalidate_caches()
+            self._update_lance_status()
+            QMessageBox.information(
+                self,
+                _('Semantic search'),
+                _('lancedb was installed successfully.\n\nRestart calibre to use the LanceDB backend.'),
+            )
+        else:
+            self.b_install_lance.setEnabled(True)
+            self.lance_status.setText(_('Installation failed.'))
+            QMessageBox.critical(
+                self,
+                _('Semantic search'),
+                _('lancedb could not be installed automatically.\n\n') + msg + '\n\n' + _(
+                    "If this was a permissions error, run calibre as administrator and try again, or install manually "
+                    "into calibre's Python:  pip install lancedb"
+                ),
+            )
+
+    def closeEvent(self, ev):
+        w = self._worker
+        if w is not None and w.isRunning():
+            r = QMessageBox.question(
+                self,
+                _('Semantic search'),
+                _('lancedb is still being installed. Close the dialog anyway?'),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if r == QMessageBox.StandardButton.No:
+                ev.ignore()
+                return
+            w.terminate()
+            w.wait(2000)
+        super().closeEvent(ev)
 
     # -- collect -----------------------------------------------------------------
 

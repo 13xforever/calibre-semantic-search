@@ -1,6 +1,8 @@
 '''Shared helpers: settings model and preferences access.'''
 
 import json
+import subprocess
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
@@ -124,3 +126,52 @@ def save_settings(prefs, settings: Settings) -> None:
         prefs(PREF_KEY, blob)
     else:
         prefs[PREF_KEY] = blob
+
+
+# -- lancedb installation --------------------------------------------------------
+
+
+def lancedb_status() -> tuple[bool, str]:
+    """Return (installed, version_or_error_message)."""
+    try:
+        import lancedb
+
+        return True, getattr(lancedb, '__version__', 'unknown')
+    except ImportError as e:
+        return False, str(e)
+
+
+def pip_install_command(extra_args=()) -> list[str]:
+    return [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *extra_args, 'lancedb']
+
+
+def install_lancedb(progress=None, _popen=None) -> tuple[bool, str]:
+    """Install lancedb into calibre's own Python via pip.
+
+    Tries a normal install first, then falls back to --user (for permission
+    errors). progress(line) receives pip output lines as they arrive.
+    Returns (ok, message).
+    """
+    popen = _popen or subprocess.Popen
+    attempts = (pip_install_command(), pip_install_command(('--user',)))
+    last_err = 'no install attempt was made'
+    for cmd in attempts:
+        try:
+            proc = popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except Exception as e:
+            last_err = f'{type(e).__name__}: {e}'
+            continue
+        tail: list[str] = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            if progress is not None and line:
+                progress(line)
+            if line:
+                tail.append(line)
+                if len(tail) > 5:
+                    tail.pop(0)
+        rc = proc.wait()
+        if rc == 0:
+            return True, 'lancedb installed.'
+        last_err = '\n'.join(tail) or f'pip exited with code {rc}'
+    return False, last_err
