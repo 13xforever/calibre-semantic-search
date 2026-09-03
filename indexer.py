@@ -12,7 +12,7 @@ import threading
 import time
 import unicodedata
 
-from .chunker import chunks_from_pages, split_plain_text
+from .chunker import chunks_from_pages, max_chunk_chars, split_plain_text
 from .store import VectorStore
 
 
@@ -222,10 +222,11 @@ class Indexer(threading.Thread):
             self.store.remove_dirty(book_id)
             return
 
+        eff_target = min(settings.target_chars, max_chunk_chars(settings.embed_context_tokens))
         if kind == 'pages':
-            chunks = chunks_from_pages(payload, settings.target_chars, settings.overlap_chars)
+            chunks = chunks_from_pages(payload, eff_target, settings.overlap_chars)
         else:
-            chunks = split_plain_text(payload or '', settings.target_chars, settings.overlap_chars)
+            chunks = split_plain_text(payload or '', eff_target, settings.overlap_chars)
         if settings.max_chunks_per_book > 0:
             chunks = chunks[: settings.max_chunks_per_book]
         if not chunks:

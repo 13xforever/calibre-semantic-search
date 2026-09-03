@@ -31,6 +31,15 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+CHARS_PER_TOKEN = 3.5  # conservative chars-per-token for English text
+MIN_CHUNK_CHARS = 200
+
+
+def max_chunk_chars(context_tokens: int) -> int:
+    """Largest chunk size (chars) that fits within the embedding model's input limit."""
+    return max(MIN_CHUNK_CHARS, int((context_tokens - 64) * CHARS_PER_TOKEN))
+
+
 def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], target_chars: int, overlap_chars: int) -> list[Chunk]:
     """Group flat paragraph lists into chunks of ~target_chars with char overlap.
 

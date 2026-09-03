@@ -60,10 +60,11 @@ class _LanceInstallWorker(QThread):
 HELP_DEFAULT = _('Hover over an option to see what it does.')
 
 HELP_SERVER_URL = _(
-    'Base URL of an OpenAI-compatible embedding server (the plugin calls POST /v1/embeddings).\n'
+    'Base URL of an OpenAI-compatible embedding server (the plugin calls POST /v1/embeddings on it).\n'
     'Ollama: http://localhost:11434 (default)\n'
-    'LM Studio: http://localhost:1234/v1\n'
-    'vLLM / Unsloth: the root URL of your server.'
+    'LM Studio: http://localhost:1234\n'
+    'Unsloth / vLLM: the root URL of your server, e.g. http://127.0.0.1:8888\n'
+    'A trailing /v1 is tolerated and ignored.'
 )
 
 HELP_MODEL = _(
@@ -109,12 +110,19 @@ HELP_FORMATS = _(
 
 HELP_TARGET = _(
     'Approximate size of each search chunk in characters (default 1000). Larger chunks give more '
-    'context but coarser matches; smaller chunks are the reverse. Changing this requires re-indexing.'
+    'context but coarser matches; smaller chunks are the reverse. Capped by the embedding model '
+    'context limit below. Changing this requires re-indexing.'
 )
 
 HELP_OVERLAP = _(
     'Number of characters repeated between adjacent chunks, so sentences that fall on a chunk '
     'boundary can still be matched.'
+)
+
+HELP_EMBED_CONTEXT = _(
+    "The maximum input length of your embedding model, in tokens (shown by Ollama / LM Studio, e.g. "
+    "8192 for nomic-embed-text). The target chunk size is capped so no chunk exceeds this limit — "
+    "set it to your model's max sequence length to avoid oversized-chunk errors."
 )
 
 HELP_MAX_CHUNKS = _(
@@ -123,10 +131,10 @@ HELP_MAX_CHUNKS = _(
 )
 
 HELP_ATTR_MODE = _(
-    'sampled: one LLM call over an evenly spaced sample of the book (~12k chars) — fast and cheap, '
-    'good for most books.\n'
-    'fulltext: map-reduce over the entire text — slower and uses more tokens, but catches details '
-    'that only appear deep in long books.'
+    'sampled: one LLM call over an evenly spaced sample of the book (sized from the context limit below) — '
+    'fast and cheap, good for most books.\n'
+    'fulltext: map-reduce over the entire text in groups sized from the context limit — slower and uses '
+    'more tokens, but catches details that only appear deep in long books.'
 )
 
 HELP_ATTR_ENABLED = _(
@@ -149,6 +157,13 @@ HELP_ATTR_TABLE = _(
     "the schema marks affected books for re-extraction.\n\n"
     'Extraction needs a text-to-text AI provider configured under Preferences > Plugins > AI Provider '
     '(separate from the embedding model). Search and indexing work without it.'
+)
+
+HELP_CONTEXT = _(
+    "The context window size of your attribute-extraction model, in tokens (the limit shown by Ollama / "
+    "LM Studio for the model). The sample size (sampled mode) and group size (fulltext mode) are derived "
+    "from this: a fixed overhead is reserved for the prompt and output, and the remainder is the book text "
+    "per call. Set it to your model's max context, e.g. 8192 for llama3.1."
 )
 
 
@@ -202,6 +217,10 @@ class SettingsWidget(QDialog):
         self.i_overlap = QSpinBox()
         self.i_overlap.setRange(0, 2000)
         self.i_overlap.setValue(self.s.overlap_chars)
+        self.i_embed_ctx = QSpinBox()
+        self.i_embed_ctx.setRange(128, 131072)
+        self.i_embed_ctx.setSingleStep(128)
+        self.i_embed_ctx.setValue(self.s.embed_context_tokens)
         self.i_maxchunks = QSpinBox()
         self.i_maxchunks.setRange(0, 100000)
         self.i_maxchunks.setValue(self.s.max_chunks_per_book)
@@ -221,6 +240,7 @@ class SettingsWidget(QDialog):
         f2.addRow(_('Format priority:'), self.i_formats)
         f2.addRow(_('Target chunk size (chars):'), self.i_target)
         f2.addRow(_('Overlap (chars):'), self.i_overlap)
+        f2.addRow(_('Embedding context limit (tokens):'), self.i_embed_ctx)
         f2.addRow(_('Max chunks per book:'), self.i_maxchunks)
         f2.addRow(_('Attribute extraction mode:'), self.i_attrmode)
         tabs.addTab(idx_tab, _('Indexing'))
@@ -235,6 +255,15 @@ class SettingsWidget(QDialog):
         )
         attr_note.setWordWrap(True)
         av.addWidget(attr_note)
+        ctx_row = QHBoxLayout()
+        ctx_row.addWidget(QLabel(_('Model context limit (tokens):')))
+        self.e_ctx = QSpinBox()
+        self.e_ctx.setRange(512, 131072)
+        self.e_ctx.setSingleStep(512)
+        self.e_ctx.setValue(self.s.attr_context_tokens)
+        ctx_row.addWidget(self.e_ctx)
+        ctx_row.addStretch(1)
+        av.addLayout(ctx_row)
         self.attr_table = QTableWidget(len(self.s.attributes), 4)
         self.attr_table.setHorizontalHeaderLabels([_('Enabled'), _('Name'), _('Type'), _('Description')])
         self.attr_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
@@ -276,6 +305,7 @@ class SettingsWidget(QDialog):
         B(HELP_FORMATS, self.i_formats, f2.labelForField(self.i_formats))
         B(HELP_TARGET, self.i_target, f2.labelForField(self.i_target))
         B(HELP_OVERLAP, self.i_overlap, f2.labelForField(self.i_overlap))
+        B(HELP_EMBED_CONTEXT, self.i_embed_ctx, f2.labelForField(self.i_embed_ctx))
         B(HELP_MAX_CHUNKS, self.i_maxchunks, f2.labelForField(self.i_maxchunks))
         B(HELP_ATTR_MODE, self.i_attrmode, f2.labelForField(self.i_attrmode))
         for col, key in enumerate((HELP_ATTR_ENABLED, HELP_ATTR_NAME, HELP_ATTR_TYPE, HELP_ATTR_DESC)):
@@ -283,6 +313,7 @@ class SettingsWidget(QDialog):
             if item is not None:
                 item.setToolTip(key)
         B(HELP_ATTR_TABLE, self.attr_table)
+        B(HELP_CONTEXT, self.e_ctx)
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.accepted.connect(self._collect_and_accept)
@@ -401,8 +432,10 @@ class SettingsWidget(QDialog):
         s.format_priority = fmts or list(s.format_priority)
         s.target_chars = self.i_target.value()
         s.overlap_chars = self.i_overlap.value()
+        s.embed_context_tokens = self.i_embed_ctx.value()
         s.max_chunks_per_book = self.i_maxchunks.value()
         s.attr_mode = self.i_attrmode.currentText()
+        s.attr_context_tokens = self.e_ctx.value()
         attrs = []
         for r in range(self.attr_table.rowCount()):
             name = (self.attr_table.item(r, 1).text() if self.attr_table.item(r, 1) else '').strip().lower()

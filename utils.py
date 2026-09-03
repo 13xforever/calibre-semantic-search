@@ -71,8 +71,10 @@ class Settings:
     format_priority: list[str] = field(default_factory=lambda: list(DEFAULT_FORMAT_PRIORITY))
     target_chars: int = 1000
     overlap_chars: int = 150
+    embed_context_tokens: int = 8192  # embedding model max input (tokens); caps the chunk size
     max_chunks_per_book: int = 0  # 0 = unlimited
     attr_mode: str = 'sampled'  # sampled | fulltext (map-reduce)
+    attr_context_tokens: int = 8192  # model context window (tokens); sample/group sizes derive from this
     attributes: list[AttrField] = field(default_factory=lambda: [f.clone() for f in DEFAULT_ATTRIBUTES])
 
     def enabled_attributes(self) -> list[AttrField]:
@@ -86,7 +88,7 @@ def _settings_from_dict(data: dict[str, Any]) -> Settings:
     embed = data.get('embed')
     if isinstance(embed, dict):
         ans.embed = EmbedSettings(**{k: v for k, v in embed.items() if k in {f.name for f in fields(EmbedSettings)}})
-    for key in ('vector_backend', 'format_priority', 'target_chars', 'overlap_chars', 'max_chunks_per_book', 'attr_mode'):
+    for key in ('vector_backend', 'format_priority', 'target_chars', 'overlap_chars', 'embed_context_tokens', 'max_chunks_per_book', 'attr_mode', 'attr_context_tokens'):
         if key in data:
             setattr(ans, key, data[key])
     attrs = data.get('attributes')

@@ -7,6 +7,17 @@ from util import load
 chunker = load('chunker')
 
 
+class TestMaxChunkChars(unittest.TestCase):
+    def test_larger_context_gives_larger_cap(self):
+        self.assertGreater(chunker.max_chunk_chars(8192), chunker.max_chunk_chars(512))
+
+    def test_derivation(self):
+        self.assertEqual(chunker.max_chunk_chars(8192), int((8192 - 64) * chunker.CHARS_PER_TOKEN))
+
+    def test_floor(self):
+        self.assertGreaterEqual(chunker.max_chunk_chars(0), chunker.MIN_CHUNK_CHARS)
+
+
 class TestGroupParagraphs(unittest.TestCase):
     def test_single_chunk(self):
         paras = ['hello world', 'second para']

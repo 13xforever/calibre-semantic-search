@@ -110,6 +110,13 @@ class SemanticSearchDialog(QDialog):
         q = self.edit.text().strip()
         if not q or self.worker is not None:
             return
+        try:
+            indexed = [b for b in self.store.indexed_books() if b['n_chunks'] > 0]
+        except Exception:
+            indexed = []
+        if not indexed:
+            self.status_label.setText(_('No books indexed yet — run indexing first (Semantic search menu).'))
+            return
         settings = self.action.get_settings()
         from .embed_client import EmbedClient
 

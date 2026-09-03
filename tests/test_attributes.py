@@ -93,6 +93,20 @@ class TestSampling(unittest.TestCase):
         self.assertIn('c', groups[1])
 
 
+class TestBudget(unittest.TestCase):
+    def test_larger_context_gives_larger_budget(self):
+        self.assertGreater(attributes.text_budget_chars(8192), attributes.text_budget_chars(4096))
+
+    def test_derivation_formula(self):
+        self.assertEqual(
+            attributes.text_budget_chars(8192),
+            int((8192 - attributes.OVERHEAD_TOKENS) * attributes.CHARS_PER_TOKEN),
+        )
+
+    def test_floor_for_tiny_context(self):
+        self.assertGreaterEqual(attributes.text_budget_chars(0), attributes.MIN_TEXT_CHARS)
+
+
 class TestBuildSchema(unittest.TestCase):
     def test_annotations(self):
         cls = attributes.build_schema_class(_FIELDS)
@@ -131,6 +145,8 @@ class TestExtract(unittest.TestCase):
         settings = utils.Settings()
         settings.attributes = [f.clone() for f in _FIELDS]
         settings.attr_mode = 'fulltext'
+        # 3000 tokens -> ~6916 char budget, so [5000,5000,100] splits into 2 groups
+        settings.attr_context_tokens = 3000
         attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
         try:
             values = attributes.extract_book_attributes(2, api, store, settings, llm=llm)

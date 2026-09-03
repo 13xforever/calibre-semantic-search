@@ -9,8 +9,15 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any, Optional
 
-SAMPLE_CHARS = 12000
-MAP_CHUNK_CHARS = 8000
+DEFAULT_CONTEXT_TOKENS = 8192
+OVERHEAD_TOKENS = 1024  # reserved for prompt + field schema + output + safety margin
+CHARS_PER_TOKEN = 3.5  # conservative chars-per-token for English text
+MIN_TEXT_CHARS = 2000  # floor so a tiny context limit still yields a usable sample
+
+
+def text_budget_chars(context_tokens: int) -> int:
+    """Book-text character budget per LLM call, derived from the model's context limit."""
+    return max(MIN_TEXT_CHARS, int((context_tokens - OVERHEAD_TOKENS) * CHARS_PER_TOKEN))
 
 
 def column_key(label: str) -> str:
@@ -62,8 +69,10 @@ def _chunks_for_book(store, book_id: int):
     return store.book_chunks_text(book_id)
 
 
-def sample_text(chunks: list[str], max_chars: int = SAMPLE_CHARS) -> str:
+def sample_text(chunks: list[str], max_chars: int | None = None) -> str:
     """Evenly sample chunks across the book, capped at max_chars."""
+    if max_chars is None:
+        max_chars = text_budget_chars(DEFAULT_CONTEXT_TOKENS)
     if not chunks:
         return ''
     total = sum(len(c) for c in chunks)
@@ -81,7 +90,9 @@ def sample_text(chunks: list[str], max_chars: int = SAMPLE_CHARS) -> str:
     return '\n\n'.join(out)
 
 
-def _split_for_map(chunks: list[str], group_chars: int = MAP_CHUNK_CHARS):
+def _split_for_map(chunks: list[str], group_chars: int | None = None):
+    if group_chars is None:
+        group_chars = text_budget_chars(DEFAULT_CONTEXT_TOKENS)
     groups, cur, used = [], [], 0
     for c in chunks:
         if cur and used + len(c) > group_chars:
@@ -144,10 +155,11 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
     chunks = _chunks_for_book(store, book_id)
     if not chunks:
         return {}
+    budget = text_budget_chars(settings.attr_context_tokens)
 
     values: dict[str, Any] = {}
     if settings.attr_mode == 'fulltext':
-        groups = _split_for_map(chunks)
+        groups = _split_for_map(chunks, budget)
         partials = []
         for i, g in enumerate(groups):
             if progress_cb:
@@ -173,7 +185,7 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
                     merged[f.name] = nv  # keep last non-empty
         values = merged
     else:
-        text = sample_text(chunks, SAMPLE_CHARS)
+        text = sample_text(chunks, budget)
         res = llm.generate_structured_output(_prompt_for(text, fields), schema, 'You are extracting book attributes. Use only information actually present in the text.')
         if res.exception is not None:
             raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')

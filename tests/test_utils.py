@@ -28,6 +28,7 @@ class TestSettingsRoundtrip(unittest.TestCase):
         s.embed.model = 'bge-m3'
         s.vector_backend = 'lancedb'
         s.target_chars = 777
+        s.embed_context_tokens = 4096
         s.attr_mode = 'fulltext'
         s.attributes[0].enabled = False
         utils.save_settings(set_, s)
@@ -37,6 +38,7 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertEqual(s2.embed.model, 'bge-m3')
         self.assertEqual(s2.vector_backend, 'lancedb')
         self.assertEqual(s2.target_chars, 777)
+        self.assertEqual(s2.embed_context_tokens, 4096)
         self.assertEqual(s2.attr_mode, 'fulltext')
         self.assertFalse(s2.attributes[0].enabled)
         self.assertTrue(s2.attributes[1].enabled)

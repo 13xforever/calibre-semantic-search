@@ -48,9 +48,12 @@ attributes in custom columns.
 ## Usage
 
 1. **Settings** — point *Embeddings* at your server URL + model name, choose
-   chunk size / format priority, and edit the attribute schema on the
-   *Attributes* tab (add/remove fields, toggle them, `text` vs multi-value
-   `tags`). New `tags` fields become multi-value custom columns (`#ss_*`).
+   chunk size / format priority on the *Indexing* tab, and set both context
+   limits (tokens): the **embedding** model's max input (caps chunk size) and
+   the attribute model's window (sizes the sample/fulltext groups). Edit the
+   attribute schema on the *Attributes* tab (add/remove fields, toggle them,
+   `text` vs multi-value `tags`). New `tags` fields become multi-value custom
+   columns (`#ss_*`).
 2. On first start (and whenever books are added/changed) the indexer queues
    books automatically: extract -> chunk -> embed -> store. Watch progress in
    *Index status*.

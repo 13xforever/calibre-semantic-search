@@ -15,11 +15,22 @@ class _Handler(BaseHTTPRequestHandler):
     fail_times = 0
     seen_auth = None
     echo = False
+    fixed_status = 0  # if non-zero, always answer with this status + fixed_body
+    fixed_body = b''
+    request_count = 0
 
     def do_POST(self):
+        type(self).request_count += 1
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length))
         type(self).seen_auth = self.headers.get('Authorization')
+        if type(self).fixed_status:
+            resp = type(self).fixed_body
+            self.send_response(type(self).fixed_status)
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+            return
         if type(self).fail_times > 0:
             type(self).fail_times -= 1
             self.send_response(500)
@@ -107,6 +118,28 @@ class TestEmbedClient(unittest.TestCase):
                 c.embed(['x'])
         finally:
             _Handler.fail_times = 0
+
+    def test_base_url_normalization(self):
+        c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}/v1', model='m', max_retries=2)
+        self.assertEqual(c.base_url, f'http://127.0.0.1:{self.port}')
+        out = c.embed(['x'])
+        self.assertEqual(len(out), 1)
+
+    def test_405_fails_fast_without_retry(self):
+        _Handler.fixed_status = 405
+        _Handler.fixed_body = b'{"error": "method not allowed"}'
+        before = _Handler.request_count
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=4)
+            with self.assertRaises(embed_client.EmbedError) as cm:
+                c.embed(['x'])
+            self.assertEqual(_Handler.request_count - before, 1)
+            msg = str(cm.exception)
+            self.assertIn('405', msg)
+            self.assertIn(f'http://127.0.0.1:{self.port}/v1/embeddings', msg)
+        finally:
+            _Handler.fixed_status = 0
+            _Handler.fixed_body = b''
 
     def test_malformed_response(self):
         # point at a server that returns wrong count: reuse port with custom handler not needed;

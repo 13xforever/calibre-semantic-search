@@ -15,7 +15,12 @@ class EmbedError(RuntimeError):
 
 class EmbedClient:
     def __init__(self, base_url: str, model: str, api_key: str = '', timeout: int = 300, max_retries: int = 4):
-        self.base_url = base_url.rstrip('/')
+        base = (base_url or '').strip().rstrip('/')
+        if base.lower().endswith('/v1'):
+            # users often paste the OpenAI-SDK style base (which includes /v1);
+            # we always append /v1/embeddings ourselves, so drop it to avoid /v1/v1/...
+            base = base[:-3].rstrip('/')
+        self.base_url = base
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
@@ -36,11 +41,24 @@ class EmbedClient:
                 req = urllib.request.Request(url, data=body, headers=self._headers(), method='POST')
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     return json.loads(resp.read().decode('utf-8'))
-            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ConnectionError, OSError) as e:
+            except urllib.error.HTTPError as e:
+                detail = ''
+                try:
+                    detail = e.read().decode('utf-8', 'replace').strip()
+                except Exception:
+                    pass
                 last_err = e
-                wait = min(2 ** attempt, 30)
-                time.sleep(wait)
-        raise EmbedError(f'embeddings request failed after {self.max_retries} attempts: {last_err}')
+                if e.code == 429 or 500 <= e.code < 600:
+                    time.sleep(min(2 ** attempt, 30))
+                    continue
+                msg = f'embeddings request failed: HTTP {e.code} for {url}'
+                if detail:
+                    msg += f'; server said: {detail[:300]}'
+                raise EmbedError(msg)
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+                last_err = e
+                time.sleep(min(2 ** attempt, 30))
+        raise EmbedError(f'embeddings request failed after {self.max_retries} attempts to {url}: {last_err}')
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of texts. Returns one vector per input, same order."""
