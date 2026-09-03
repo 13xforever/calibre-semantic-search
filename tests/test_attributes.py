@@ -124,6 +124,14 @@ class TestBuildSchema(unittest.TestCase):
         self.assertIsNone(cls.gender)
         self.assertIsNone(cls.tropes)
 
+    def test_accepts_kwargs_like_calibre_instantiate(self):
+        # calibre.ai.structured.instantiate builds the object via cls(**parsed_json);
+        # a plain class has no such __init__ and raises "takes no arguments".
+        cls = attributes.build_schema_class(_FIELDS)
+        obj = cls(gender='female', tropes=['slow burn'])
+        self.assertEqual(obj.gender, 'female')
+        self.assertEqual(list(obj.tropes), ['slow burn'])
+
 
 class TestExtract(unittest.TestCase):
     def test_sampled_extraction_writes_columns(self):

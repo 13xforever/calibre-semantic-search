@@ -44,7 +44,15 @@ def ensure_columns(new_api, settings) -> dict[str, str]:
 
 
 def build_schema_class(fields):
-    """Build a dynamic structured-output schema class for the given fields."""
+    """Build a dynamic structured-output schema class for the given fields.
+
+    Calibre's structured-output parser instantiates the class via ``cls(**parsed_json)``
+    (see calibre.ai.structured.instantiate) and introspects its annotations/defaults, so
+    it must be a dataclass: that gives us both the keyword-accepting __init__ and the
+    field metadata calibre reads for types and defaults.
+    """
+    import dataclasses
+
     anns: dict[str, Any] = {}
     ns: dict[str, Any] = {'__doc__': 'Attributes extracted from a book.'}
     for f in fields:
@@ -61,7 +69,7 @@ def build_schema_class(fields):
         ns['doc'] = Doc('Extract the following attributes about a book. Use only information actually present in the text; leave fields null when not determinable.')
     except ImportError:
         pass
-    return type('BookAttributes', (), ns)
+    return dataclasses.dataclass(type('BookAttributes', (), ns))
 
 
 def _chunks_for_book(store, book_id: int):
