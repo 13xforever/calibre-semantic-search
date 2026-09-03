@@ -268,7 +268,7 @@ class SettingsWidget(QDialog):
         ctx_row = QHBoxLayout()
         ctx_row.addWidget(QLabel(_('Model context limit (tokens):')))
         self.e_ctx = QSpinBox()
-        self.e_ctx.setRange(512, 131072)
+        self.e_ctx.setRange(512, 10_000_000)
         self.e_ctx.setSingleStep(512)
         self.e_ctx.setValue(self.s.attr_context_tokens)
         ctx_row.addWidget(self.e_ctx)

@@ -351,13 +351,24 @@ class SemanticSearchAction(InterfaceAction):
         dirty = self.store.dirty_book_ids()
         n_chunks = sum(b['n_chunks'] for b in books)
         api = self._api()
-        lines = [f'Indexed books: {len(books)}']
+        lines = []
         if api is not None:
             try:
-                lines.append(f'Library books: {len(api.all_book_ids())}')
+                lines.append(f'Books indexed: {len(books)}/{len(api.all_book_ids())}')
             except Exception:
-                pass
-        lines += [f'Total chunks: {n_chunks}', f'Pending (dirty): {len(dirty)}']
+                lines.append(f'Indexed books: {len(books)}')
+        else:
+            lines.append(f'Indexed books: {len(books)}')
+        lines.append(f'Total chunks: {n_chunks}')
+        st = self._last_status
+        if st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
+            if st.get('state') == 'attributes':
+                line = f"Extracting attributes ({st.get('done')}/{st.get('total')}): {self._book_label(st.get('book_id'), api)}"
+            else:
+                line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
+                if st.get('total'):
+                    line += f" {st.get('done')}/{st.get('total')}"
+            lines.append(line)
         try:
             settings = self.get_settings()
             from .attributes import pending_attribute_books
@@ -365,18 +376,10 @@ class SemanticSearchAction(InterfaceAction):
             with_chunks = [b for b in books if b['n_chunks'] > 0]
             pending_attrs = pending_attribute_books(self.store, settings)
             done_attrs = max(0, len(with_chunks) - len(pending_attrs))
-            lines.append(f'Attributes: {done_attrs}/{len(with_chunks)} books')
+            lines.append(f'Attributes stored: {done_attrs}/{len(with_chunks)} books')
         except Exception:
             pass
-        st = self._last_status
-        if st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
-            if st.get('state') == 'attributes':
-                line = f"Extracting attributes: {st.get('done')}/{st.get('total')}"
-            else:
-                line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
-                if st.get('total'):
-                    line += f" {st.get('done')}/{st.get('total')}"
-            lines.append(line)
+        lines.append(f'Pending: {len(dirty)}')
         import json
 
         try:

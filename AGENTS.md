@@ -31,5 +31,5 @@ calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extrac
 
 ## Gotchas
 
-- The store opens SQLite with `journal_mode=WAL` (`store.py`). Inspecting `semantic-search.db` directly can show **stale/empty tables** (rows live in `-wal` until a checkpoint). Don't "debug" persistence by eyeballing the raw file — verify via the store API or the *Index status* dialog's `Attributes: X/Y books` line.
+- The store opens SQLite with `journal_mode=WAL` (`store.py`). Inspecting `semantic-search.db` directly can show **stale/empty tables** (rows live in `-wal` until a checkpoint). Don't "debug" persistence by eyeballing the raw file — verify via the store API or the *Index status* dialog's `Attributes stored: X/Y books` line.
 - The plugin targets calibre 8.x dev and uses `calibre.ai` structured-output + newAPI internals. A sibling calibre source checkout (e.g. `E:\Work\git\calibre`) is useful for reading those APIs; the plugin itself ships only the files in the ZIP command above.
