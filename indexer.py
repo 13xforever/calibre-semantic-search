@@ -7,6 +7,7 @@ Runs as a daemon thread. All calibre/Qt access happens through the injected
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import threading
 import time
@@ -132,18 +133,84 @@ def file_info_value(fmt: str, md: dict) -> str:
 class Indexer(threading.Thread):
     """Daemon thread draining the store's dirty queue."""
 
-    def __init__(self, store: VectorStore, get_new_api, settings_provider, status_cb=None):
+    def __init__(self, store: VectorStore, get_new_api, settings_provider, status_cb=None, attr_writer=None, attr_done_cb=None):
         super().__init__(name='SemanticSearchIndexer', daemon=True)
         self.store = store
         self.get_new_api = get_new_api
         self.settings_provider = settings_provider
         self.status_cb = status_cb or (lambda s: None)
+        self.attr_writer = attr_writer  # GUI-thread-marshalled new_api for the custom-column mirror
+        self.attr_done_cb = attr_done_cb or (lambda payload: None)
         self.stop_event = threading.Event()
         self.current_book_id: int | None = None
         self._reconcile_lock = threading.Lock()
+        self._attr_requested = threading.Event()
 
     def stop(self):
         self.stop_event.set()
+
+    # -- attribute extraction phase ---------------------------------------------
+
+    def request_attributes(self):
+        """Ask the worker loop to run the attribute-extraction phase."""
+        self._attr_requested.set()
+
+    def _pending_attr_books(self, settings) -> list[int]:
+        from .attributes import pending_attribute_books
+
+        try:
+            failed = set(json.loads(self.store.get_meta('attr_failed', '{}') or '{}').keys())
+        except Exception:
+            failed = set()
+        return [b for b in pending_attribute_books(self.store, settings) if str(b) not in failed]
+
+    def _set_attr_failed(self, book_id: int, error: str | None):
+        try:
+            failed = json.loads(self.store.get_meta('attr_failed', '{}') or '{}')
+        except Exception:
+            failed = {}
+        key = str(book_id)
+        if error is None:
+            failed.pop(key, None)
+        else:
+            failed[key] = {'error': error, 'at': time.time()}
+        self.store.set_meta('attr_failed', json.dumps(failed))
+
+    def _process_attributes(self, pending: list[int], settings, llm=None):
+        """Extract attributes for every book in `pending`, reporting live progress.
+
+        Runs only after the indexing (embedding) queue is empty, so all embedding
+        work is batched before any LLM calls (the two use different models).
+        """
+        if llm is None:
+            try:
+                from calibre.ai import AICapabilities
+                from calibre.ai.prefs import plugin_for_purpose
+
+                llm = plugin_for_purpose(AICapabilities.text_to_text)
+            except Exception as e:
+                self._status('attr_error', error=f'AI provider unavailable: {e}')
+                return
+        if llm is None:
+            self._status('attr_error', error='no text-to-text AI provider configured')
+            return
+
+        from .attributes import extract_book_attributes
+
+        total = len(pending)
+        errors: list[tuple[int, str]] = []
+        for i, bid in enumerate(pending):
+            if self.stop_event.is_set():
+                break
+            self._status('attributes', bid, done=i + 1, total=total)
+            try:
+                extract_book_attributes(bid, self.attr_writer, self.store, settings, llm=llm)
+                self._set_attr_failed(bid, None)
+            except Exception as e:
+                self._set_attr_failed(bid, repr(e))
+                errors.append((bid, repr(e)))
+        self._status('attributes_done', done=total, total=total)
+        self.attr_done_cb((total, errors))
 
     # -- public -------------------------------------------------------------
 
@@ -220,18 +287,29 @@ class Indexer(threading.Thread):
         while not self.stop_event.is_set():
             try:
                 pending = self.store.dirty_book_ids()
-                if not pending:
-                    now = time.time()
-                    if idle_since is None:
-                        idle_since = now
-                    elif now - idle_since >= self.IDLE_RECONCILE_SECONDS:
-                        idle_since = now
-                        self.reconcile()
-                    self.status_cb({'state': 'idle'})
-                    self.stop_event.wait(2)
+                if pending:
+                    # Indexing (embedding) has priority: drain the whole dirty queue
+                    # before any attribute work so the two models are used in batches.
+                    idle_since = None
+                    self._process_one(pending[0])
                     continue
-                idle_since = None
-                self._process_one(pending[0])
+                settings = self.settings_provider()
+                if self._attr_requested.is_set() or getattr(settings, 'auto_extract_attributes', True):
+                    attr_pending = self._pending_attr_books(settings)
+                    if attr_pending:
+                        idle_since = None
+                        self._process_attributes(attr_pending, settings)
+                        self._attr_requested.clear()
+                        continue
+                # Fully idle.
+                now = time.time()
+                if idle_since is None:
+                    idle_since = now
+                elif now - idle_since >= self.IDLE_RECONCILE_SECONDS:
+                    idle_since = now
+                    self.reconcile()
+                self.status_cb({'state': 'idle'})
+                self.stop_event.wait(2)
             except Exception as e:
                 _default_log(f'indexer loop error: {e!r}')
                 self.stop_event.wait(5)

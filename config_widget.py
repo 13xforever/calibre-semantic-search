@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from qt.core import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -137,6 +138,12 @@ HELP_ATTR_MODE = _(
     'more tokens, but catches details that only appear deep in long books.'
 )
 
+HELP_AUTO_ATTR = _(
+    'When enabled, the plugin runs LLM attribute extraction automatically once a book finishes indexing — '
+    'indexing and attributes run as one pipeline (all embeddings first, then all attribute calls), reported in '
+    'the same status dialog. Disable this to only extract when you click "Extract attributes..." from the menu.'
+)
+
 HELP_ATTR_ENABLED = _(
     'Include this field in attribute extraction. Its calibre custom column is created/updated automatically.'
 )
@@ -255,6 +262,9 @@ class SettingsWidget(QDialog):
         )
         attr_note.setWordWrap(True)
         av.addWidget(attr_note)
+        self.e_auto_attr = QCheckBox(_('Automatically extract attributes after a book is indexed'))
+        self.e_auto_attr.setChecked(bool(self.s.auto_extract_attributes))
+        av.addWidget(self.e_auto_attr)
         ctx_row = QHBoxLayout()
         ctx_row.addWidget(QLabel(_('Model context limit (tokens):')))
         self.e_ctx = QSpinBox()
@@ -314,6 +324,7 @@ class SettingsWidget(QDialog):
                 item.setToolTip(key)
         B(HELP_ATTR_TABLE, self.attr_table)
         B(HELP_CONTEXT, self.e_ctx)
+        B(HELP_AUTO_ATTR, self.e_auto_attr)
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.accepted.connect(self._collect_and_accept)
@@ -436,6 +447,7 @@ class SettingsWidget(QDialog):
         s.max_chunks_per_book = self.i_maxchunks.value()
         s.attr_mode = self.i_attrmode.currentText()
         s.attr_context_tokens = self.e_ctx.value()
+        s.auto_extract_attributes = bool(self.e_auto_attr.isChecked())
         attrs = []
         for r in range(self.attr_table.rowCount()):
             name = (self.attr_table.item(r, 1).text() if self.attr_table.item(r, 1) else '').strip().lower()

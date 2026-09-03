@@ -17,6 +17,7 @@ Backends:
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import struct
@@ -204,6 +205,28 @@ class MetaStore:
                 (book_id, fmt, time.time(), n_chunks, model, dim),
             )
             self.conn.commit()
+
+    # -- attributes ---------------------------------------------------------------
+
+    def set_attrs(self, book_id: int, values: dict):
+        with self._lock:
+            self.conn.execute(
+                'INSERT INTO attrs_raw(book_id, json, fields, updated_at) VALUES(?,?,?,?) '
+                'ON CONFLICT(book_id) DO UPDATE SET json=excluded.json, fields=excluded.fields, updated_at=excluded.updated_at',
+                (book_id, json.dumps(values), ','.join(values.keys()), time.time()),
+            )
+            self.conn.commit()
+
+    def get_attrs(self, book_id: int):
+        with self._lock:
+            row = self.conn.execute('SELECT json FROM attrs_raw WHERE book_id=?', (book_id,)).fetchone()
+        if not row:
+            return {}
+        try:
+            data = json.loads(row[0] or '{}')
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
 
 
 class SqliteVectorBackend:
@@ -550,6 +573,12 @@ class VectorStore:
 
     def upsert_book(self, book_id, fmt, n_chunks, model, dim):
         self.meta.upsert_book(book_id, fmt, n_chunks, model, dim)
+
+    def set_attrs(self, book_id, values):
+        self.meta.set_attrs(book_id, values)
+
+    def get_attrs(self, book_id):
+        return self.meta.get_attrs(book_id)
 
     # -- search ------------------------------------------------------------------------
 

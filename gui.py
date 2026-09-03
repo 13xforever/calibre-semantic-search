@@ -32,6 +32,36 @@ def _plugin_icon(name):
     return None
 
 
+class _GuiDbProxy:
+    '''Forwards calibre db writes to the GUI thread; reads pass through.
+
+    The real new_api is resolved lazily via a getter so the proxy stays valid
+    across library switches. calibre's newAPI is not safe to write from a worker
+    thread, so create_custom_column and set_field are marshalled to the GUI thread
+    synchronously; everything else (reads such as backend.custom_column_label_map)
+    passes straight through.
+    '''
+
+    def __init__(self, action, get_real):
+        self._action = action
+        self._get_real = get_real
+
+    def _real(self):
+        r = self._get_real() if callable(self._get_real) else self._get_real
+        if r is None:
+            raise RuntimeError('no calibre db api available')
+        return r
+
+    def __getattr__(self, name):
+        return getattr(self._real(), name)
+
+    def create_custom_column(self, *a, **k):
+        self._action._run_db_write('create_custom_column', a, k)
+
+    def set_field(self, *a, **k):
+        self._action._run_db_write('set_field', a, k)
+
+
 class StatusDialog(QDialog):
     '''Live index-status view: fixed-size window, scrollable text, 1s refresh.'''
 
@@ -79,6 +109,8 @@ class SemanticSearchAction(InterfaceAction):
     action_type = 'global'
 
     _status_sig = pyqtSignal(object)
+    _db_sig = pyqtSignal(object)  # (method, args, kwargs, threading.Event)
+    _attr_done_sig = pyqtSignal(object)  # (total, [(book_id, err), ...])
 
     def __init__(self, parent, site_customization):
         super().__init__(parent, site_customization)
@@ -89,6 +121,8 @@ class SemanticSearchAction(InterfaceAction):
         self._last_status = None
         self._status_dialog = None
         self._status_sig.connect(self._on_status)
+        self._db_sig.connect(self._on_db_write)
+        self._attr_done_sig.connect(self._on_attr_done)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -165,11 +199,14 @@ class SemanticSearchAction(InterfaceAction):
             return
         from .indexer import Indexer
 
+        get_api = lambda: (self.gui.current_db.new_api if self.gui is not None else None)
         self.indexer = Indexer(
             store=self.store,
-            get_new_api=lambda: (self.gui.current_db.new_api if self.gui is not None else None),
+            get_new_api=get_api,
             settings_provider=self.get_settings,
             status_cb=self._status_sig.emit,
+            attr_writer=_GuiDbProxy(self, get_api),
+            attr_done_cb=self._attr_done_sig.emit,
         )
         self.indexer.start()
         # reconcile in a background thread so startup stays snappy
@@ -208,11 +245,57 @@ class SemanticSearchAction(InterfaceAction):
         state = d.get('state', '')
         if state == 'idle':
             tip = _('Search books by meaning')
+        elif state == 'attributes':
+            tip = f"Extracting attributes ({d.get('done')}/{d.get('total')})"
+        elif state == 'attributes_done':
+            tip = f"Attributes: {d.get('done')}/{d.get('total')} done"
+        elif state == 'attr_error':
+            tip = "Attribute extraction: " + str(d.get('error', ''))[:80]
         else:
             tip = f"Indexing book {d.get('book_id')} ({state})"
             if d.get('total'):
                 tip += f" {d.get('done')}/{d.get('total')}"
         self.qaction.setToolTip(tip)
+
+    # -- attribute extraction ------------------------------------------------------
+
+    def _run_db_write(self, method, args, kwargs):
+        '''Marshal a calibre db write to the GUI thread and wait for it.'''
+        ev = threading.Event()
+        self._db_sig.emit((method, args, kwargs, ev))
+        if not ev.wait(timeout=30):
+            raise RuntimeError('GUI thread did not process the db write in time')
+
+    def _on_db_write(self, payload):
+        method, args, kwargs, ev = payload
+        try:
+            api = self._api()
+            if api is None:
+                return
+            getattr(api, method)(*args, **kwargs)
+        except Exception as e:
+            print(f'semantic search: db write {method} failed: {e!r}')
+        finally:
+            ev.set()
+
+    def _on_attr_done(self, payload):
+        total, errors = payload
+        if errors:
+            from calibre.gui2 import error_dialog
+
+            lines = [f'{self._book_label(b)}: {err}' for b, err in errors[:5]]
+            if len(errors) > 5:
+                lines.append(f'... and {len(errors) - 5} more')
+            error_dialog(
+                self.gui,
+                'Attribute extraction',
+                f'{len(errors)} of {total} book(s) failed:\n\n' + '\n'.join(lines),
+                show=True,
+            )
+        else:
+            from calibre.gui2 import info_dialog
+
+            info_dialog(self.gui, 'Attribute extraction', f'Extracted attributes for {total} book(s).', show=True)
 
     # -- helpers ---------------------------------------------------------------
 
@@ -275,11 +358,24 @@ class SemanticSearchAction(InterfaceAction):
             except Exception:
                 pass
         lines += [f'Total chunks: {n_chunks}', f'Pending (dirty): {len(dirty)}']
+        try:
+            settings = self.get_settings()
+            from .attributes import pending_attribute_books
+
+            with_chunks = [b for b in books if b['n_chunks'] > 0]
+            pending_attrs = pending_attribute_books(self.store, settings)
+            done_attrs = max(0, len(with_chunks) - len(pending_attrs))
+            lines.append(f'Attributes: {done_attrs}/{len(with_chunks)} books')
+        except Exception:
+            pass
         st = self._last_status
-        if st and st.get('state') in ('extracting', 'embedding', 'saving'):
-            line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
-            if st.get('total'):
-                line += f" {st.get('done')}/{st.get('total')}"
+        if st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
+            if st.get('state') == 'attributes':
+                line = f"Extracting attributes: {st.get('done')}/{st.get('total')}"
+            else:
+                line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
+                if st.get('total'):
+                    line += f" {st.get('done')}/{st.get('total')}"
             lines.append(line)
         import json
 
@@ -291,6 +387,19 @@ class SemanticSearchAction(InterfaceAction):
             lines.append('')
             lines.append(f'Failed books: {len(failed)}')
             for bid_str, info in sorted(failed.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
+                try:
+                    bid = int(bid_str)
+                except ValueError:
+                    continue
+                lines.append(f'{self._book_label(bid, api)}: {(info or {}).get("error", "unknown error")}')
+        try:
+            attr_failed = json.loads(self.store.get_meta('attr_failed', '{}') or '{}')
+        except Exception:
+            attr_failed = {}
+        if attr_failed and api is not None:
+            lines.append('')
+            lines.append(f'Attribute failures: {len(attr_failed)} (use "Extract attributes..." to retry)')
+            for bid_str, info in sorted(attr_failed.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
                 try:
                     bid = int(bid_str)
                 except ValueError:
@@ -329,32 +438,41 @@ class SemanticSearchAction(InterfaceAction):
             self.store.add_dirty(bid, fmt, 'reindex')
 
     def extract_attributes_menu(self):
-        from calibre.gui2 import info_dialog
+        """Force-run the attribute-extraction phase now and show live progress.
 
+        Attribute extraction normally runs automatically right after indexing (see
+        settings.auto_extract_attributes). This menu item re-runs it on demand: it
+        resets previously-failed books, asks the indexer to run the phase, and
+        raises the same status dialog used for indexing so progress is visible.
+        """
         if not self._ensure_started():
             return
-        api = self._api()
-        if api is None:
+        try:
+            from calibre.ai import AICapabilities
+            from calibre.ai.prefs import plugin_for_purpose
+
+            llm = plugin_for_purpose(AICapabilities.text_to_text)
+        except Exception as e:
+            from calibre.gui2 import error_dialog
+
+            error_dialog(self.gui, 'Attribute extraction', f'Could not check the AI provider:\n{e}', show=True)
             return
-        from .attributes import pending_attribute_books
+        if llm is None:
+            from calibre.gui2 import error_dialog
 
-        settings = self.get_settings()
-        pending = pending_attribute_books(self.store, settings)
-        if not pending:
-            info_dialog(self.gui, 'Attribute extraction', 'All indexed books already have attributes.', show=True)
+            error_dialog(
+                self.gui,
+                'Attribute extraction',
+                'No text-to-text AI provider is configured.\n\n'
+                'Set one up under Preferences > Plugins > AI Provider (e.g. an OpenAI-compatible provider), then try again.',
+                show=True,
+            )
             return
-        threading.Thread(target=self._extract_worker, args=(pending,), daemon=True).start()
-
-    def _extract_worker(self, pending):
-        from .attributes import extract_book_attributes
-
-        api = self._api()
-        settings = self.get_settings()
-        for i, bid in enumerate(pending):
-            try:
-                extract_book_attributes(bid, api, self.store, settings)
-            except Exception as e:
-                print(f'semantic search: attribute extraction failed for {bid}: {e!r}')
+        # Retry books that previously failed, then ask the indexer to run the
+        # attribute phase; raise the live status dialog so progress is immediate.
+        self.store.set_meta('attr_failed', '{}')
+        self.indexer.request_attributes()
+        self.show_status()
 
     def _api(self):
         try:

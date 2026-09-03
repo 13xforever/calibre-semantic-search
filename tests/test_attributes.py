@@ -12,12 +12,19 @@ class FakeStore:
     def __init__(self, chunks_by_book=None):
         self.chunks_by_book = chunks_by_book or {}
         self.meta = {}
+        self.attrs = {}
 
     def set_meta(self, k, v):
         self.meta[k] = v
 
     def get_meta(self, k, default=None):
         return self.meta.get(k, default)
+
+    def set_attrs(self, book_id, values):
+        self.attrs[book_id] = dict(values)
+
+    def get_attrs(self, book_id):
+        return self.attrs.get(book_id, {})
 
     # attributes._chunks_for_book pokes at store.conn; emulate via monkeypatch in tests
 
@@ -134,6 +141,9 @@ class TestExtract(unittest.TestCase):
             pass
         self.assertEqual(values['gender'], 'female')
         self.assertEqual(values['tropes'], ['slow burn'])
+        # source of truth is the plugin store (attrs_raw), not the columns
+        self.assertEqual(store.attrs[1]['gender'], 'female')
+        self.assertEqual(store.attrs[1]['tropes'], ['slow burn'])
         self.assertIn('ss_gender', api.columns)
         self.assertEqual(api.fields['#ss_gender'], {1: 'female'})
         self.assertEqual(api.fields['#ss_tropes'], {1: ['slow burn']})

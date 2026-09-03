@@ -1,0 +1,164 @@
+import os as _os
+import sys as _sys
+import json
+import tempfile
+import types
+import importlib.util
+import unittest
+
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+
+ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+
+# Load plugin modules as a synthetic package so their relative imports resolve.
+_pkg = types.ModuleType('sspkg')
+_pkg.__path__ = [ROOT]
+_sys.modules['sspkg'] = _pkg
+
+
+def _loadpkg(name):
+    key = 'sspkg.' + name
+    if key in _sys.modules:
+        return _sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, _os.path.join(ROOT, name + '.py'))
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = 'sspkg'
+    _sys.modules[key] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+indexer = _loadpkg('indexer')
+store_mod = _loadpkg('store')
+attributes = _loadpkg('attributes')
+utils = _loadpkg('utils')
+chunker = _loadpkg('chunker')
+
+_FIELDS = [utils.AttrField('gender', 'ss_gender', 'text', 'g'), utils.AttrField('tropes', 'ss_tropes', 'tags', 't')]
+
+
+class FakeLLM:
+    def __init__(self, data=None):
+        self.data = data or {}
+        self.calls = 0
+
+    def generate_structured_output(self, prompt, schema, instructions='', use_model=''):
+        from types import SimpleNamespace
+
+        self.calls += 1
+        return SimpleNamespace(
+            data=SimpleNamespace(**{f.name: self.data.get(f.name) for f in _FIELDS}), exception=None, error_details=''
+        )
+
+
+class FailingLLM:
+    def generate_structured_output(self, prompt, schema, instructions='', use_model=''):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(data=None, exception=RuntimeError('boom'), error_details='boom')
+
+
+class FakeWriter:
+    """Stands in for the GUI db proxy; records custom-column writes."""
+
+    def __init__(self):
+        self.columns = {}
+        self.fields = {}
+
+    @property
+    def backend(self):
+        class B:
+
+            pass
+
+        b = B()
+        b.custom_column_label_map = self.columns
+        return b
+
+    def create_custom_column(self, label, name, datatype, is_multiple):
+        self.columns[label] = {'label': label}
+
+    def set_field(self, key, mapping):
+        self.fields.setdefault(key, {}).update(mapping)
+
+
+class TestAttrPhase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_chunks = attributes._chunks_for_book
+        attributes._chunks_for_book = lambda s, bid: ['word ' * 40]
+
+    def tearDown(self):
+        attributes._chunks_for_book = self._orig_chunks
+        self._tmp.cleanup()
+
+    def _make(self, auto=True):
+        vs = store_mod.VectorStore(_os.path.join(self._tmp.name, 't.db'), backend='sqlite')
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.auto_extract_attributes = auto
+        statuses, done = [], []
+        writer = FakeWriter()
+        ix = indexer.Indexer(
+            store=vs,
+            get_new_api=lambda: None,
+            settings_provider=lambda: settings,
+            status_cb=statuses.append,
+            attr_writer=writer,
+            attr_done_cb=done.append,
+        )
+        return vs, ix, settings, statuses, done, writer
+
+    def _index_book(self, vs, bid):
+        vs.upsert_book(bid, 'EPUB', 1, 'm', 8)
+        c = chunker.Chunk(chunk_no=0, text='x' * 3000, chapter_path=['c'], para_start=0, para_end=1, char_offset=0)
+        vs.insert_chunk(bid, c, c.text, c.chapter_path, 0, 1, 0, 'm', 8, [0.1] * 8)
+        vs.commit(bid)
+
+    def test_persists_and_reports(self):
+        vs, ix, settings, statuses, done, writer = self._make()
+        llm = FakeLLM({'gender': 'female', 'tropes': ['x']})
+        ix._process_attributes([1, 2], settings, llm=llm)
+        # source of truth (attrs_raw) is populated for both books
+        self.assertEqual(vs.get_attrs(1)['gender'], 'female')
+        self.assertEqual(vs.get_attrs(2)['tropes'], ['x'])
+        # live status reported per book plus a terminal state
+        states = [s['state'] for s in statuses]
+        self.assertEqual(states.count('attributes'), 2)
+        self.assertIn('attributes_done', states)
+        # done callback got (total, errors)
+        self.assertEqual(done[0][0], 2)
+        self.assertEqual(done[0][1], [])
+        # custom-column mirror happened through the writer proxy
+        self.assertEqual(writer.fields['#ss_gender'][1], 'female')
+        self.assertEqual(writer.fields['#ss_tropes'][2], ['x'])
+        vs.close()
+
+    def test_failures_recorded_and_reported(self):
+        vs, ix, settings, statuses, done, writer = self._make()
+        ix._process_attributes([1], settings, llm=FailingLLM())
+        self.assertEqual(done[0][0], 1)
+        self.assertEqual(len(done[0][1]), 1)
+        failed = json.loads(vs.get_meta('attr_failed', '{}'))
+        self.assertIn('1', failed)
+        vs.close()
+
+    def test_pending_excludes_failed(self):
+        vs, ix, settings, statuses, done, writer = self._make()
+        self._index_book(vs, 1)
+        self._index_book(vs, 2)
+        vs.set_meta('attr_failed', json.dumps({'1': {'error': 'x'}}))
+        self.assertEqual(ix._pending_attr_books(settings), [2])
+        vs.close()
+
+    def test_success_clears_prior_failure(self):
+        vs, ix, settings, statuses, done, writer = self._make()
+        vs.set_meta('attr_failed', json.dumps({'1': {'error': 'old'}}))
+        ix._process_attributes([1], settings, llm=FakeLLM({'gender': 'male'}))
+        failed = json.loads(vs.get_meta('attr_failed', '{}'))
+        self.assertNotIn('1', failed)
+        vs.close()
+
+
+if __name__ == '__main__':
+    unittest.main()

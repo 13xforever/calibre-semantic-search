@@ -6,7 +6,6 @@ on a worker thread; the LLM provider is injected so tests can fake it.
 
 from __future__ import annotations
 
-import json
 from typing import Annotated, Any, Optional
 
 DEFAULT_CONTEXT_TOKENS = 8192
@@ -150,7 +149,6 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
         llm = plugin_for_purpose(AICapabilities.text_to_text)
         if llm is None:
             raise RuntimeError('no text-to-text AI provider configured (Preferences > Plugins > AI Provider)')
-    colmap = ensure_columns(new_api, settings)
     schema = build_schema_class(fields)
     chunks = _chunks_for_book(store, book_id)
     if not chunks:
@@ -193,19 +191,34 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
         for f in fields:
             values[f.name] = _normalize_value(getattr(data, f.name, None) if data is not None else None, f.type)
 
-    # write to custom columns
-    updates: dict[str, dict[int, Any]] = {}
+    # Guarantee every enabled field has a key so the book counts as complete
+    # (fulltext map-reduce only keeps non-empty values; fill the rest with defaults).
     for f in fields:
-        key = colmap[f.name]
-        val = values.get(f.name)
-        if f.type == 'tags':
-            val = val or []
-        else:
-            val = val or ''
-        updates.setdefault(key, {})[book_id] = val
-    for key, mapping in updates.items():
-        new_api.set_field(key, mapping)
-    store.set_meta(f'attrs:{book_id}', json.dumps(values))
+        values.setdefault(f.name, [] if f.type == 'tags' else '')
+
+    # Persist to the plugin store first: this is the source of truth and is
+    # thread-safe (our own SQLite), so the book counts as done even if the
+    # custom-column mirror below fails.
+    store.set_attrs(book_id, values)
+
+    # Best-effort mirror into calibre custom columns so the attributes are also
+    # browsable/filterable in calibre's main view. A failure here must not fail
+    # the book — attrs_raw already holds the data.
+    try:
+        colmap = ensure_columns(new_api, settings)
+        updates: dict[str, dict[int, Any]] = {}
+        for f in fields:
+            key = colmap[f.name]
+            val = values.get(f.name)
+            if f.type == 'tags':
+                val = val or []
+            else:
+                val = val or ''
+            updates.setdefault(key, {})[book_id] = val
+        for key, mapping in updates.items():
+            new_api.set_field(key, mapping)
+    except Exception:
+        pass
     return values
 
 
@@ -216,11 +229,7 @@ def pending_attribute_books(store, settings) -> list[int]:
     for b in store.indexed_books():
         if b['n_chunks'] == 0:
             continue
-        raw = store.get_meta(f'attrs:{b["id"]}', '')
-        try:
-            data = json.loads(raw) if raw else {}
-        except Exception:
-            data = {}
+        data = store.get_attrs(b['id'])
         stored = set(data.keys())
         if stored != set(enabled):
             out.append(b['id'])
