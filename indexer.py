@@ -95,6 +95,40 @@ def pick_format(formats, priority: list[str]) -> str | None:
     return next(iter(formats))
 
 
+def _mtime_to_float(v):
+    """Normalize an mtime value (number or datetime) to a float epoch timestamp."""
+    if v is None:
+        return None
+    ts = getattr(v, 'timestamp', None)
+    if callable(ts):
+        try:
+            return float(ts())
+        except Exception:
+            pass
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+
+        return float(datetime.fromisoformat(str(v)).timestamp())
+    except Exception:
+        return None
+
+
+def file_info_value(fmt: str, md: dict) -> str:
+    """Serialize (fmt, size, mtime) for change detection; fmt-only if stat info is missing."""
+    try:
+        size = int(md.get('size'))
+    except (TypeError, ValueError):
+        size = None
+    mtime = _mtime_to_float(md.get('mtime'))
+    if size is not None and mtime is not None:
+        return f'{fmt}|{size}|{mtime}'
+    return fmt
+
+
 class Indexer(threading.Thread):
     """Daemon thread draining the store's dirty queue."""
 
@@ -106,6 +140,7 @@ class Indexer(threading.Thread):
         self.status_cb = status_cb or (lambda s: None)
         self.stop_event = threading.Event()
         self.current_book_id: int | None = None
+        self._reconcile_lock = threading.Lock()
 
     def stop(self):
         self.stop_event.set()
@@ -114,6 +149,10 @@ class Indexer(threading.Thread):
 
     def reconcile(self):
         """Compare library vs store; queue missing/changed books, drop removed ones."""
+        with self._reconcile_lock:
+            self._reconcile_locked()
+
+    def _reconcile_locked(self):
         import json
 
         api = self.get_new_api()
@@ -162,20 +201,36 @@ class Indexer(threading.Thread):
     @staticmethod
     def _same_file(parts: list[str], md: dict) -> bool:
         try:
-            return int(parts[1]) == int(md.get('size') or -1) and float(parts[2]) == float(md.get('mtime') or -1)
-        except (TypeError, ValueError):
+            size = int(parts[1])
+            cur_size = int(md.get('size'))
+        except (IndexError, TypeError, ValueError):
             return False
+        mtime = _mtime_to_float(parts[2])
+        cur_mtime = _mtime_to_float(md.get('mtime'))
+        if mtime is None or cur_mtime is None:
+            return False
+        return size == cur_size and abs(mtime - cur_mtime) < 1e-6
 
     # -- worker loop ----------------------------------------------------------
 
+    IDLE_RECONCILE_SECONDS = 15
+
     def run(self):
+        idle_since = None
         while not self.stop_event.is_set():
             try:
                 pending = self.store.dirty_book_ids()
                 if not pending:
+                    now = time.time()
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since >= self.IDLE_RECONCILE_SECONDS:
+                        idle_since = now
+                        self.reconcile()
                     self.status_cb({'state': 'idle'})
                     self.stop_event.wait(2)
                     continue
+                idle_since = None
                 self._process_one(pending[0])
             except Exception as e:
                 _default_log(f'indexer loop error: {e!r}')
@@ -286,7 +341,7 @@ class Indexer(threading.Thread):
         self.store.commit()
         self.store.upsert_book(book_id, fmt, len(chunks), settings.embed.model, dim)
         # record size/mtime for change detection
-        self.store.set_meta(file_info_key(book_id), f'{fmt}|{md.get("size")}|{md.get("mtime")}')
+        self.store.set_meta(file_info_key(book_id), file_info_value(fmt, md))
         import json
 
         try:
@@ -310,7 +365,7 @@ class Indexer(threading.Thread):
         if fmt is not None and api is not None:
             try:
                 md = api.format_metadata(book_id, fmt)
-                self.store.set_meta(file_info_key(book_id), f'{fmt}|{md.get("size")}|{md.get("mtime")}')
+                self.store.set_meta(file_info_key(book_id), file_info_value(fmt, md))
             except Exception:
                 pass
         failed = {}

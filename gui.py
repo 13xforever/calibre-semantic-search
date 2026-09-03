@@ -246,6 +246,21 @@ class SemanticSearchAction(InterfaceAction):
                 d.edit.setText(q)
         d.show()
 
+    def _book_label(self, bid, api=None):
+        if api is None:
+            api = self._api()
+        if api is not None and bid is not None:
+            try:
+                md = api.get_metadata(bid)
+            except Exception:
+                md = None
+            if md is not None:
+                title = getattr(md, 'title', None) or '?'
+                authors = [a for a in (getattr(md, 'authors', None) or []) if a]
+                label = f'"{title}"' + (f' by {", ".join(authors)}' if authors else '')
+                return f'{label} [id {bid}]'
+        return f'book {bid}'
+
     def status_lines(self):
         if self.store is None:
             return ['Store not started.']
@@ -262,7 +277,7 @@ class SemanticSearchAction(InterfaceAction):
         lines += [f'Total chunks: {n_chunks}', f'Pending (dirty): {len(dirty)}']
         st = self._last_status
         if st and st.get('state') in ('extracting', 'embedding', 'saving'):
-            line = f"Currently indexing book id {st.get('book_id')}: {st.get('state')}"
+            line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
             if st.get('total'):
                 line += f" {st.get('done')}/{st.get('total')}"
             lines.append(line)
@@ -280,14 +295,7 @@ class SemanticSearchAction(InterfaceAction):
                     bid = int(bid_str)
                 except ValueError:
                     continue
-                title = None
-                try:
-                    md = api.get_metadata(bid)
-                    title = getattr(md, 'title', None)
-                except Exception:
-                    pass
-                label = title or f'book {bid}'
-                lines.append(f'{label} [id {bid}]: {(info or {}).get("error", "unknown error")}')
+                lines.append(f'{self._book_label(bid, api)}: {(info or {}).get("error", "unknown error")}')
         return lines
 
     def show_status(self):
