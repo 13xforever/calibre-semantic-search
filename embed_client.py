@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -57,12 +58,37 @@ class EmbedClient:
             out.append([float(x) for x in v])
         return out
 
-    def embed_batched(self, texts: list[str], batch_size: int = 64, progress=None) -> list[list[float]]:
-        """Embed with batching; progress(done, total) is optional."""
-        out: list[list[float]] = []
-        for start in range(0, len(texts), batch_size):
-            batch = texts[start : start + batch_size]
-            out.extend(self.embed(batch))
-            if progress:
-                progress(min(start + batch_size, len(texts)), len(texts))
-        return out
+    def embed_batched(self, texts: list[str], batch_size: int = 64, progress=None, concurrency: int = 1) -> list[list[float]]:
+        """Embed with batching; progress(done, total) is optional.
+
+        Batches are sent in order-preserving fashion; with concurrency > 1 they
+        run in parallel on a thread pool and results are reassembled in input order.
+        """
+        if not texts:
+            return []
+        batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+        total = len(texts)
+        out: list[list[float]] = [[] for _ in batches]
+        state = {'done': 0}
+        lock = threading.Lock()
+
+        def work(idx: int, batch: list[str]):
+            vecs = self.embed(batch)
+            out[idx] = vecs
+            with lock:
+                state['done'] += len(batch)
+                d = state['done']
+            if progress is not None:
+                progress(min(d, total), total)
+
+        if concurrency > 1 and len(batches) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=max(1, min(concurrency, len(batches)))) as ex:
+                futs = [ex.submit(work, i, b) for i, b in enumerate(batches)]
+                for fu in futs:
+                    fu.result()  # re-raise the first batch error, if any
+        else:
+            for i, b in enumerate(batches):
+                work(i, b)
+        return [v for chunk in out for v in chunk]

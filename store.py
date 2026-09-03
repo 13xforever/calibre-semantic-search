@@ -321,12 +321,19 @@ class LanceVectorBackend:
         slug = re.sub(r'[^a-zA-Z0-9]+', '_', model).strip('_').lower() or 'model'
         return f'chunks_{slug}'[:80]
 
+    def _table_names(self):
+        res = self._db.list_tables()
+        tables = getattr(res, 'tables', None)  # newer lancedb returns a page object
+        if tables is None:
+            return list(res)
+        return list(tables)
+
     def _get_table(self, model: str, dim: int):
         name = self._table_name(model)
         t = self._tables.get(name)
         if t is not None:
             return t
-        if name in self._db.table_names():
+        if name in self._table_names():
             t = self._db.open_table(name)
         else:
             import pyarrow as pa
@@ -352,7 +359,7 @@ class LanceVectorBackend:
         names = [self._table_name(m) for m in {i['model'] for i in self.meta.indexed_books() if i['model']}]
         out = []
         for n in set(names):
-            if n in self._db.table_names():
+            if n in self._table_names():
                 out.append(self._db.open_table(n))
         return out
 
@@ -362,7 +369,7 @@ class LanceVectorBackend:
 
     def insert_chunks(self, book_id: int, items):
         first_model = items[0][2]
-        dim = len(items[0][3]) if np is None else items[0][3].shape[0]
+        dim = items[0][3]
         t = self._get_table(first_model, dim)
         rows = []
         for c, v, model, dim_ in items:
@@ -380,17 +387,20 @@ class LanceVectorBackend:
                     vec,
                 )
             )
-        data = {
-            'book_id': [r[0] for r in rows],
-            'chunk_no': [r[1] for r in rows],
-            'text': [r[2] for r in rows],
-            'chapter_path': [r[3] for r in rows],
-            'para_start': [r[4] for r in rows],
-            'para_end': [r[5] for r in rows],
-            'char_offset': [r[6] for r in rows],
-            'dim': [r[7] for r in rows],
-            'vector': [r[8] for r in rows],
-        }
+        data = [
+            {
+                'book_id': r[0],
+                'chunk_no': r[1],
+                'text': r[2],
+                'chapter_path': r[3],
+                'para_start': r[4],
+                'para_end': r[5],
+                'char_offset': r[6],
+                'dim': r[7],
+                'vector': r[8],
+            }
+            for r in rows
+        ]
         t.add(data)
 
     def commit(self):
@@ -399,11 +409,13 @@ class LanceVectorBackend:
     def book_chunks_text(self, book_id: int):
         out = []
         for t in self._all_tables():
-            lance = t.to_lance()
-            tbl = lance.to_table(filter=f'book_id = {int(book_id)}', columns=['chunk_no', 'text'])
-            if len(tbl) == 0:
+            try:
+                df = t.search().where(f'book_id = {int(book_id)}').limit(10_000_000).to_pandas()
+            except Exception:
                 continue
-            df = tbl.to_pandas().sort_values('chunk_no')
+            if df is None or len(df) == 0:
+                continue
+            df = df.sort_values('chunk_no')
             out.extend(str(x) for x in df['text'])
         return out
 
@@ -425,6 +437,7 @@ class LanceVectorBackend:
         import pandas as pd
 
         df = pd.concat(candidates, ignore_index=True)
+        fmt_map = {i['id']: i['fmt'] for i in self.meta.indexed_books()}
         out = []
         for _, r in df.iterrows():
             s = float(r['_distance'])
@@ -435,7 +448,7 @@ class LanceVectorBackend:
             out.append(
                 SearchResult(
                     book_id=int(r['book_id']),
-                    fmt='',
+                    fmt=fmt_map.get(int(r['book_id']), ''),
                     chunk_no=int(r['chunk_no']),
                     text=str(r['text']),
                     chapter_path=[p for p in str(r['chapter_path']).split(' > ') if p],

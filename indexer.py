@@ -248,7 +248,9 @@ class Indexer(threading.Thread):
             self._status('embedding', book_id, done=d, total=total)
 
         try:
-            vectors = client.embed_batched(texts, batch_size=settings.embed.batch_size, progress=progress)
+            vectors = client.embed_batched(
+                texts, batch_size=settings.embed.batch_size, concurrency=settings.embed.concurrency, progress=progress
+            )
         except Exception as e:
             self._fail(book_id, str(e))
             return

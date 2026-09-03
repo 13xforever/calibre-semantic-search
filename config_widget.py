@@ -6,16 +6,19 @@ from qt.core import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QEvent,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
     QLineEdit,
+    QObject,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
     Qt,
@@ -26,12 +29,120 @@ from calibre.utils.localization import _
 from .utils import AttrField, Settings
 
 
+class _HelpFilter(QObject):
+    """Updates the help box when the mouse enters a bound widget or its label."""
+
+    def __init__(self, box: QTextEdit):
+        super().__init__()
+        self.box = box
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Type.Enter:
+            text = getattr(obj, '_help_text', None)
+            if text:
+                self.box.setPlainText(text)
+        return False
+
+
+HELP_DEFAULT = _('Hover over an option to see what it does.')
+
+HELP_SERVER_URL = _(
+    'Base URL of an OpenAI-compatible embedding server (the plugin calls POST /v1/embeddings).\n'
+    'Ollama: http://localhost:11434 (default)\n'
+    'LM Studio: http://localhost:1234/v1\n'
+    'vLLM / Unsloth: the root URL of your server.'
+)
+
+HELP_MODEL = _(
+    'Name/ID of the embedding model served by that server (e.g. an Ollama tag).\n\n'
+    'Recommended models:\n'
+    '- nomic-embed-text — good default, fast even on CPU\n'
+    '- Qwen3-Embedding-4B or bge-m3 — best quality; want a GPU with ~8GB+ VRAM\n'
+    '- bge-small-en-v1.5 / mxbai-embed-large — lighter alternatives\n\n'
+    'Note: changing the model changes vector dimensions and scores. After switching models, '
+    "run 'Re-index all books' from the Semantic search menu so every book shares one model."
+)
+
+HELP_API_KEY = _(
+    "Optional. Leave empty for local servers such as Ollama. Set it if your server requires an "
+    "'Authorization: Bearer <key>' header (some vLLM / LM Studio setups)."
+)
+
+HELP_BATCH = _(
+    'How many text chunks to send per embeddings request. Larger values are faster but use more RAM '
+    'on the server. 64 works well; lower it if the server runs out of memory.'
+)
+
+HELP_CONCURRENCY = _(
+    'Number of embedding requests to run in parallel. Higher values speed up initial indexing on '
+    'multi-core servers or GPUs; keep at 1-2 for small models running on CPU.'
+)
+
+HELP_TIMEOUT = _('Per-request timeout in seconds. Raise it if indexing stalls on a slow CPU server.')
+
+HELP_BACKEND = _(
+    "Where chunk vectors are stored.\n"
+    "- auto (default): LanceDB if the 'lancedb' Python package is installed, otherwise SQLite\n"
+    '- sqlite: always available; vectors live in a file next to metadata.db\n'
+    "- lancedb: requires 'pip install lancedb'\n\n"
+    'Changing the backend or the embedding model requires re-indexing for consistent results.'
+)
+
+HELP_FORMATS = _(
+    'Which file format to extract text from, one per line, top to bottom. The first format a book has '
+    'is used. EPUB/AZW3 first gives the best structure; keep PDF last because its text extraction is '
+    'lower quality.'
+)
+
+HELP_TARGET = _(
+    'Approximate size of each search chunk in characters (default 1000). Larger chunks give more '
+    'context but coarser matches; smaller chunks are the reverse. Changing this requires re-indexing.'
+)
+
+HELP_OVERLAP = _(
+    'Number of characters repeated between adjacent chunks, so sentences that fall on a chunk '
+    'boundary can still be matched.'
+)
+
+HELP_MAX_CHUNKS = _(
+    'Safety cap on the number of chunks per book (0 = unlimited). Useful to keep indexing time and '
+    'disk usage down for very long books.'
+)
+
+HELP_ATTR_MODE = _(
+    'sampled: one LLM call over an evenly spaced sample of the book (~12k chars) — fast and cheap, '
+    'good for most books.\n'
+    'fulltext: map-reduce over the entire text — slower and uses more tokens, but catches details '
+    'that only appear deep in long books.'
+)
+
+HELP_ATTR_ENABLED = _(
+    'Include this field in attribute extraction. Its calibre custom column is created/updated automatically.'
+)
+HELP_ATTR_NAME = _(
+    "Internal name of the field (lowercase letters, digits, underscores). Determines the calibre "
+    "custom column (label 'ss_...') where values are stored."
+)
+HELP_ATTR_TYPE = _(
+    "text = single value (e.g. 'first person'). tags = multi-value list, stored like #tags so you can "
+    'filter on individual values.'
+)
+HELP_ATTR_DESC = _(
+    'Shown to the LLM as guidance for what to extract. Be specific about the expected format and give examples.'
+)
+HELP_ATTR_TABLE = _(
+    "Attribute fields extracted by the LLM into calibre custom columns. Toggle 'Enabled', edit names, "
+    "types and descriptions, then run 'Extract attributes...' from the Semantic search menu. Changing "
+    'the schema marks affected books for re-extraction.'
+)
+
+
 class SettingsWidget(QDialog):
     def __init__(self, settings: Settings):
         super().__init__()
         self.s = settings
         self.setWindowTitle(_('Semantic search settings'))
-        self.resize(760, 520)
+        self.resize(760, 610)
         v = QVBoxLayout(self)
         tabs = QTabWidget()
         v.addWidget(tabs)
@@ -116,10 +227,47 @@ class SettingsWidget(QDialog):
         av.addLayout(btns)
         tabs.addTab(att_tab, _('Attributes'))
 
+        # -- help box + per-option hints -----------------------------------------
+        self.help_box = QTextEdit()
+        self.help_box.setReadOnly(True)
+        self.help_box.setMaximumHeight(80)
+        self.help_box.setPlainText(HELP_DEFAULT)
+        v.addWidget(self.help_box)
+
+        self._help_filter = _HelpFilter(self.help_box)
+        B = self._bind_help
+        B(HELP_SERVER_URL, self.e_base_url, f.labelForField(self.e_base_url))
+        B(HELP_MODEL, self.e_model, f.labelForField(self.e_model))
+        B(HELP_API_KEY, self.e_api_key, f.labelForField(self.e_api_key))
+        B(HELP_BATCH, self.e_batch, f.labelForField(self.e_batch))
+        B(HELP_CONCURRENCY, self.e_conc, f.labelForField(self.e_conc))
+        B(HELP_TIMEOUT, self.e_timeout, f.labelForField(self.e_timeout))
+        B(HELP_BACKEND, self.i_backend, f2.labelForField(self.i_backend))
+        B(HELP_FORMATS, self.i_formats, f2.labelForField(self.i_formats))
+        B(HELP_TARGET, self.i_target, f2.labelForField(self.i_target))
+        B(HELP_OVERLAP, self.i_overlap, f2.labelForField(self.i_overlap))
+        B(HELP_MAX_CHUNKS, self.i_maxchunks, f2.labelForField(self.i_maxchunks))
+        B(HELP_ATTR_MODE, self.i_attrmode, f2.labelForField(self.i_attrmode))
+        for col, key in enumerate((HELP_ATTR_ENABLED, HELP_ATTR_NAME, HELP_ATTR_TYPE, HELP_ATTR_DESC)):
+            item = self.attr_table.horizontalHeaderItem(col)
+            if item is not None:
+                item.setToolTip(key)
+        B(HELP_ATTR_TABLE, self.attr_table)
+
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.accepted.connect(self._collect_and_accept)
         box.rejected.connect(self.reject)
         v.addWidget(box)
+
+    def _bind_help(self, text: str, *widgets):
+        """Give widgets a tooltip and make hovering them update the help box."""
+        for w in widgets:
+            if w is None:
+                continue
+            w._help_text = text
+            w.setToolTip(text)
+            w.setWhatsThis(text)
+            w.installEventFilter(self._help_filter)
 
     # -- attribute table ---------------------------------------------------------
 

@@ -124,5 +124,66 @@ class TestVecHelpers(unittest.TestCase):
         self.assertEqual(list(v), [0.0, 0.0])
 
 
+def _lancedb_available():
+    try:
+        import lancedb  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+@unittest.skipUnless(_lancedb_available(), 'lancedb not installed')
+class TestVectorStoreLance(unittest.TestCase):
+    """Runtime coverage for the LanceDB backend (forced, not auto)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'test.db')
+        self.s = store.VectorStore(self.path, backend='lancedb')
+
+    def tearDown(self):
+        self.s.close()
+        self.tmp.cleanup()
+
+    def test_backend_selected(self):
+        self.assertEqual(self.s.backend_name, 'lancedb')
+
+    def test_roundtrip_search_and_chunks_text(self):
+        import math
+        from dataclasses import dataclass
+
+        @dataclass
+        class C:
+            chunk_no: int
+            text: str
+            chapter_path: list = None
+            para_start: int = 0
+            para_end: int = 0
+            char_offset: int = 0
+
+        s = self.s
+        chunks = [C(i, f'text of chunk {i}', ['Ch', f'S{i}'], i, i + 3, i * 10) for i in range(5)]
+        dim = 8
+        vecs = [[math.cos(i * 0.3 + t) for t in range(dim)] for i in range(5)]
+        for c, v in zip(chunks, vecs):
+            s.insert_chunk(1, c, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, 'test-model', dim, store.l2_normalize(v))
+        s.commit()
+        s.upsert_book(1, 'EPUB', 5, 'test-model', dim)
+
+        results = s.search([1.0] * dim, limit=3)
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[0].book_id, 1)
+        for a, b in zip(results, results[1:]):
+            self.assertGreaterEqual(a.score, b.score)
+
+        self.assertEqual(s.book_chunks_text(1), [f'text of chunk {i}' for i in range(5)])
+
+        s.clear_book(1)
+        self.assertFalse(s.book_is_indexed(1))
+        self.assertEqual(s.book_chunks_text(1), [])
+        self.assertEqual(s.search([1.0] * dim), [])
+
+
 if __name__ == '__main__':
     unittest.main()

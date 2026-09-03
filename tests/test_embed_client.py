@@ -14,6 +14,7 @@ class _Handler(BaseHTTPRequestHandler):
     # server-side state set by tests
     fail_times = 0
     seen_auth = None
+    echo = False
 
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
@@ -25,7 +26,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b'{"error": "boom"}')
             return
-        data = [{'object': 'embedding', 'index': i, 'embedding': [float(i), 1.0 / (i + 1)]} for i in range(len(body['input']))]
+        if type(self).echo:
+            # vector derived from the text itself so order can be verified
+            data = [{'object': 'embedding', 'index': i, 'embedding': [float(t), 0.0]} for i, t in enumerate(body['input'])]
+        else:
+            data = [{'object': 'embedding', 'index': i, 'embedding': [float(i), 1.0 / (i + 1)]} for i in range(len(body['input']))]
         resp = json.dumps({'object': 'list', 'data': data, 'model': body.get('model', '')}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
@@ -67,6 +72,18 @@ class TestEmbedClient(unittest.TestCase):
         self.assertEqual(out[0], [0.0, 1.0])
         self.assertEqual(out[1], [1.0, 0.5])
         self.assertEqual(out[2], [2.0, 1.0 / 3])
+
+    def test_parallel_batches_preserve_order(self):
+        _Handler.echo = True
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
+            texts = [str(i) for i in range(8)]
+            calls = []
+            out = c.embed_batched(texts, batch_size=2, concurrency=4, progress=lambda d, t: calls.append((d, t)))
+            self.assertEqual([v[0] for v in out], [float(i) for i in range(8)])
+            self.assertEqual(calls[-1], (8, 8))
+        finally:
+            _Handler.echo = False
 
     def test_api_key_header(self):
         c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', api_key='sekret', max_retries=2)
