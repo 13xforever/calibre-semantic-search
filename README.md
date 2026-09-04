@@ -38,8 +38,9 @@ attributes in custom columns.
    python -m zipfile -c semantic_search.zip `
      __init__.py gui.py dialog.py store.py chunker.py indexer.py `
      embed_client.py attributes.py config_widget.py utils.py `
-     plugin-import-name-semantic_search.txt semantic_search.png
-   ```
+      plugin-import-name-semantic_search.txt semantic_search.png `
+      semantic_search-for-light-theme.png semantic_search-for-dark-theme.png
+    ```
 
 2. In calibre: *Preferences > Plugins > Custom plugins > `+`* and pick the ZIP.
 3. Open the new **Semantic search** menu (toolbar dropdown or the icon in the

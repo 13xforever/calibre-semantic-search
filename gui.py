@@ -15,20 +15,33 @@ from .utils import load_settings, save_settings
 
 
 def _plugin_icon(name):
-    """Load a PNG shipped with the plugin (zip resource when installed, file when running from source)."""
-    g = globals().get('get_icons')
-    if callable(g):
-        try:
-            ic = g(name)
-            if ic is not None and not ic.isNull():
-                return ic
-        except Exception:
-            pass
-    p = os.path.join(os.path.dirname(__file__), name)
-    if os.path.exists(p):
-        from qt.core import QIcon
+    """Load a PNG shipped with the plugin (zip resource when installed, file when running from source).
 
-        return QIcon(p)
+    Prefers calibre's theme-variant naming (<name>-for-dark-theme.png /
+    <name>-for-light-theme.png) so the icon matches the active palette.
+    """
+    stem, ext = os.path.splitext(name)
+    candidates = [name]
+    try:
+        from calibre.gui2 import is_dark_theme
+
+        candidates.insert(0, f'{stem}-for-{"dark" if is_dark_theme() else "light"}-theme{ext}')
+    except Exception:
+        pass
+    for cand in candidates:
+        g = globals().get('get_icons')
+        if callable(g):
+            try:
+                ic = g(cand)
+                if ic is not None and not ic.isNull():
+                    return ic
+            except Exception:
+                pass
+        p = os.path.join(os.path.dirname(__file__), cand)
+        if os.path.exists(p):
+            from qt.core import QIcon
+
+            return QIcon(p)
     return None
 
 
@@ -126,17 +139,38 @@ class SemanticSearchAction(InterfaceAction):
 
     # -- lifecycle -----------------------------------------------------------
 
+    def _apply_theme_icon(self):
+        # (re)resolve the plugin icon for the active light/dark theme and apply it
+        # everywhere it is shown; also called on app.palette_changed so live
+        # theme switches in Preferences > Appearance are picked up without a restart
+        icon = _plugin_icon('semantic_search.png')
+        if icon is None:
+            return
+        self.qaction.setIcon(icon)
+        if getattr(self, '_search_menu_action', None) is not None:
+            self._search_menu_action.setIcon(icon)
+        if self.search_action is not None:
+            self.search_action.setIcon(icon)
+
+    def _hook_palette_changes(self):
+        if getattr(self, '_palette_hooked', False):
+            return
+        try:
+            from calibre.gui2 import qapplication_or_fail
+
+            app = qapplication_or_fail()
+            app.palette_changed.connect(self._apply_theme_icon)
+            self._palette_hooked = True
+        except Exception:
+            pass
+
     def genesis(self):
         m = self.qaction.menu()
         assert m is not None
-        icon = _plugin_icon('semantic_search.png')
-        if icon is not None:
-            self.qaction.setIcon(icon)
         # main button click opens the search dialog; the arrow shows this menu
         self.qaction.triggered.connect(self.open_dialog)
         ac_search = self.create_action(spec=(_('Search...'), 'semantic_search.png', _('Open the semantic search dialog'), None), attr='search')
-        if icon is not None:
-            ac_search.setIcon(icon)
+        self._search_menu_action = ac_search
         ac_search.triggered.connect(self.open_dialog)
         m.addAction(ac_search)
         ac_status = self.create_action(spec=(_('Index status'), 'book.png', _('Show indexing status'), None), attr='status')
@@ -166,6 +200,8 @@ class SemanticSearchAction(InterfaceAction):
         ac_settings = self.create_action(spec=(_('Settings'), 'config.png', _('Semantic search settings'), None), attr='settings')
         ac_settings.triggered.connect(self.open_settings)
         m.addAction(ac_settings)
+        self._apply_theme_icon()
+        self._hook_palette_changes()
 
     def initialization_complete(self):
         # called once at GUI startup; library_changed only fires on library switches
@@ -178,6 +214,8 @@ class SemanticSearchAction(InterfaceAction):
                 self.search_action.triggered.connect(self.open_dialog)
         except Exception:
             self.search_action = None
+        self._apply_theme_icon()
+        self._hook_palette_changes()
         self._start_for_library()
 
     def _ensure_started(self) -> bool:

@@ -22,6 +22,15 @@ def _install_qt_stubs():
 
     qtcore.QToolButton = _QToolButton
     qtcore.pyqtSignal = lambda *a, **k: None
+
+    class QIcon:
+        def __init__(self, path=''):
+            self.path = path
+
+        def isNull(self):
+            return not self.path
+
+    qtcore.QIcon = QIcon
     _sys.modules['qt.core'] = qtcore
 
     cal = types.ModuleType('calibre')
@@ -117,6 +126,27 @@ class TestStatusLines(unittest.TestCase):
     def test_no_api_falls_back_to_indexed(self):
         lines = _status_lines(None)
         self.assertEqual(lines[0], 'Indexed books: 2')
+
+
+class TestPluginIconTheme(unittest.TestCase):
+    def _pick(self, dark):
+        gui2 = _sys.modules['calibre.gui2']
+        gui2.is_dark_theme = lambda: dark
+        try:
+            return gui._plugin_icon('semantic_search.png')
+        finally:
+            del gui2.is_dark_theme
+
+    def test_dark_theme_picks_dark_variant(self):
+        # Regression: the variant suffix must be inserted before the file
+        # extension (semantic_search-for-dark-theme.png), not appended to the
+        # whole filename.
+        ic = self._pick(True)
+        self.assertEqual(ic.path, _os.path.join(ROOT, 'semantic_search-for-dark-theme.png'))
+
+    def test_light_theme_picks_light_variant(self):
+        ic = self._pick(False)
+        self.assertEqual(ic.path, _os.path.join(ROOT, 'semantic_search-for-light-theme.png'))
 
 
 if __name__ == '__main__':
