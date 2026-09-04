@@ -7,6 +7,7 @@ from qt.core import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QEvent,
     QFormLayout,
     QHBoxLayout,
@@ -131,6 +132,13 @@ HELP_MAX_CHUNKS = _(
     'disk usage down for very long books.'
 )
 
+HELP_MIN_SCORE = _(
+    'Search results are only shown when their similarity score reaches this value (0–1).\n'
+    'Higher values return fewer, more relevant matches; 0 shows everything. A good starting range is '
+    '0.2–0.4 — scores vary between embedding models, so adjust to taste.\n\n'
+    'There is still a hard cap of 1000 rows per search to keep the table responsive.'
+)
+
 HELP_ATTR_MODE = _(
     'sampled: one LLM call over an evenly spaced sample of the book (sized from the context limit below) — '
     'fast and cheap, good for most books.\n'
@@ -232,6 +240,11 @@ class SettingsWidget(QDialog):
         self.i_maxchunks.setRange(0, 100000)
         self.i_maxchunks.setValue(self.s.max_chunks_per_book)
         self.i_maxchunks.setSpecialValueText(_('Unlimited'))
+        self.i_min_score = QDoubleSpinBox()
+        self.i_min_score.setRange(0.0, 1.0)
+        self.i_min_score.setSingleStep(0.05)
+        self.i_min_score.setDecimals(2)
+        self.i_min_score.setValue(self.s.search_min_score)
         self.i_attrmode = QComboBox()
         self.i_attrmode.addItems(['sampled', 'fulltext'])
         self.i_attrmode.setCurrentText(self.s.attr_mode)
@@ -249,6 +262,7 @@ class SettingsWidget(QDialog):
         f2.addRow(_('Overlap (chars):'), self.i_overlap)
         f2.addRow(_('Embedding context limit (tokens):'), self.i_embed_ctx)
         f2.addRow(_('Max chunks per book:'), self.i_maxchunks)
+        f2.addRow(_('Minimum match score (search):'), self.i_min_score)
         f2.addRow(_('Attribute extraction mode:'), self.i_attrmode)
         tabs.addTab(idx_tab, _('Indexing'))
 
@@ -317,6 +331,7 @@ class SettingsWidget(QDialog):
         B(HELP_OVERLAP, self.i_overlap, f2.labelForField(self.i_overlap))
         B(HELP_EMBED_CONTEXT, self.i_embed_ctx, f2.labelForField(self.i_embed_ctx))
         B(HELP_MAX_CHUNKS, self.i_maxchunks, f2.labelForField(self.i_maxchunks))
+        B(HELP_MIN_SCORE, self.i_min_score, f2.labelForField(self.i_min_score))
         B(HELP_ATTR_MODE, self.i_attrmode, f2.labelForField(self.i_attrmode))
         for col, key in enumerate((HELP_ATTR_ENABLED, HELP_ATTR_NAME, HELP_ATTR_TYPE, HELP_ATTR_DESC)):
             item = self.attr_table.horizontalHeaderItem(col)
@@ -445,6 +460,7 @@ class SettingsWidget(QDialog):
         s.overlap_chars = self.i_overlap.value()
         s.embed_context_tokens = self.i_embed_ctx.value()
         s.max_chunks_per_book = self.i_maxchunks.value()
+        s.search_min_score = self.i_min_score.value()
         s.attr_mode = self.i_attrmode.currentText()
         s.attr_context_tokens = self.e_ctx.value()
         s.auto_extract_attributes = bool(self.e_auto_attr.isChecked())

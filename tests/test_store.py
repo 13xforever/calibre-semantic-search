@@ -68,6 +68,29 @@ class TestVectorStore(unittest.TestCase):
         self.assertIn('text of chunk', r.text)
         self.assertEqual(r.chapter_path, ['Ch', f'S{r.chunk_no}'])
 
+    def test_search_min_score_filters(self):
+        s = self.s
+        chunks = self._chunks()
+        import math
+
+        dim = 8
+        vecs = [[math.cos(i * 0.3 + t) for t in range(dim)] for i in range(5)]
+        q = [1.0] * dim
+        for c, v in zip(chunks, vecs):
+            s.insert_chunk(1, c, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, 'test-model', dim, store.l2_normalize(v))
+        s.commit()
+        s.upsert_book(1, 'EPUB', 5, 'test-model', dim)
+
+        all_res = s.search(q, limit=10)
+        self.assertEqual(len(all_res), 5)
+        scores = [r.score for r in all_res]
+        # threshold between the 2nd and 3rd best score keeps exactly the top 2
+        mid = (scores[1] + scores[2]) / 2.0
+        top2 = s.search(q, limit=10, min_score=mid)
+        self.assertEqual([r.chunk_no for r in top2], [r.chunk_no for r in all_res[:2]])
+        # threshold above the best score returns nothing
+        self.assertEqual(s.search(q, limit=10, min_score=scores[0] + 0.001), [])
+
     def test_dim_mismatch_isolated(self):
         s = self.s
         chunks = self._chunks()[:1]

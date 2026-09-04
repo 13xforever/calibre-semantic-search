@@ -40,7 +40,10 @@ class EmbedClient:
             try:
                 req = urllib.request.Request(url, data=body, headers=self._headers(), method='POST')
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    return json.loads(resp.read().decode('utf-8'))
+                    raw = resp.read()
+                    if not raw.strip():
+                        raise EmbedError(f'empty response from {url}')
+                    return json.loads(raw.decode('utf-8'))
             except urllib.error.HTTPError as e:
                 detail = ''
                 try:

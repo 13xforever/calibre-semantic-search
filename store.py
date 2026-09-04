@@ -449,7 +449,7 @@ class LanceVectorBackend:
         candidates = []
         for t in self._all_tables():
             try:
-                df = t.search(vec).limit(limit * 3).to_pandas()
+                df = t.search(vec).metric('cosine').limit(limit * 3).to_pandas()
             except Exception:
                 continue
             if df is None or len(df) == 0:
@@ -464,8 +464,9 @@ class LanceVectorBackend:
         out = []
         for _, r in df.iterrows():
             s = float(r['_distance'])
-            # lancedb returns L2 distance by default; monotonic cosine-like score for unit vectors
-            score = 1.0 / (1.0 + s)
+            # cosine distance = 1 - similarity; stored vectors are normalized, so this is the
+            # same cosine-similarity scale as the sqlite backend (dot product of unit vectors)
+            score = 1.0 - s
             if score < min_score:
                 continue
             out.append(

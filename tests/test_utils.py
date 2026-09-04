@@ -20,6 +20,7 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertEqual(s.embed.base_url, 'http://localhost:11434')
         self.assertEqual(len(s.attributes), 7)
         self.assertTrue(all(a.enabled for a in s.attributes))
+        self.assertEqual(s.search_min_score, 0.2)
 
     def test_save_load_roundtrip(self):
         get, set_ = self._prefs()
@@ -29,6 +30,7 @@ class TestSettingsRoundtrip(unittest.TestCase):
         s.vector_backend = 'lancedb'
         s.target_chars = 777
         s.embed_context_tokens = 4096
+        s.search_min_score = 0.35
         s.attr_mode = 'fulltext'
         s.attributes[0].enabled = False
         utils.save_settings(set_, s)
@@ -39,6 +41,7 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertEqual(s2.vector_backend, 'lancedb')
         self.assertEqual(s2.target_chars, 777)
         self.assertEqual(s2.embed_context_tokens, 4096)
+        self.assertEqual(s2.search_min_score, 0.35)
         self.assertEqual(s2.attr_mode, 'fulltext')
         self.assertFalse(s2.attributes[0].enabled)
         self.assertTrue(s2.attributes[1].enabled)
