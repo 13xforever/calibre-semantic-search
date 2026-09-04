@@ -63,6 +63,51 @@ class TestGroupParagraphs(unittest.TestCase):
         self.assertEqual(chunks[-1].para_end, 9)
 
 
+class TestEstimateTokens(unittest.TestCase):
+    def test_latin(self):
+        self.assertEqual(chunker.estimate_tokens('x' * 350), 100)
+
+    def test_cyrillic_is_denser_than_latin(self):
+        self.assertGreater(chunker.estimate_tokens('а' * 350), chunker.estimate_tokens('x' * 350))
+        self.assertEqual(chunker.estimate_tokens('а' * 1000), 400)
+
+    def test_cjk_is_denser_than_cyrillic(self):
+        self.assertGreater(chunker.estimate_tokens('中' * 100), chunker.estimate_tokens('x' * 100))
+        self.assertEqual(chunker.estimate_tokens('中' * 1000), 1200)
+
+    def test_mixed_scripts(self):
+        # 350 latin (100 tokens) + 1000 cyrillic (400 tokens)
+        self.assertEqual(chunker.estimate_tokens('x' * 350 + 'а' * 1000), 500)
+
+
+class TestTokenCap(unittest.TestCase):
+    def test_cyrillic_chunks_respect_token_cap(self):
+        paras = ['б' * 500 for _ in range(12)]  # 500 cyrillic chars = 200 tokens each
+        chunks = chunker.group_paragraphs(paras, [[] for _ in paras], 100000, 0, max_tokens=450)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(chunker.estimate_tokens(c.text), 450 + 2)
+
+    def test_cjk_chunks_respect_token_cap(self):
+        paras = ['中' * 800 for _ in range(6)]  # 800 CJK chars = 960 tokens each
+        chunks = chunker.group_paragraphs(paras, [[] for _ in paras], 100000, 0, max_tokens=2000)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(chunker.estimate_tokens(c.text), 2000 + 2)
+
+    def test_english_unaffected_when_cap_not_binding(self):
+        paras = [f'paragraph number {i} ' + 'x' * 50 for i in range(20)]
+        paths = [[f'ch{i // 5}'] for i in range(20)]
+        a = chunker.group_paragraphs(paras, paths, 300, 0)
+        b = chunker.group_paragraphs(paras, paths, 300, 0, max_tokens=100000)
+        self.assertEqual([c.text for c in a], [c.text for c in b])
+
+    def test_plain_text_passthrough(self):
+        text = ('中' * 500 + '\n\n' + '中' * 500)
+        chunks = chunker.split_plain_text(text, 100000, 0, max_tokens=900)
+        self.assertGreater(len(chunks), 1)
+
+
 class TestPageToParagraphs(unittest.TestCase):
     def test_headings_build_path(self):
         html = '<html><body><h1>Chapter One</h1><p>First para.</p><h2>Scene</h2><p>Second para.</p></body></html>'

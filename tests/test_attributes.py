@@ -114,6 +114,32 @@ class TestBudget(unittest.TestCase):
         self.assertGreaterEqual(attributes.text_budget_chars(0), attributes.MIN_TEXT_CHARS)
 
 
+class TestTokenBudget(unittest.TestCase):
+    def test_latin_estimate(self):
+        self.assertEqual(attributes.estimate_tokens('x' * 350), 100)
+
+    def test_cyrillic_estimate(self):
+        self.assertEqual(attributes.estimate_tokens('ж' * 1000), 400)
+
+    def test_sample_all_fits(self):
+        chunks = ['ж' * 100 for _ in range(3)]  # 40 tokens each
+        out = attributes.sample_text(chunks, max_tokens=1000)
+        self.assertEqual(out, '\n\n'.join(chunks))
+
+    def test_sample_cyrillic_respects_token_budget(self):
+        chunks = ['ж' * 2000 for _ in range(10)]  # 800 tokens each
+        out = attributes.sample_text(chunks, max_tokens=1700)
+        self.assertIn('ж', out)
+        self.assertLessEqual(attributes.estimate_tokens(out), 1700 + 5)
+
+    def test_map_split_token_budget(self):
+        chunks = ['ж' * 2000 for _ in range(4)]  # 800 tokens each
+        groups = attributes._split_for_map(chunks, group_tokens=1700)
+        self.assertEqual(len(groups), 2)
+        for g in groups:
+            self.assertLessEqual(attributes.estimate_tokens(g), 1700 + 5)
+
+
 class TestBuildSchema(unittest.TestCase):
     def test_annotations(self):
         cls = attributes.build_schema_class(_FIELDS)

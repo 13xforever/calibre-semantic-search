@@ -128,6 +128,34 @@ class TestStatusLines(unittest.TestCase):
         self.assertEqual(lines[0], 'Indexed books: 2')
 
 
+class _FakeIconSink:
+    def __init__(self):
+        self.icons = []
+
+    def setIcon(self, ic):
+        self.icons.append(ic)
+
+
+class TestThemeIconRefresh(unittest.TestCase):
+    def _run(self, paused=None):
+        a = object.__new__(gui.SemanticSearchAction)
+        a.indexer = types.SimpleNamespace(paused=paused) if paused is not None else None
+        a.qaction = _FakeIconSink()
+        a.search_action = None
+        seen = []
+        a._set_pause_label = lambda p: seen.append(p)
+        gui.SemanticSearchAction._apply_theme_icon(a)
+        return seen
+
+    def test_refresh_passes_unpaused_state(self):
+        # palette_changed must re-request the pause/resume standard icon with
+        # the current (unpaused) state so it is regenerated for the new theme
+        self.assertEqual(self._run(), [False])
+
+    def test_refresh_preserves_paused_state(self):
+        self.assertEqual(self._run(True), [True])
+
+
 class TestPluginIconTheme(unittest.TestCase):
     def _pick(self, dark):
         gui2 = _sys.modules['calibre.gui2']
@@ -147,6 +175,32 @@ class TestPluginIconTheme(unittest.TestCase):
     def test_light_theme_picks_light_variant(self):
         ic = self._pick(False)
         self.assertEqual(ic.path, _os.path.join(ROOT, 'semantic_search-for-light-theme.png'))
+
+
+class TestPauseIconTheme(unittest.TestCase):
+    def _path(self, paused, dark):
+        gui2 = _sys.modules['calibre.gui2']
+        gui2.is_dark_theme = lambda: dark
+        try:
+            a = object.__new__(gui.SemanticSearchAction)
+            ic = gui.SemanticSearchAction._pause_icon(a, paused)
+            return ic.path
+        finally:
+            del gui2.is_dark_theme
+
+    def test_pause_glyph_light(self):
+        self.assertEqual(self._path(False, False), _os.path.join(ROOT, 'semantic_pause-for-light-theme.png'))
+
+    def test_pause_glyph_dark(self):
+        # Qt's standard media icons are fixed near-black in both themes, so the
+        # pause/resume glyphs must come from the shipped themed variants
+        self.assertEqual(self._path(False, True), _os.path.join(ROOT, 'semantic_pause-for-dark-theme.png'))
+
+    def test_play_glyph_light(self):
+        self.assertEqual(self._path(True, False), _os.path.join(ROOT, 'semantic_play-for-light-theme.png'))
+
+    def test_play_glyph_dark(self):
+        self.assertEqual(self._path(True, True), _os.path.join(ROOT, 'semantic_play-for-dark-theme.png'))
 
 
 if __name__ == '__main__':

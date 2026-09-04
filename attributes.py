@@ -10,8 +10,57 @@ from typing import Annotated, Any, Optional
 
 DEFAULT_CONTEXT_TOKENS = 8192
 OVERHEAD_TOKENS = 1024  # reserved for prompt + field schema + output + safety margin
-CHARS_PER_TOKEN = 3.5  # conservative chars-per-token for English text
 MIN_TEXT_CHARS = 2000  # floor so a tiny context limit still yields a usable sample
+
+# Script-aware token estimation (kept in sync with chunker.py; this module is
+# loaded standalone in tests and cannot import from the plugin package).
+CHARS_PER_TOKEN = 3.5            # Latin text (and fallback)
+NONLATIN_CHARS_PER_TOKEN = 2.5   # Cyrillic, Greek, Arabic, Hebrew, Devanagari, Thai, ...
+DENSE_TOKENS_PER_CHAR = 1.2      # CJK ideographs, kana, hangul: roughly one token per char
+
+_DENSE_RANGES = (
+    (0x3000, 0x30FF),   # CJK punctuation + Japanese kana
+    (0x3400, 0x4DBF),   # CJK extension A
+    (0x4E00, 0x9FFF),   # CJK unified ideographs
+    (0xAC00, 0xD7AF),   # Hangul syllables
+    (0xF900, 0xFAFF),   # CJK compatibility
+    (0xFF00, 0xFFEF),   # fullwidth forms
+    (0x20000, 0x2EBEF),  # CJK extension B+
+)
+_NONLATIN_RANGES = (
+    (0x0370, 0x03FF),   # Greek
+    (0x0400, 0x052F),   # Cyrillic
+    (0x0530, 0x058F),   # Armenian
+    (0x0590, 0x05FF),   # Hebrew
+    (0x0600, 0x06FF),   # Arabic
+    (0x0750, 0x077F),   # Arabic supplement
+    (0x0900, 0x097F),   # Devanagari
+    (0x0E00, 0x0E7F),   # Thai
+    (0x10A0, 0x10FF),   # Georgian
+    (0xFB50, 0xFDFF),   # Arabic presentation forms A
+    (0xFE70, 0xFEFF),   # Arabic presentation forms B
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """Script-aware token estimate for `text` (conservative; see constants above)."""
+    dense = nonlatin = 0
+    for ch in text:
+        cp = ord(ch)
+        if cp < 0x370:
+            continue
+        for lo, hi in _DENSE_RANGES:
+            if lo <= cp <= hi:
+                dense += 1
+                break
+        else:
+            for lo, hi in _NONLATIN_RANGES:
+                if lo <= cp <= hi:
+                    nonlatin += 1
+                    break
+    latin = len(text) - dense - nonlatin
+    total = dense * DENSE_TOKENS_PER_CHAR + nonlatin / NONLATIN_CHARS_PER_TOKEN + latin / CHARS_PER_TOKEN
+    return max(1, int(total + 0.5))
 
 
 def text_budget_chars(context_tokens: int) -> int:
@@ -76,28 +125,57 @@ def _chunks_for_book(store, book_id: int):
     return store.book_chunks_text(book_id)
 
 
-def sample_text(chunks: list[str], max_chars: int | None = None) -> str:
-    """Evenly sample chunks across the book, capped at max_chars."""
-    if max_chars is None:
-        max_chars = text_budget_chars(DEFAULT_CONTEXT_TOKENS)
+def sample_text(chunks: list[str], max_chars: int | None = None, max_tokens: int | None = None) -> str:
+    """Evenly sample chunks across the book, capped by a char or token budget.
+
+    The token budget (max_tokens) is script-aware and preferred for LLM prompts:
+    it keeps foreign-language text inside the model's context window.
+    """
     if not chunks:
         return ''
-    total = sum(len(c) for c in chunks)
-    if total <= max_chars:
+    if max_tokens is None:
+        if max_chars is None:
+            max_chars = text_budget_chars(DEFAULT_CONTEXT_TOKENS)
+        total = sum(len(c) for c in chunks)
+        if total <= max_chars:
+            return '\n\n'.join(chunks)
+        # pick evenly spaced chunks until budget is spent
+        step = max(1, len(chunks) * total // max_chars)
+        picked = [chunks[i] for i in range(0, len(chunks), step)]
+        out, used = [], 0
+        for c in picked:
+            if used + len(c) > max_chars and out:
+                break
+            out.append(c)
+            used += len(c)
+        return '\n\n'.join(out)
+    toks = [estimate_tokens(c) for c in chunks]
+    total_tok = sum(toks)
+    if total_tok <= max_tokens:
         return '\n\n'.join(chunks)
-    # pick evenly spaced chunks until budget is spent
-    step = max(1, len(chunks) * total // max_chars)
-    picked = [chunks[i] for i in range(0, len(chunks), step)]
+    step = max(1, len(chunks) * total_tok // max_tokens)
     out, used = [], 0
-    for c in picked:
-        if used + len(c) > max_chars and out:
+    for i in range(0, len(chunks), step):
+        if used + toks[i] > max_tokens and out:
             break
-        out.append(c)
-        used += len(c)
+        out.append(chunks[i])
+        used += toks[i]
     return '\n\n'.join(out)
 
 
-def _split_for_map(chunks: list[str], group_chars: int | None = None):
+def _split_for_map(chunks: list[str], group_chars: int | None = None, group_tokens: int | None = None):
+    if group_tokens is not None:
+        toks = [estimate_tokens(c) for c in chunks]
+        groups, cur, used = [], [], 0
+        for c, t in zip(chunks, toks):
+            if cur and used + t > group_tokens:
+                groups.append('\n\n'.join(cur))
+                cur, used = [], 0
+            cur.append(c)
+            used += t
+        if cur:
+            groups.append('\n\n'.join(cur))
+        return groups
     if group_chars is None:
         group_chars = text_budget_chars(DEFAULT_CONTEXT_TOKENS)
     groups, cur, used = [], [], 0
@@ -161,11 +239,11 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
     chunks = _chunks_for_book(store, book_id)
     if not chunks:
         return {}
-    budget = text_budget_chars(settings.attr_context_tokens)
+    max_tok = settings.attr_context_tokens - OVERHEAD_TOKENS
 
     values: dict[str, Any] = {}
     if settings.attr_mode == 'fulltext':
-        groups = _split_for_map(chunks, budget)
+        groups = _split_for_map(chunks, group_tokens=max_tok)
         partials = []
         for i, g in enumerate(groups):
             if progress_cb:
@@ -191,7 +269,7 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
                     merged[f.name] = nv  # keep last non-empty
         values = merged
     else:
-        text = sample_text(chunks, budget)
+        text = sample_text(chunks, max_tokens=max_tok)
         res = llm.generate_structured_output(_prompt_for(text, fields), schema, 'You are extracting book attributes. Use only information actually present in the text.')
         if res.exception is not None:
             raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')

@@ -13,7 +13,9 @@ calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extrac
     __init__.py gui.py dialog.py store.py chunker.py indexer.py `
     embed_client.py attributes.py config_widget.py utils.py `
     plugin-import-name-semantic_search.txt semantic_search.png `
-    semantic_search-for-light-theme.png semantic_search-for-dark-theme.png
+    semantic_search-for-light-theme.png semantic_search-for-dark-theme.png `
+    semantic_pause.png semantic_pause-for-light-theme.png semantic_pause-for-dark-theme.png `
+    semantic_play.png semantic_play-for-light-theme.png semantic_play-for-dark-theme.png
   ```
 
 **After any change to a shipped file**: run the full test suite + compile check, and rebuild `semantic_search.zip` so it always matches the working tree. Don't hand off a task with failing tests or a stale ZIP.

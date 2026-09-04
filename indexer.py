@@ -13,7 +13,7 @@ import threading
 import time
 import unicodedata
 
-from .chunker import chunks_from_pages, max_chunk_chars, split_plain_text
+from .chunker import CONTEXT_OVERHEAD_TOKENS, chunks_from_pages, max_chunk_chars, split_plain_text
 from .store import VectorStore
 
 
@@ -394,10 +394,12 @@ class Indexer(threading.Thread):
             return
 
         eff_target = min(settings.target_chars, max_chunk_chars(settings.embed_context_tokens))
+        # hard per-chunk token cap so non-Latin scripts stay inside the model's context
+        max_tokens = settings.embed_context_tokens - CONTEXT_OVERHEAD_TOKENS
         if kind == 'pages':
-            chunks = chunks_from_pages(payload, eff_target, settings.overlap_chars)
+            chunks = chunks_from_pages(payload, eff_target, settings.overlap_chars, max_tokens=max_tokens)
         else:
-            chunks = split_plain_text(payload or '', eff_target, settings.overlap_chars)
+            chunks = split_plain_text(payload or '', eff_target, settings.overlap_chars, max_tokens=max_tokens)
         if settings.max_chunks_per_book > 0:
             chunks = chunks[: settings.max_chunks_per_book]
         if not chunks:

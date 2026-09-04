@@ -144,13 +144,17 @@ class SemanticSearchAction(InterfaceAction):
         # everywhere it is shown; also called on app.palette_changed so live
         # theme switches in Preferences > Appearance are picked up without a restart
         icon = _plugin_icon('semantic_search.png')
-        if icon is None:
-            return
-        self.qaction.setIcon(icon)
-        if getattr(self, '_search_menu_action', None) is not None:
-            self._search_menu_action.setIcon(icon)
-        if self.search_action is not None:
-            self.search_action.setIcon(icon)
+        if icon is not None:
+            self.qaction.setIcon(icon)
+            if getattr(self, '_search_menu_action', None) is not None:
+                self._search_menu_action.setIcon(icon)
+            if self.search_action is not None:
+                self.search_action.setIcon(icon)
+        # Qt's standard media icons (pause/resume) are generated from the active
+        # palette at request time, so re-request them for the new theme; a fresh
+        # or absent indexer is never paused
+        paused = self.indexer is not None and self.indexer.paused
+        self._set_pause_label(paused)
 
     def _hook_palette_changes(self):
         if getattr(self, '_palette_hooked', False):
@@ -500,7 +504,13 @@ class SemanticSearchAction(InterfaceAction):
                 act.setIcon(icon)
 
     def _pause_icon(self, paused):
-        # calibre ships no pause icon of its own; Qt's standard media icons are themed (light/dark)
+        # Ship our own pause/play glyphs with light/dark variants — Qt's standard
+        # media icons render as fixed near-black under both themes in this style.
+        # Fall back to the standard icon if the shipped files are missing.
+        name = 'semantic_play.png' if paused else 'semantic_pause.png'
+        ic = _plugin_icon(name)
+        if ic is not None:
+            return ic
         from qt.core import QStyle
 
         sp = QStyle.StandardPixmap.SP_MediaPlay if paused else QStyle.StandardPixmap.SP_MediaPause

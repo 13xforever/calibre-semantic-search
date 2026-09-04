@@ -27,24 +27,82 @@ class Chunk:
         return ' > '.join(self.chapter_path)
 
 
+# Chars-per-token by script class. Deliberately conservative: under-estimating
+# capacity keeps chunks inside the model's context window for foreign-language
+# text, at the cost of a few extra chunks.
+CHARS_PER_TOKEN = 3.5            # Latin text (and fallback)
+NONLATIN_CHARS_PER_TOKEN = 2.5   # Cyrillic, Greek, Arabic, Hebrew, Devanagari, Thai, ...
+DENSE_TOKENS_PER_CHAR = 1.2      # CJK ideographs, kana, hangul: roughly one token per char
+CONTEXT_OVERHEAD_TOKENS = 64     # reserved for the model's own wrapper tokens
+
+# Codepoint ranges for scripts that tokenize at ~1 token per character.
+_DENSE_RANGES = (
+    (0x3000, 0x30FF),   # CJK punctuation + Japanese kana
+    (0x3400, 0x4DBF),   # CJK extension A
+    (0x4E00, 0x9FFF),   # CJK unified ideographs
+    (0xAC00, 0xD7AF),   # Hangul syllables
+    (0xF900, 0xFAFF),   # CJK compatibility
+    (0xFF00, 0xFFEF),   # fullwidth forms
+    (0x20000, 0x2EBEF),  # CJK extension B+
+)
+# Other non-Latin space-separated scripts with fewer chars per token than Latin.
+_NONLATIN_RANGES = (
+    (0x0370, 0x03FF),   # Greek
+    (0x0400, 0x052F),   # Cyrillic
+    (0x0530, 0x058F),   # Armenian
+    (0x0590, 0x05FF),   # Hebrew
+    (0x0600, 0x06FF),   # Arabic
+    (0x0750, 0x077F),   # Arabic supplement
+    (0x0900, 0x097F),   # Devanagari
+    (0x0E00, 0x0E7F),   # Thai
+    (0x10A0, 0x10FF),   # Georgian
+    (0xFB50, 0xFDFF),   # Arabic presentation forms A
+    (0xFE70, 0xFEFF),   # Arabic presentation forms B
+)
+
+
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    """Script-aware token estimate for `text` (conservative; see constants above)."""
+    dense = nonlatin = 0
+    for ch in text:
+        cp = ord(ch)
+        if cp < 0x370:
+            continue
+        for lo, hi in _DENSE_RANGES:
+            if lo <= cp <= hi:
+                dense += 1
+                break
+        else:
+            for lo, hi in _NONLATIN_RANGES:
+                if lo <= cp <= hi:
+                    nonlatin += 1
+                    break
+    latin = len(text) - dense - nonlatin
+    total = dense * DENSE_TOKENS_PER_CHAR + nonlatin / NONLATIN_CHARS_PER_TOKEN + latin / CHARS_PER_TOKEN
+    return max(1, int(total + 0.5))
 
 
-CHARS_PER_TOKEN = 3.5  # conservative chars-per-token for English text
 MIN_CHUNK_CHARS = 200
 
 
 def max_chunk_chars(context_tokens: int) -> int:
-    """Largest chunk size (chars) that fits within the embedding model's input limit."""
-    return max(MIN_CHUNK_CHARS, int((context_tokens - 64) * CHARS_PER_TOKEN))
+    """Largest chunk size (chars, assuming Latin text) within the model's input limit.
+
+    Non-Latin scripts are additionally protected by the per-chunk token cap in
+    group_paragraphs (max_tokens), since their chars-per-token is lower.
+    """
+    return max(MIN_CHUNK_CHARS, int((context_tokens - CONTEXT_OVERHEAD_TOKENS) * CHARS_PER_TOKEN))
 
 
-def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], target_chars: int, overlap_chars: int) -> list[Chunk]:
+def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], target_chars: int, overlap_chars: int, max_tokens: int | None = None) -> list[Chunk]:
     """Group flat paragraph lists into chunks of ~target_chars with char overlap.
 
     paragraphs[i] and chapter_paths[i] must align. Returns chunks whose text is
     the joined paragraphs (plus a leading overlap tail from the previous chunk).
+    When max_tokens is given, a chunk is also closed once its script-aware token
+    estimate (estimate_tokens) exceeds it, so dense scripts such as CJK cannot
+    overflow the embedding model's context even when the char target allows more.
+    A single paragraph longer than the cap still gets its own chunk.
     """
     chunks: list[Chunk] = []
     n = len(paragraphs)
@@ -57,8 +115,11 @@ def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], targ
     if overlap_chars >= target_chars // 2:
         overlap_chars = target_chars // 5
 
+    para_toks = [estimate_tokens(p) for p in paragraphs] if max_tokens is not None else None
+
     cur_parts: list[str] = []
     cur_len = 0
+    cur_tok = 0.0
     start_idx: int | None = None
     end_idx: int | None = None
     offset_at_start = 0
@@ -70,7 +131,10 @@ def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], targ
         p = para.strip()
         if not p:
             continue
-        if cur_parts and start_idx is not None and cur_len + len(p) + 2 > target_chars:
+        add_len = len(p) + 2
+        add_tok = (para_toks[i] + 2 / CHARS_PER_TOKEN) if para_toks is not None else 0.0
+        over_tokens = para_toks is not None and cur_tok + add_tok > max_tokens
+        if cur_parts and start_idx is not None and (cur_len + add_len > target_chars or over_tokens):
             text = '\n\n'.join(cur_parts).strip()
             if text:
                 chunks.append(
@@ -87,6 +151,7 @@ def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], targ
             prev_tail = text[-overlap_chars:] if overlap_chars else ''
             cur_parts = []
             cur_len = 0
+            cur_tok = float(estimate_tokens(prev_tail)) if (para_toks is not None and prev_tail) else 0.0
             start_idx = end_idx = i
             offset_at_start = total_offset
             if prev_tail:
@@ -96,14 +161,17 @@ def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], targ
             if start_idx is None:
                 start_idx = end_idx = i
                 offset_at_start = total_offset
+                if para_toks is not None and prev_tail:
+                    cur_tok = float(estimate_tokens(prev_tail))
                 if prev_tail:
                     cur_parts.append(prev_tail)
                     cur_len += len(prev_tail) + 2
             else:
                 end_idx = i
         cur_parts.append(p)
-        cur_len += len(p) + 2
-        total_offset += len(p) + 2
+        cur_len += add_len
+        cur_tok += add_tok
+        total_offset += add_len
 
     if cur_parts:
         text = '\n\n'.join(cur_parts).strip()
@@ -121,11 +189,11 @@ def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], targ
     return chunks
 
 
-def split_plain_text(text: str, target_chars: int, overlap_chars: int) -> list[Chunk]:
+def split_plain_text(text: str, target_chars: int, overlap_chars: int, max_tokens: int | None = None) -> list[Chunk]:
     """Chunk a flat plain-text string (e.g. PDF extraction) on blank lines."""
     paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
     paths = [[] for _ in paragraphs]
-    return group_paragraphs(paragraphs, paths, target_chars, overlap_chars)
+    return group_paragraphs(paragraphs, paths, target_chars, overlap_chars, max_tokens)
 
 
 def html_to_units(html: str):
@@ -244,7 +312,7 @@ def page_to_paragraphs(html: str):
     return paragraphs, paths
 
 
-def chunks_from_pages(pages: list[str], target_chars: int, overlap_chars: int) -> list[Chunk]:
+def chunks_from_pages(pages: list[str], target_chars: int, overlap_chars: int, max_tokens: int | None = None) -> list[Chunk]:
     """Chunk a whole book given its spine pages as HTML strings."""
     all_paras: list[str] = []
     all_paths: list[list[str]] = []
@@ -254,4 +322,4 @@ def chunks_from_pages(pages: list[str], target_chars: int, overlap_chars: int) -
         paras, paths = page_to_paragraphs(page)
         all_paras.extend(paras)
         all_paths.extend(paths)
-    return group_paragraphs(all_paras, all_paths, target_chars, overlap_chars)
+    return group_paragraphs(all_paras, all_paths, target_chars, overlap_chars, max_tokens)
