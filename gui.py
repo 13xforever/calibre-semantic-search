@@ -218,6 +218,10 @@ class SemanticSearchAction(InterfaceAction):
                 self.search_action.triggered.connect(self.open_dialog)
         except Exception:
             self.search_action = None
+        try:
+            self._hook_book_details_menu()
+        except Exception as e:
+            print(f'semantic search: book details menu hook failed: {e!r}')
         self._apply_theme_icon()
         self._hook_palette_changes()
         self._start_for_library()
@@ -284,6 +288,10 @@ class SemanticSearchAction(InterfaceAction):
             print(f'semantic search: reconcile failed: {e!r}')
 
     def shutting_down(self):
+        try:
+            self._unhook_book_details_menu()
+        except Exception:
+            pass
         self._stop_indexer()
         if self.store is not None:
             try:
@@ -519,6 +527,151 @@ class SemanticSearchAction(InterfaceAction):
         except Exception:
             return None
 
+    # -- Book Details context menu -------------------------------------------------
+
+    def _hook_book_details_menu(self):
+        """Add per-book re-index/re-extract items to calibre's Book Details context menu.
+
+        calibre builds that menu in calibre.gui2.book_details.details_context_menu_event
+        and offers no extension point, so wrap the function: while the original runs,
+        the module's QMenu is swapped for a subclass whose exec() injects our actions
+        into the top-level menu just before it is shown.
+        """
+        try:
+            from calibre.gui2 import book_details as bd
+        except Exception:
+            return
+        if getattr(bd, '_ss_hooked', False):
+            return
+        orig = bd.details_context_menu_event
+        action = self
+
+        def hooked(view, ev, book_info, add_popup_action=False, edit_metadata=None):
+            injected = [False]
+            QMenuOrig = bd.QMenu
+
+            class HookedQMenu(QMenuOrig):
+                def exec(self, *a, **k):
+                    if not injected[0]:
+                        injected[0] = True
+                        try:
+                            action._add_book_details_actions(self)
+                        except Exception as e:
+                            print(f'semantic search: book details menu hook failed: {e!r}')
+                    return super().exec(*a, **k)
+
+            bd.QMenu = HookedQMenu
+            try:
+                return orig(view, ev, book_info, add_popup_action, edit_metadata)
+            finally:
+                bd.QMenu = QMenuOrig
+
+        bd.details_context_menu_event = hooked
+        bd._ss_orig_details_menu = orig
+        bd._ss_hooked = True
+        # The standalone Book Info dialog imports the function by name; patch that
+        # binding too if the module is already loaded.
+        import sys
+
+        bi = sys.modules.get('calibre.gui2.dialogs.book_info')
+        if bi is not None and getattr(bi, 'details_context_menu_event', None) is orig:
+            bi.details_context_menu_event = hooked
+            bi._ss_patched = True
+
+    def _unhook_book_details_menu(self):
+        try:
+            from calibre.gui2 import book_details as bd
+        except Exception:
+            return
+        orig = getattr(bd, '_ss_orig_details_menu', None)
+        if orig is not None:
+            bd.details_context_menu_event = orig
+            del bd._ss_orig_details_menu
+        if getattr(bd, '_ss_hooked', False):
+            del bd._ss_hooked
+        import sys
+
+        bi = sys.modules.get('calibre.gui2.dialogs.book_info')
+        if bi is not None and getattr(bi, '_ss_patched', False) and orig is not None:
+            bi.details_context_menu_event = orig
+            del bi._ss_patched
+
+    def _add_book_details_actions(self, menu):
+        """Items injected into the Book Details context menu (see _hook_book_details_menu)."""
+        book_id = getattr(getattr(self.gui, 'library_view', None), 'current_id', None)
+        if book_id is None:
+            return
+        from qt.core import QIcon
+
+        menu.addSeparator()
+        ac_embed = menu.addAction(_('Re-index this book for semantic search'))
+        ac_embed.setToolTip(
+            _('Queue this book to be re-read and re-embedded. Useful if the file changed outside calibre or you switched embedding models.')
+        )
+        # same refresh glyph as the "Re-index ..." items in the toolbar menu
+        try:
+            ic = QIcon.ic('view-refresh.png')
+        except Exception:
+            ic = None
+        if ic is not None:
+            ac_embed.setIcon(ic)
+        ac_embed.triggered.connect(lambda checked=False, bid=book_id: self.reindex_book(bid))
+        ac_attrs = menu.addAction(_('Re-extract attributes for this book'))
+        ac_attrs.setToolTip(_('Run LLM attribute extraction on this book again and overwrite its stored attributes.'))
+        try:
+            ic2 = QIcon.ic('ai.png')
+        except Exception:
+            ic2 = None
+        if ic2 is not None:
+            ac_attrs.setIcon(ic2)
+        ac_attrs.triggered.connect(lambda checked=False, bid=book_id: self.reextract_attributes_book(bid))
+
+    def reindex_book(self, book_id):
+        """Queue one book for re-embedding (Book Details context menu)."""
+        if not self._ensure_started():
+            return
+        api = self._api()
+        if api is None or book_id is None:
+            return
+        settings = self.get_settings()
+        from .indexer import pick_format
+
+        formats = api.formats(book_id)
+        fmt = pick_format(formats, settings.format_priority) if formats else None
+        if fmt is None:
+            from calibre.gui2 import error_dialog
+
+            error_dialog(self.gui, _('Semantic search'), f'No usable format for {self._book_label(book_id)}.', show=True)
+            return
+        self.store.add_dirty(book_id, fmt, 'reindex')
+        from calibre.gui2 import info_dialog
+
+        info_dialog(self.gui, _('Semantic search'), f'Queued {self._book_label(book_id)} for re-embedding.', show=True)
+
+    def reextract_attributes_book(self, book_id):
+        """Force LLM attribute extraction for one book (Book Details context menu)."""
+        if not self._ensure_started():
+            return
+        if book_id is None:
+            return
+        indexed = {b['id']: b for b in self.store.indexed_books()}
+        info = indexed.get(book_id)
+        if info is None or info['n_chunks'] == 0:
+            from calibre.gui2 import info_dialog
+
+            info_dialog(
+                self.gui,
+                _('Semantic search'),
+                f'{self._book_label(book_id)} has no indexed text yet.\n\n'
+                'Use "Re-index this book for semantic search" first.',
+                show=True,
+            )
+            return
+        if not self._check_llm_provider():
+            return
+        self.indexer.request_attributes(book_id)
+        self.show_status()
+
     def reindex_new_and_failed(self):
         """Queue books that are not indexed yet or previously failed; skip the rest."""
         if not self._ensure_started():
@@ -585,16 +738,8 @@ class SemanticSearchAction(InterfaceAction):
                 continue
             self.store.add_dirty(bid, fmt, 'reindex')
 
-    def extract_attributes_menu(self):
-        """Force-run the attribute-extraction phase now and show live progress.
-
-        Attribute extraction normally runs automatically right after indexing (see
-        settings.auto_extract_attributes). This menu item re-runs it on demand: it
-        resets previously-failed books, asks the indexer to run the phase, and
-        raises the same status dialog used for indexing so progress is visible.
-        """
-        if not self._ensure_started():
-            return
+    def _check_llm_provider(self):
+        """Return True if a text-to-text AI provider is configured; show an error otherwise."""
         try:
             from calibre.ai import AICapabilities
             from calibre.ai.prefs import plugin_for_purpose
@@ -604,7 +749,7 @@ class SemanticSearchAction(InterfaceAction):
             from calibre.gui2 import error_dialog
 
             error_dialog(self.gui, 'Attribute extraction', f'Could not check the AI provider:\n{e}', show=True)
-            return
+            return False
         if llm is None:
             from calibre.gui2 import error_dialog
 
@@ -615,6 +760,20 @@ class SemanticSearchAction(InterfaceAction):
                 'Set one up under Preferences > Plugins > AI Provider (e.g. an OpenAI-compatible provider), then try again.',
                 show=True,
             )
+            return False
+        return True
+
+    def extract_attributes_menu(self):
+        """Force-run the attribute-extraction phase now and show live progress.
+
+        Attribute extraction normally runs automatically right after indexing (see
+        settings.auto_extract_attributes). This menu item re-runs it on demand: it
+        resets previously-failed books, asks the indexer to run the phase, and
+        raises the same status dialog used for indexing so progress is visible.
+        """
+        if not self._ensure_started():
+            return
+        if not self._check_llm_provider():
             return
         # Retry books that previously failed, then ask the indexer to run the
         # attribute phase; raise the live status dialog so progress is immediate.

@@ -203,5 +203,146 @@ class TestPauseIconTheme(unittest.TestCase):
         self.assertEqual(self._path(True, True), _os.path.join(ROOT, 'semantic_play-for-dark-theme.png'))
 
 
+class _FakeSignal:
+    def __init__(self):
+        self.slots = []
+
+    def connect(self, cb):
+        self.slots.append(cb)
+
+
+class _FakeQtAction:
+    def __init__(self, text=''):
+        self.text = text
+        self.tip = ''
+        self.icon = None
+        self.triggered = _FakeSignal()
+
+    def setToolTip(self, t):
+        self.tip = t
+
+    def setIcon(self, ic):
+        self.icon = ic
+
+
+class _FakeMenu:
+    def __init__(self):
+        self.actions = []
+        self.separators = 0
+
+    def addSeparator(self):
+        self.separators += 1
+
+    def addAction(self, text=''):
+        ac = _FakeQtAction(text)
+        self.actions.append(ac)
+        return ac
+
+
+def _details_action(current_id=5):
+    a = object.__new__(gui.SemanticSearchAction)
+    calls = []
+    a.gui = types.SimpleNamespace(library_view=types.SimpleNamespace(current_id=current_id))
+    a.reindex_book = lambda bid: calls.append(('reindex', bid))
+    a.reextract_attributes_book = lambda bid: calls.append(('attrs', bid))
+    return a, calls
+
+
+class TestBookDetailsMenuActions(unittest.TestCase):
+    def test_adds_two_actions_for_current_book(self):
+        a, calls = _details_action()
+        m = _FakeMenu()
+        gui.SemanticSearchAction._add_book_details_actions(a, m)
+        self.assertEqual(m.separators, 1)
+        texts = [x.text for x in m.actions]
+        self.assertIn('Re-index this book for semantic search', texts)
+        self.assertIn('Re-extract attributes for this book', texts)
+        # both actions must be wired to the captured book id
+        for ac in m.actions:
+            for slot in ac.triggered.slots:
+                slot(False)
+        self.assertEqual(sorted(calls), [('attrs', 5), ('reindex', 5)])
+
+    def test_no_current_book_adds_nothing(self):
+        a, calls = _details_action(current_id=None)
+        m = _FakeMenu()
+        gui.SemanticSearchAction._add_book_details_actions(a, m)
+        self.assertEqual(m.actions, [])
+        self.assertEqual(m.separators, 0)
+
+
+class TestBookDetailsMenuHook(unittest.TestCase):
+    def _install_fake_bd(self):
+        class FakeQMenu:
+            instances = []
+
+            def __init__(self, *a, **k):
+                self.actions = []
+                FakeQMenu.instances.append(self)
+
+            def addSeparator(self):
+                pass
+
+            def addAction(self, text=''):
+                ac = _FakeQtAction(text)
+                self.actions.append(ac)
+                return ac
+
+            def exec(self, *a, **k):
+                return 'executed'
+
+        bd = types.ModuleType('calibre.gui2.book_details')
+        bd.QMenu = FakeQMenu
+
+        def orig(view, ev, book_info, add_popup_action=False, edit_metadata=None):
+            # mimic calibre: build the menu via the module global, then show it
+            menu = bd.QMenu()
+            return menu.exec((0, 0))
+
+        bd.details_context_menu_event = orig
+        _sys.modules['calibre.gui2.book_details'] = bd
+        _sys.modules['calibre.gui2'].book_details = bd
+        return bd, FakeQMenu
+
+    def tearDown(self):
+        _sys.modules.pop('calibre.gui2.book_details', None)
+        if hasattr(_sys.modules['calibre.gui2'], 'book_details'):
+            delattr(_sys.modules['calibre.gui2'], 'book_details')
+
+    def test_hook_injects_actions_before_exec(self):
+        bd, FakeQMenu = self._install_fake_bd()
+        a, _ = _details_action(current_id=9)
+        gui.SemanticSearchAction._hook_book_details_menu(a)
+        self.assertTrue(bd._ss_hooked)
+        self.assertEqual(bd.details_context_menu_event(None, None, None), 'executed')
+        # the module's QMenu must be restored after the call returns
+        self.assertIs(bd.QMenu, FakeQMenu)
+        menu = FakeQMenu.instances[-1]
+        texts = [x.text for x in menu.actions]
+        self.assertIn('Re-index this book for semantic search', texts)
+        self.assertIn('Re-extract attributes for this book', texts)
+        # opening the menu again must not duplicate the items
+        bd.details_context_menu_event(None, None, None)
+        menu2 = FakeQMenu.instances[-1]
+        self.assertEqual(sum(1 for t in (x.text for x in menu2.actions) if 'semantic search' in t), 1)
+
+    def test_hook_is_idempotent(self):
+        bd, _ = self._install_fake_bd()
+        a, _ = _details_action()
+        gui.SemanticSearchAction._hook_book_details_menu(a)
+        first = bd.details_context_menu_event
+        gui.SemanticSearchAction._hook_book_details_menu(a)
+        self.assertIs(bd.details_context_menu_event, first)
+
+    def test_unhook_restores_original(self):
+        bd, _ = self._install_fake_bd()
+        orig = bd.details_context_menu_event
+        a, _ = _details_action()
+        gui.SemanticSearchAction._hook_book_details_menu(a)
+        gui.SemanticSearchAction._unhook_book_details_menu(a)
+        self.assertIs(bd.details_context_menu_event, orig)
+        self.assertFalse(hasattr(bd, '_ss_hooked'))
+
+
 if __name__ == '__main__':
     unittest.main()

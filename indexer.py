@@ -145,6 +145,8 @@ class Indexer(threading.Thread):
         self.current_book_id: int | None = None
         self._reconcile_lock = threading.Lock()
         self._attr_requested = threading.Event()
+        self._forced_attrs: set[int] = set()
+        self._forced_lock = threading.Lock()
         self._paused = threading.Event()
 
     def stop(self):
@@ -163,8 +165,16 @@ class Indexer(threading.Thread):
 
     # -- attribute extraction phase ---------------------------------------------
 
-    def request_attributes(self):
-        """Ask the worker loop to run the attribute-extraction phase."""
+    def request_attributes(self, book_id=None):
+        """Ask the worker loop to run the attribute-extraction phase.
+
+        If book_id is given, that book is (re-)extracted even when its attributes
+        are already stored; it stays in the force list until the phase has
+        processed it (so a pause mid-phase doesn't lose the request).
+        """
+        if book_id is not None:
+            with self._forced_lock:
+                self._forced_attrs.add(int(book_id))
         self._attr_requested.set()
 
     def _pending_attr_books(self, settings) -> list[int]:
@@ -175,6 +185,17 @@ class Indexer(threading.Thread):
         except Exception:
             failed = set()
         return [b for b in pending_attribute_books(self.store, settings) if str(b) not in failed]
+
+    def _attr_phase_books(self, settings) -> list[int]:
+        """Books for the next attribute phase: normal pending books plus forced re-extractions."""
+        attr_pending = self._pending_attr_books(settings)
+        with self._forced_lock:
+            forced = [b for b in sorted(self._forced_attrs) if b not in attr_pending]
+        return attr_pending + forced
+
+    def _drop_forced(self, book_id):
+        with self._forced_lock:
+            self._forced_attrs.discard(int(book_id))
 
     def _set_attr_failed(self, book_id: int, error: str | None):
         try:
@@ -223,6 +244,8 @@ class Indexer(threading.Thread):
             except Exception as e:
                 self._set_attr_failed(bid, repr(e))
                 errors.append((bid, repr(e)))
+            finally:
+                self._drop_forced(bid)
         self._status('attributes_done', done=total, total=total)
         self.attr_done_cb((total, errors))
         return True
@@ -316,10 +339,10 @@ class Indexer(threading.Thread):
                     continue
                 settings = self.settings_provider()
                 if self._attr_requested.is_set() or getattr(settings, 'auto_extract_attributes', True):
-                    attr_pending = self._pending_attr_books(settings)
-                    if attr_pending:
+                    phase_books = self._attr_phase_books(settings)
+                    if phase_books:
                         idle_since = None
-                        completed = self._process_attributes(attr_pending, settings)
+                        completed = self._process_attributes(phase_books, settings)
                         # keep the request alive if we were paused mid-phase so it resumes
                         if completed:
                             self._attr_requested.clear()

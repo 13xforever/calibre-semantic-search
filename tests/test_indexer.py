@@ -160,6 +160,84 @@ class TestAttrPhase(unittest.TestCase):
         vs.close()
 
 
+def _index_book(vs, bid):
+    vs.upsert_book(bid, 'EPUB', 1, 'm', 8)
+    c = chunker.Chunk(chunk_no=0, text='x' * 3000, chapter_path=['c'], para_start=0, para_end=1, char_offset=0)
+    vs.insert_chunk(bid, c, c.text, c.chapter_path, 0, 1, 0, 'm', 8, [0.1] * 8)
+    vs.commit(bid)
+
+
+class TestForcedAttrExtraction(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_chunks = attributes._chunks_for_book
+        attributes._chunks_for_book = lambda s, bid: ['word ' * 40]
+
+    def tearDown(self):
+        attributes._chunks_for_book = self._orig_chunks
+        self._tmp.cleanup()
+
+    def _make(self):
+        vs = store_mod.VectorStore(_os.path.join(self._tmp.name, 't.db'), backend='sqlite')
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        statuses, done = [], []
+        ix = indexer.Indexer(
+            store=vs,
+            get_new_api=lambda: None,
+            settings_provider=lambda: settings,
+            status_cb=statuses.append,
+            attr_writer=FakeWriter(),
+            attr_done_cb=done.append,
+        )
+        return vs, ix, settings, statuses, done
+
+    def test_request_without_book_id_forces_nothing(self):
+        vs, ix, *_ = self._make()
+        ix.request_attributes()
+        self.assertEqual(ix._forced_attrs, set())
+        vs.close()
+
+    def test_request_attributes_forces_stored_book(self):
+        # a book whose attributes are already stored is not normally pending,
+        # but a forced re-extraction must include it in the phase
+        vs, ix, settings, *_ = self._make()
+        _index_book(vs, 7)
+        vs.set_attrs(7, {'gender': 'f', 'tropes': []})
+        self.assertEqual(ix._pending_attr_books(settings), [])
+        ix.request_attributes(7)
+        self.assertEqual(ix._attr_phase_books(settings), [7])
+        vs.close()
+
+    def test_forced_book_not_duplicated_when_pending(self):
+        vs, ix, settings, *_ = self._make()
+        _index_book(vs, 1)  # no attrs stored -> already pending
+        ix.request_attributes(1)
+        self.assertEqual(ix._attr_phase_books(settings), [1])
+        vs.close()
+
+    def test_process_drops_forced_book_on_success(self):
+        vs, ix, settings, statuses, done = self._make()
+        _index_book(vs, 7)
+        vs.set_attrs(7, {'gender': 'old', 'tropes': []})
+        ix.request_attributes(7)
+        ix._process_attributes(ix._attr_phase_books(settings), settings, llm=FakeLLM({'gender': 'male'}))
+        self.assertEqual(vs.get_attrs(7)['gender'], 'male')
+        self.assertEqual(ix._forced_attrs, set())
+        self.assertEqual(done[0][0], 1)
+        vs.close()
+
+    def test_failed_forced_book_recorded_and_dropped(self):
+        vs, ix, settings, statuses, done = self._make()
+        _index_book(vs, 7)
+        ix.request_attributes(7)
+        ix._process_attributes(ix._attr_phase_books(settings), settings, llm=FailingLLM())
+        failed = json.loads(vs.get_meta('attr_failed', '{}'))
+        self.assertIn('7', failed)
+        self.assertEqual(ix._forced_attrs, set())
+        vs.close()
+
+
 class TestPauseResume(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
