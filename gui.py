@@ -123,7 +123,6 @@ class SemanticSearchAction(InterfaceAction):
 
     _status_sig = pyqtSignal(object)
     _db_sig = pyqtSignal(object)  # (method, args, kwargs, threading.Event)
-    _attr_done_sig = pyqtSignal(object)  # (total, [(book_id, err), ...])
 
     def __init__(self, parent, site_customization):
         super().__init__(parent, site_customization)
@@ -135,7 +134,6 @@ class SemanticSearchAction(InterfaceAction):
         self._status_dialog = None
         self._status_sig.connect(self._on_status)
         self._db_sig.connect(self._on_db_write)
-        self._attr_done_sig.connect(self._on_attr_done)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -267,7 +265,6 @@ class SemanticSearchAction(InterfaceAction):
             settings_provider=self.get_settings,
             status_cb=self._status_sig.emit,
             attr_writer=_GuiDbProxy(self, get_api),
-            attr_done_cb=self._attr_done_sig.emit,
         )
         self.indexer.start()
         # a fresh indexer is never paused; make sure the menu label reflects that
@@ -346,25 +343,6 @@ class SemanticSearchAction(InterfaceAction):
             print(f'semantic search: db write {method} failed: {e!r}')
         finally:
             ev.set()
-
-    def _on_attr_done(self, payload):
-        total, errors = payload
-        if errors:
-            from calibre.gui2 import error_dialog
-
-            lines = [f'{self._book_label(b)}: {err}' for b, err in errors[:5]]
-            if len(errors) > 5:
-                lines.append(f'... and {len(errors) - 5} more')
-            error_dialog(
-                self.gui,
-                'Attribute extraction',
-                f'{len(errors)} of {total} book(s) failed:\n\n' + '\n'.join(lines),
-                show=True,
-            )
-        else:
-            from calibre.gui2 import info_dialog
-
-            info_dialog(self.gui, 'Attribute extraction', f'Extracted attributes for {total} book(s).', show=True)
 
     # -- helpers ---------------------------------------------------------------
 
