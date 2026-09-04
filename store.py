@@ -7,7 +7,9 @@ Public API (used by indexer/dialog/attributes):
     insert_chunk / commit
     search(query_vec, limit, min_score) -> list[SearchResult]
     book_chunks_text(book_id) -> list[str]
-    get_meta / set_meta / close
+    get_meta / set_meta / delete_meta
+    set_attrs / get_attrs / clear_attrs
+    close
 
 Backends:
   'sqlite'  - vectors in a local SQLite file (always available; numpy speeds it up)
@@ -156,6 +158,11 @@ class MetaStore:
             )
             self.conn.commit()
 
+    def delete_meta(self, key: str):
+        with self._lock:
+            self.conn.execute('DELETE FROM meta WHERE key=?', (key,))
+            self.conn.commit()
+
     # -- dirty queue -------------------------------------------------------------
 
     def add_dirty(self, book_id: int, fmt: str, reason: str = 'added'):
@@ -227,6 +234,11 @@ class MetaStore:
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
+
+    def clear_attrs(self, book_id: int):
+        with self._lock:
+            self.conn.execute('DELETE FROM attrs_raw WHERE book_id=?', (book_id,))
+            self.conn.commit()
 
 
 class SqliteVectorBackend:
@@ -530,6 +542,9 @@ class VectorStore:
     def set_meta(self, key, value):
         self.meta.set_meta(key, value)
 
+    def delete_meta(self, key):
+        self.meta.delete_meta(key)
+
     def add_dirty(self, book_id, fmt, reason='added'):
         self.meta.add_dirty(book_id, fmt, reason)
 
@@ -580,6 +595,9 @@ class VectorStore:
 
     def get_attrs(self, book_id):
         return self.meta.get_attrs(book_id)
+
+    def clear_attrs(self, book_id):
+        self.meta.clear_attrs(book_id)
 
     # -- search ------------------------------------------------------------------------
 

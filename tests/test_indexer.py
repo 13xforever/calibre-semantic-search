@@ -58,6 +58,22 @@ class FailingLLM:
         return SimpleNamespace(data=None, exception=RuntimeError('boom'), error_details='boom')
 
 
+class FakeApi:
+    """Minimal newAPI stand-in for reconcile tests."""
+
+    def __init__(self, book_ids):
+        self.book_ids = set(book_ids)
+
+    def all_book_ids(self):
+        return sorted(self.book_ids)
+
+    def formats(self, bid):
+        return ('EPUB',) if bid in self.book_ids else ()
+
+    def format_metadata(self, bid, fmt):
+        return {'size': 100, 'mtime': 1234.0}
+
+
 class FakeWriter:
     """Stands in for the GUI db proxy; records custom-column writes."""
 
@@ -236,6 +252,59 @@ class TestForcedAttrExtraction(unittest.TestCase):
         self.assertIn('7', failed)
         self.assertEqual(ix._forced_attrs, set())
         vs.close()
+
+
+class TestReconcile(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._vs = None
+
+    def tearDown(self):
+        if self._vs is not None:
+            self._vs.close()
+        self._tmp.cleanup()
+
+    def _make(self, lib_ids):
+        vs = store_mod.VectorStore(_os.path.join(self._tmp.name, 't.db'), backend='sqlite')
+        self._vs = vs
+        settings = utils.Settings()
+        ix = indexer.Indexer(
+            store=vs,
+            get_new_api=lambda: FakeApi(lib_ids),
+            settings_provider=lambda: settings,
+        )
+        return vs, ix
+
+    def test_removed_book_state_cleaned(self):
+        vs, ix = self._make([1])
+        _index_book(vs, 2)
+        vs.set_attrs(2, {'gender': 'f'})
+        vs.set_meta(indexer.file_info_key(2), 'EPUB|100|1234.0')
+        vs.set_meta('failed', json.dumps({'2': {'error': 'x'}}))
+        vs.set_meta('attr_failed', json.dumps({'2': {'error': 'y'}}))
+        ix.reconcile()
+        self.assertFalse(vs.book_is_indexed(2))
+        self.assertEqual(vs.get_attrs(2), {})
+        self.assertIsNone(vs.get_meta(indexer.file_info_key(2)))
+        self.assertNotIn('2', json.loads(vs.get_meta('failed', '{}')))
+        self.assertNotIn('2', json.loads(vs.get_meta('attr_failed', '{}')))
+
+    def test_removed_dirty_book_dropped(self):
+        vs, ix = self._make([1])
+        vs.add_dirty(3, 'EPUB')
+        ix.reconcile()
+        # book 3 vanished from the library; book 1 (present, unindexed) is queued
+        self.assertNotIn(3, vs.dirty_book_ids())
+
+    def test_surviving_books_untouched(self):
+        vs, ix = self._make([1])
+        _index_book(vs, 1)
+        vs.set_attrs(1, {'gender': 'm'})
+        vs.set_meta(indexer.file_info_key(1), 'EPUB|100|1234.0')
+        ix.reconcile()
+        self.assertTrue(vs.book_is_indexed(1))
+        self.assertEqual(vs.get_attrs(1)['gender'], 'm')
+        self.assertEqual(vs.get_meta(indexer.file_info_key(1)), 'EPUB|100|1234.0')
 
 
 class TestPauseResume(unittest.TestCase):

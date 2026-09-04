@@ -270,13 +270,22 @@ class Indexer(threading.Thread):
             failed = json.loads(self.store.get_meta('failed', '{}') or '{}')
         except Exception:
             failed = {}
+        try:
+            attr_failed = json.loads(self.store.get_meta('attr_failed', '{}') or '{}')
+        except Exception:
+            attr_failed = {}
         # remove books that vanished from the library
         for bid, info in list(indexed.items()):
             if bid not in lib_ids:
                 self.store.clear_book(bid)
                 self.store.remove_dirty(bid)
-                self.store.set_meta(f'fileinfo:{bid}', '')
+                self.store.delete_meta(file_info_key(bid))
+                self.store.clear_attrs(bid)
                 failed.pop(str(bid), None)
+                attr_failed.pop(str(bid), None)
+        for bid in self.store.dirty_book_ids():
+            if bid not in lib_ids:
+                self.store.remove_dirty(bid)
         for bid in lib_ids:
             formats = api.formats(bid)
             fmt = pick_format(formats, settings.format_priority)
@@ -302,6 +311,7 @@ class Indexer(threading.Thread):
             if changed:
                 self.store.add_dirty(bid, fmt, 'changed')
         self.store.set_meta('failed', json.dumps(failed))
+        self.store.set_meta('attr_failed', json.dumps(attr_failed))
 
     @staticmethod
     def _same_file(parts: list[str], md: dict) -> bool:

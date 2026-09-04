@@ -127,6 +127,17 @@ class TestVectorStore(unittest.TestCase):
         s.set_meta('k', 'v1')
         s.set_meta('k', 'v2')
         self.assertEqual(s.get_meta('k'), 'v2')
+        s.delete_meta('k')
+        self.assertIsNone(s.get_meta('k'))
+        s.delete_meta('missing')  # no error
+
+    def test_attrs_clear(self):
+        s = self.s
+        self.assertEqual(s.get_attrs(4), {})
+        s.set_attrs(4, {'gender': 'f'})
+        self.assertEqual(s.get_attrs(4)['gender'], 'f')
+        s.clear_attrs(4)
+        self.assertEqual(s.get_attrs(4), {})
 
 
 class TestVecHelpers(unittest.TestCase):
