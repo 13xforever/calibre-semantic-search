@@ -160,5 +160,60 @@ class TestAttrPhase(unittest.TestCase):
         vs.close()
 
 
+class TestPauseResume(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_chunks = attributes._chunks_for_book
+        attributes._chunks_for_book = lambda s, bid: ['word ' * 40]
+
+    def tearDown(self):
+        attributes._chunks_for_book = self._orig_chunks
+        self._tmp.cleanup()
+
+    def _make(self):
+        vs = store_mod.VectorStore(_os.path.join(self._tmp.name, 't.db'), backend='sqlite')
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        statuses, done = [], []
+        ix = indexer.Indexer(
+            store=vs,
+            get_new_api=lambda: None,
+            settings_provider=lambda: settings,
+            status_cb=statuses.append,
+            attr_writer=FakeWriter(),
+            attr_done_cb=done.append,
+        )
+        return vs, ix, settings, statuses, done
+
+    def test_pause_resume_toggles_flag(self):
+        vs, ix, *_ = self._make()
+        self.assertFalse(ix.paused)
+        ix.pause()
+        self.assertTrue(ix.paused)
+        ix.resume()
+        self.assertFalse(ix.paused)
+        vs.close()
+
+    def test_paused_phase_interrupts_without_done(self):
+        vs, ix, settings, statuses, done = self._make()
+        ix.pause()
+        completed = ix._process_attributes([1, 2], settings, llm=FakeLLM({'gender': 'f'}))
+        # interrupted before any book; no terminal state and no done callback
+        self.assertFalse(completed)
+        self.assertEqual(done, [])
+        self.assertNotIn('attributes_done', [s['state'] for s in statuses])
+        vs.close()
+
+    def test_resumed_phase_completes(self):
+        vs, ix, settings, statuses, done = self._make()
+        ix.pause()
+        ix.resume()
+        completed = ix._process_attributes([1], settings, llm=FakeLLM({'gender': 'f'}))
+        self.assertTrue(completed)
+        self.assertEqual(done[0][0], 1)
+        self.assertIn('attributes_done', [s['state'] for s in statuses])
+        vs.close()
+
+
 if __name__ == '__main__':
     unittest.main()

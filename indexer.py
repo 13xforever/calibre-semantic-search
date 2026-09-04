@@ -145,9 +145,21 @@ class Indexer(threading.Thread):
         self.current_book_id: int | None = None
         self._reconcile_lock = threading.Lock()
         self._attr_requested = threading.Event()
+        self._paused = threading.Event()
 
     def stop(self):
         self.stop_event.set()
+
+    def pause(self):
+        """Suspend the worker loop; queued work is left untouched."""
+        self._paused.set()
+
+    def resume(self):
+        self._paused.clear()
+
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
 
     # -- attribute extraction phase ---------------------------------------------
 
@@ -181,6 +193,8 @@ class Indexer(threading.Thread):
 
         Runs only after the indexing (embedding) queue is empty, so all embedding
         work is batched before any LLM calls (the two use different models).
+        Returns True if the phase ran to completion, False if it was interrupted
+        by a pause or shutdown (remaining books are picked up on a later pass).
         """
         if llm is None:
             try:
@@ -190,18 +204,18 @@ class Indexer(threading.Thread):
                 llm = plugin_for_purpose(AICapabilities.text_to_text)
             except Exception as e:
                 self._status('attr_error', error=f'AI provider unavailable: {e}')
-                return
+                return True
         if llm is None:
             self._status('attr_error', error='no text-to-text AI provider configured')
-            return
+            return True
 
         from .attributes import extract_book_attributes
 
         total = len(pending)
         errors: list[tuple[int, str]] = []
         for i, bid in enumerate(pending):
-            if self.stop_event.is_set():
-                break
+            if self.stop_event.is_set() or self._paused.is_set():
+                return False  # interrupted; the phase resumes on a later pass
             self._status('attributes', bid, done=i + 1, total=total)
             try:
                 extract_book_attributes(bid, self.attr_writer, self.store, settings, llm=llm)
@@ -211,6 +225,7 @@ class Indexer(threading.Thread):
                 errors.append((bid, repr(e)))
         self._status('attributes_done', done=total, total=total)
         self.attr_done_cb((total, errors))
+        return True
 
     # -- public -------------------------------------------------------------
 
@@ -286,6 +301,12 @@ class Indexer(threading.Thread):
         idle_since = None
         while not self.stop_event.is_set():
             try:
+                if self._paused.is_set():
+                    # Suspend without touching the queues; pick up where we left off
+                    # on resume. Takes effect between books/phases, not mid-book.
+                    self.status_cb({'state': 'paused'})
+                    self.stop_event.wait(1)
+                    continue
                 pending = self.store.dirty_book_ids()
                 if pending:
                     # Indexing (embedding) has priority: drain the whole dirty queue
@@ -298,8 +319,10 @@ class Indexer(threading.Thread):
                     attr_pending = self._pending_attr_books(settings)
                     if attr_pending:
                         idle_since = None
-                        self._process_attributes(attr_pending, settings)
-                        self._attr_requested.clear()
+                        completed = self._process_attributes(attr_pending, settings)
+                        # keep the request alive if we were paused mid-phase so it resumes
+                        if completed:
+                            self._attr_requested.clear()
                         continue
                 # Fully idle.
                 now = time.time()

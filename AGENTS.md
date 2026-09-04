@@ -15,6 +15,8 @@ calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extrac
     plugin-import-name-semantic_search.txt semantic_search.png
   ```
 
+**After any change to a shipped file**: run the full test suite + compile check, and rebuild `semantic_search.zip` so it always matches the working tree. Don't hand off a task with failing tests or a stale ZIP.
+
 ## Testing gotchas (easy to get wrong)
 
 - `tests/` is **not** a package (no `__init__.py`). `python -m unittest tests.test_x` fails — always use `discover -s tests [-p file]`.

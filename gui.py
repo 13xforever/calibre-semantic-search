@@ -142,12 +142,27 @@ class SemanticSearchAction(InterfaceAction):
         ac_status = self.create_action(spec=(_('Index status'), 'book.png', _('Show indexing status'), None), attr='status')
         ac_status.triggered.connect(self.show_status)
         m.addAction(ac_status)
-        ac_reindex = self.create_action(spec=(_('Re-index all books'), 'view-refresh.png', _('Queue every book for re-indexing'), None), attr='reindex')
-        ac_reindex.triggered.connect(self.reindex_all)
-        m.addAction(ac_reindex)
+        self._pause_action = self.create_action(
+            spec=(_('Pause indexing'), None, _('Pause or resume indexing and attribute extraction'), None), attr='pause'
+        )
+        self._pause_action.triggered.connect(self.toggle_pause)
+        self._set_pause_label(False)
+        m.addAction(self._pause_action)
         ac_attrs = self.create_action(spec=(_('Extract attributes...'), 'ai.png', _('Run LLM attribute extraction on indexed books'), None), attr='attrs')
         ac_attrs.triggered.connect(self.extract_attributes_menu)
         m.addAction(ac_attrs)
+        m.addSeparator()
+        # && renders as a literal & in Qt action text (a single & would become a mnemonic)
+        ac_reindex_new = self.create_action(
+            spec=(_('Re-index new && failed books'), 'view-refresh.png', _('Queue books that are not indexed yet or failed before; skip already-indexed books'), None),
+            attr='reindex_new',
+        )
+        ac_reindex_new.triggered.connect(self.reindex_new_and_failed)
+        m.addAction(ac_reindex_new)
+        ac_reindex = self.create_action(spec=(_('Re-index all books'), 'view-refresh.png', _('Queue every book for re-indexing'), None), attr='reindex')
+        ac_reindex.triggered.connect(self.reindex_all)
+        m.addAction(ac_reindex)
+        m.addSeparator()
         ac_settings = self.create_action(spec=(_('Settings'), 'config.png', _('Semantic search settings'), None), attr='settings')
         ac_settings.triggered.connect(self.open_settings)
         m.addAction(ac_settings)
@@ -209,6 +224,8 @@ class SemanticSearchAction(InterfaceAction):
             attr_done_cb=self._attr_done_sig.emit,
         )
         self.indexer.start()
+        # a fresh indexer is never paused; make sure the menu label reflects that
+        self._set_pause_label(False)
         # reconcile in a background thread so startup stays snappy
         t = threading.Thread(target=self._reconcile_safe, name='SSReconcile', daemon=True)
         self._reconcile_thread = t
@@ -245,6 +262,8 @@ class SemanticSearchAction(InterfaceAction):
         state = d.get('state', '')
         if state == 'idle':
             tip = _('Search books by meaning')
+        elif state == 'paused':
+            tip = _('Indexing paused')
         elif state == 'attributes':
             tip = f"Extracting attributes ({d.get('done')}/{d.get('total')})"
         elif state == 'attributes_done':
@@ -361,7 +380,9 @@ class SemanticSearchAction(InterfaceAction):
             lines.append(f'Indexed books: {len(books)}')
         lines.append(f'Total chunks: {n_chunks}')
         st = self._last_status
-        if st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
+        if st and st.get('state') == 'paused':
+            lines.append(_('Indexing paused (use the menu to resume)'))
+        elif st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
             if st.get('state') == 'attributes':
                 line = f"Extracting attributes ({st.get('done')}/{st.get('total')}): {self._book_label(st.get('book_id'), api)}"
             else:
@@ -422,11 +443,87 @@ class SemanticSearchAction(InterfaceAction):
         self._status_dialog = d
         d.show()
 
+    def toggle_pause(self):
+        """Pause or resume the indexing/attribute-extraction worker."""
+        if self.indexer is None:
+            return
+        if self.indexer.paused:
+            self.indexer.resume()
+        else:
+            self.indexer.pause()
+        self._set_pause_label(self.indexer.paused)
+
+    def _set_pause_label(self, paused):
+        act = getattr(self, '_pause_action', None)
+        if act is not None:
+            act.setText(_('Resume indexing') if paused else _('Pause indexing'))
+            icon = self._pause_icon(paused)
+            if icon is not None:
+                act.setIcon(icon)
+
+    def _pause_icon(self, paused):
+        # calibre ships no pause icon of its own; Qt's standard media icons are themed (light/dark)
+        from qt.core import QStyle
+
+        sp = QStyle.StandardPixmap.SP_MediaPlay if paused else QStyle.StandardPixmap.SP_MediaPause
+        try:
+            return self.gui.style().standardIcon(sp)
+        except Exception:
+            return None
+
+    def reindex_new_and_failed(self):
+        """Queue books that are not indexed yet or previously failed; skip the rest."""
+        if not self._ensure_started():
+            return
+        api = self._api()
+        if api is None:
+            return
+        import json
+
+        settings = self.get_settings()
+        from .indexer import pick_format
+
+        indexed = {b['id'] for b in self.store.indexed_books()}
+        try:
+            failed = set(json.loads(self.store.get_meta('failed', '{}') or '{}').keys())
+        except Exception:
+            failed = set()
+        queued = 0
+        for bid in sorted(api.all_book_ids()):
+            if bid in indexed and str(bid) not in failed:
+                continue  # already indexed without error -> skip
+            formats = api.formats(bid)
+            if not formats:
+                continue
+            fmt = pick_format(formats, settings.format_priority)
+            if fmt is None:
+                continue
+            self.store.add_dirty(bid, fmt, 'reindex')
+            queued += 1
+        from calibre.gui2 import info_dialog
+
+        if queued:
+            info_dialog(self.gui, _('Semantic search'), f'Queued {queued} book(s) for (re-)indexing.', show=True)
+        else:
+            info_dialog(self.gui, _('Semantic search'), 'Nothing to do: every book is already indexed without errors.', show=True)
+
     def reindex_all(self):
         if not self._ensure_started():
             return
         api = self._api()
         if api is None:
+            return
+        from calibre.gui2 import question_dialog
+
+        ok = question_dialog(
+            self.gui,
+            _('Semantic search'),
+            'Re-index ALL books?\n\n'
+            'This queues every book in the library for re-indexing, re-reading and re-embedding all of them. '
+            'It can take a long time and uses many embedding API calls.',
+            show=True,
+        )
+        if not ok:
             return
         settings = self.get_settings()
         from .indexer import pick_format
