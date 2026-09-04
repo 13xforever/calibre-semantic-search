@@ -41,6 +41,21 @@ class FakeLLM:
         return SimpleNamespace(data=SimpleNamespace(**{f.name: self.data.get(f.name) for f in _FIELDS}), exception=None, error_details='')
 
 
+class FakeLLMSequence(FakeLLM):
+    def __init__(self, responses):
+        super().__init__()
+        self.responses = list(responses)
+        self.i = 0
+
+    def generate_structured_output(self, prompt, schema, instructions=''):
+        from types import SimpleNamespace
+
+        self.calls += 1
+        data = self.responses[self.i % len(self.responses)]
+        self.i += 1
+        return SimpleNamespace(data=SimpleNamespace(**{f.name: data.get(f.name) for f in _FIELDS}), exception=None, error_details='')
+
+
 _FIELDS = [utils.AttrField('gender', 'ss_gender', 'text', 'g'), utils.AttrField('tropes', 'ss_tropes', 'tags', 't')]
 
 
@@ -78,6 +93,44 @@ class TestNormalize(unittest.TestCase):
 
     def test_tags_list_coerced_for_text(self):
         self.assertEqual(attributes._normalize_value(['x', 'y'], 'text'), 'x, y')
+
+
+class TestNormalizeTags(unittest.TestCase):
+    def test_exact_duplicates_removed_in_order(self):
+        self.assertEqual(attributes.normalize_tags(['a', 'b', 'a', 'B']), ['a', 'b'])
+
+    def test_case_and_whitespace_variants(self):
+        self.assertEqual(attributes.normalize_tags(['Slow Burn', 'slow  burn']), ['Slow Burn'])
+
+    def test_separator_variants(self):
+        self.assertEqual(
+            attributes.normalize_tags(['sexual assault/rape', 'sexual assault / rape']),
+            ['sexual assault/rape'],
+        )
+        self.assertEqual(
+            attributes.normalize_tags(['bullying and harassment', 'bullying/harassment']),
+            ['bullying/harassment'],
+        )
+
+    def test_trailing_parenthetical_collapses_to_base(self):
+        tags = [
+            'non-explicit sex scenes (brief implied encounter between Holsten and Lain)',
+            'violence depicted (gun battles, combat, drone destruction)',
+            'skinship moments',
+            'non-explicit sex scenes',
+        ]
+        # the lone detailed tag keeps its display; only the duplicated base form collapses
+        self.assertEqual(
+            attributes.normalize_tags(tags),
+            ['non-explicit sex scenes', 'violence depicted (gun battles, combat, drone destruction)', 'skinship moments'],
+        )
+
+    def test_distinct_tags_untouched(self):
+        tags = ['slow burn', 'enemies to lovers', 'found family']
+        self.assertEqual(attributes.normalize_tags(tags), tags)
+
+    def test_blank_entries_dropped(self):
+        self.assertEqual(attributes.normalize_tags(['  ', '', 'ok']), ['ok'])
 
 
 class TestSampling(unittest.TestCase):
@@ -198,6 +251,35 @@ class TestExtract(unittest.TestCase):
             pass
         self.assertEqual(llm.calls, 2)  # two map groups
         self.assertEqual(values['gender'], 'male')
+
+    def test_sampled_extraction_dedupes_near_duplicate_tags(self):
+        store = FakeStore()
+        api = FakeApi()
+        llm = FakeLLM({'gender': 'female', 'tropes': ['slow burn', 'Slow Burn (implied)', 'angst/whump']})
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
+        values = attributes.extract_book_attributes(10, api, store, settings, llm=llm)
+        self.assertEqual(values['tropes'], ['slow burn', 'angst/whump'])
+        self.assertEqual(store.attrs[10]['tropes'], ['slow burn', 'angst/whump'])
+
+    def test_fulltext_merge_dedupes_near_duplicate_tags(self):
+        store = FakeStore()
+        api = FakeApi()
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.attr_mode = 'fulltext'
+        # 3000 tokens -> ~6916 char budget, so [5000,5000,100] splits into 2 groups
+        settings.attr_context_tokens = 3000
+        attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
+        llm = FakeLLMSequence([
+            {'gender': 'male', 'tropes': ['slow burn (early chapters)', 'enemies to lovers']},
+            {'gender': None, 'tropes': ['Slow Burn', 'enemies to  lovers']},
+        ])
+        values = attributes.extract_book_attributes(11, api, store, settings, llm=llm)
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(values['tropes'], ['Slow Burn', 'enemies to lovers'])
+        self.assertEqual(store.attrs[11]['tropes'], ['Slow Burn', 'enemies to lovers'])
 
 
 if __name__ == '__main__':

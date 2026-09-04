@@ -6,6 +6,7 @@ on a worker thread; the LLM provider is injected so tests can fake it.
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Optional
 
 DEFAULT_CONTEXT_TOKENS = 8192
@@ -206,6 +207,44 @@ def _normalize_value(value: Any, field_type: str):
     return s
 
 
+_TAG_WS_RE = re.compile(r'\s+')
+_TAG_TRAIL_PAREN_RE = re.compile(r'\s*\([^()]*\)\s*$')
+_TAG_SEP_RE = re.compile(r'\s*(?:[/&+]|\band\b)\s*')
+
+
+def _tag_key(tag: str) -> str:
+    """Dedup key for a tag: case- and whitespace-insensitive, separator variants
+    ('/' vs '&' vs '+' vs 'and') collapsed, trailing parentheticals ignored."""
+    s = _TAG_WS_RE.sub(' ', tag.strip().lower())
+    prev = None
+    while prev != s:
+        prev = s
+        s = _TAG_TRAIL_PAREN_RE.sub('', s)
+    s = re.sub(r'\|+', '|', _TAG_SEP_RE.sub('|', s)).strip('|')
+    return s or tag.strip().lower()
+
+
+def normalize_tags(tags) -> list[str]:
+    """Deduplicate near-identical tags, keeping first-seen order.
+
+    Tags that differ only in case, whitespace, separator style, or a trailing
+    parenthetical are treated as the same tag; the shortest spelling wins.
+    """
+    best: dict[str, str] = {}
+    order: list[str] = []
+    for t in tags:
+        s = str(t).strip()
+        if not s:
+            continue
+        k = _tag_key(s)
+        if k not in best:
+            best[k] = s
+            order.append(k)
+        elif len(s) < len(best[k]):
+            best[k] = s
+    return [best[k] for k in order]
+
+
 def _prompt_for(text: str, fields) -> str:
     lines = []
     for f in fields:
@@ -276,6 +315,12 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
         data = res.data
         for f in fields:
             values[f.name] = _normalize_value(getattr(data, f.name, None) if data is not None else None, f.type)
+
+    # The map-reduce union (and even a single LLM call) can yield near-duplicate
+    # tags that differ only in spelling; collapse them before persisting.
+    for f in fields:
+        if f.type == 'tags':
+            values[f.name] = normalize_tags(values.get(f.name) or [])
 
     # Guarantee every enabled field has a key so the book counts as complete
     # (fulltext map-reduce only keeps non-empty values; fill the rest with defaults).
