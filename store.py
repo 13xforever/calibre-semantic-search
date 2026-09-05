@@ -403,6 +403,10 @@ class MetaStore:
         with self._lock:
             self.conn.close()
 
+    def wal_checkpoint_truncate(self):
+        """Drain the WAL into the main DB file and truncate it. Caller holds self._lock."""
+        self.conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+
     # -- schema migration --------------------------------------------------------
 
     def _user_version(self) -> int:
@@ -787,19 +791,32 @@ class SqliteVectorBackend:
         """Run the pending chunk migrations (v0 split, then v2 slim per table).
 
         Each model group / table is committed independently so progress survives an
-        interrupt; returns True when anything was migrated."""
+        interrupt. While running, WAL auto-checkpointing is disabled and the WAL is
+        checkpointed explicitly (TRUNCATE) at phase boundaries: with a multi-GB WAL
+        the default in-commit passive checkpoint can stall for minutes on slow
+        storage. Returns True when anything was migrated."""
         did = False
         with self.meta._lock:
-            if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone():
-                self._split_legacy_chunks()
-                did = True
-        while True:
+            prev_ac = self.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
+            self.conn.execute('PRAGMA wal_autocheckpoint=0')
+        try:
             with self.meta._lock:
-                t = self._legacy_table_locked()
-            if t is None:
-                break
-            self._slim_table(t)
-            did = True
+                if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone():
+                    self._split_legacy_chunks()
+                    did = True
+                self.meta.wal_checkpoint_truncate()
+            while True:
+                with self.meta._lock:
+                    t = self._legacy_table_locked()
+                if t is None:
+                    break
+                self._slim_table(t)
+                with self.meta._lock:
+                    self.meta.wal_checkpoint_truncate()
+                did = True
+        finally:
+            with self.meta._lock:
+                self.conn.execute(f'PRAGMA wal_autocheckpoint={prev_ac}')
         return did
 
     def _legacy_where(self, raws):
@@ -1273,9 +1290,17 @@ class VectorStore:
             self._finalized = True
             return
         with self.meta._lock:
-            if av != 2:  # 2 == INCREMENTAL
-                self.meta.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
-                self.meta.conn.execute('VACUUM')
+            prev_ac = self.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
+            self.meta.conn.execute('PRAGMA wal_autocheckpoint=0')
+            try:
+                if av != 2:  # 2 == INCREMENTAL
+                    self.meta.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
+                    self.meta.conn.execute('VACUUM')
+                # VACUUM in WAL mode leaves the rebuilt DB in the WAL; drain it into
+                # the main file now (the store stays open, so no close-time checkpoint).
+                self.meta.wal_checkpoint_truncate()
+            finally:
+                self.meta.conn.execute(f'PRAGMA wal_autocheckpoint={prev_ac}')
         self._finalized = True
 
     def _select_backend(self, want: str) -> str:

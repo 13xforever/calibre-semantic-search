@@ -284,8 +284,22 @@ class TestSqlitePerModel(unittest.TestCase):
         s = store.VectorStore(self.path, backend='sqlite')
         try:
             self.assertTrue(s.needs_finalize())
+            with s.meta._lock:
+                ac_before = s.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
+            ac_during = {}
+            orig_slim = s.backend._slim_table
+
+            def slim_probe(t):
+                with s.meta._lock:
+                    ac_during['v'] = s.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
+                return orig_slim(t)
+            s.backend._slim_table = slim_probe
             s.finalize_schema()
             self.assertFalse(s.needs_finalize())
+            self.assertEqual(ac_during.get('v'), 0)  # auto-checkpoint disabled during migration
+            with s.meta._lock:
+                ac_after = s.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
+            self.assertEqual(ac_after, ac_before)  # ...and restored afterwards
             self.assertEqual(s.backend._chunk_tables(), ['chunks_old_model'])
             res = s.search([1.0] * 4, limit=5)
             self.assertEqual(len(res), 1)

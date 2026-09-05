@@ -83,7 +83,9 @@ attributes in custom columns.
   after upgrading. On large libraries this one-time migration can take a
   while; *Index status* shows "Migrating search database" until it finishes,
   and indexing starts only afterwards. The migration is resumable if calibre
-  is closed mid-way.
+  is closed mid-way. While it runs, intermediate data is flushed to the main
+  file at phase boundaries, so the temporary WAL growth stays bounded even on
+  slow disks.
 - The **lancedb** backend keeps vectors in a sibling LanceDB directory
   (`semantic-search-lancedb/`), one table per embedding model; bookkeeping
   stays in SQLite either way.
