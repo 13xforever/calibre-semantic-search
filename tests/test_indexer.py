@@ -296,6 +296,25 @@ class TestReconcile(unittest.TestCase):
         # book 3 vanished from the library; book 1 (present, unindexed) is queued
         self.assertNotIn(3, vs.dirty_book_ids())
 
+    def test_preexisting_orphans_swept(self):
+        # rows left behind by older versions: attrs_raw + fileinfo with no books/dirty row
+        vs, ix = self._make([1])
+        vs.set_attrs(2, {'gender': 'f'})
+        vs.set_meta(indexer.file_info_key(2), 'EPUB|100|1234.0')
+        ix.reconcile()
+        self.assertEqual(vs.get_attrs(2), {})
+        self.assertIsNone(vs.get_meta(indexer.file_info_key(2)))
+        self.assertEqual(vs.attr_book_ids(), [])
+
+    def test_failed_indexing_book_removed(self):
+        # a book that failed indexing has no books row, only fileinfo + a failed entry
+        vs, ix = self._make([1])
+        vs.set_meta(indexer.file_info_key(3), 'EPUB|100|1234.0')
+        vs.set_meta('failed', json.dumps({'3': {'error': 'x'}}))
+        ix.reconcile()
+        self.assertIsNone(vs.get_meta(indexer.file_info_key(3)))
+        self.assertNotIn('3', json.loads(vs.get_meta('failed', '{}')))
+
     def test_surviving_books_untouched(self):
         vs, ix = self._make([1])
         _index_book(vs, 1)

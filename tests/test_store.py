@@ -130,14 +130,20 @@ class TestVectorStore(unittest.TestCase):
         s.delete_meta('k')
         self.assertIsNone(s.get_meta('k'))
         s.delete_meta('missing')  # no error
+        s.set_meta('fileinfo:1', 'EPUB|1|2')
+        s.set_meta('other', 'x')
+        self.assertEqual(s.meta_keys('fileinfo:'), ['fileinfo:1'])
 
     def test_attrs_clear(self):
         s = self.s
         self.assertEqual(s.get_attrs(4), {})
         s.set_attrs(4, {'gender': 'f'})
         self.assertEqual(s.get_attrs(4)['gender'], 'f')
+        s.set_attrs(5, {'gender': 'm'})
+        self.assertEqual(sorted(s.attr_book_ids()), [4, 5])
         s.clear_attrs(4)
         self.assertEqual(s.get_attrs(4), {})
+        self.assertEqual(s.attr_book_ids(), [5])
 
 
 class TestVecHelpers(unittest.TestCase):

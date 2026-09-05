@@ -274,18 +274,26 @@ class Indexer(threading.Thread):
             attr_failed = json.loads(self.store.get_meta('attr_failed', '{}') or '{}')
         except Exception:
             attr_failed = {}
+        # Every book id the store knows about, so a vanished book is cleaned up
+        # even when it left no books/dirty row behind (failed indexing) and
+        # orphans from older versions are swept on the first run.
+        known = set(indexed) | set(self.store.dirty_book_ids()) | set(self.store.attr_book_ids())
+        for key in self.store.meta_keys('fileinfo:'):
+            suffix = key.split(':', 1)[1] if ':' in key else ''
+            if suffix.isdigit():
+                known.add(int(suffix))
+        for d in (failed, attr_failed):
+            for k in d:
+                if str(k).isdigit():
+                    known.add(int(str(k)))
         # remove books that vanished from the library
-        for bid, info in list(indexed.items()):
-            if bid not in lib_ids:
-                self.store.clear_book(bid)
-                self.store.remove_dirty(bid)
-                self.store.delete_meta(file_info_key(bid))
-                self.store.clear_attrs(bid)
-                failed.pop(str(bid), None)
-                attr_failed.pop(str(bid), None)
-        for bid in self.store.dirty_book_ids():
-            if bid not in lib_ids:
-                self.store.remove_dirty(bid)
+        for bid in sorted(known - lib_ids):
+            self.store.clear_book(bid)
+            self.store.remove_dirty(bid)
+            self.store.delete_meta(file_info_key(bid))
+            self.store.clear_attrs(bid)
+            failed.pop(str(bid), None)
+            attr_failed.pop(str(bid), None)
         for bid in lib_ids:
             formats = api.formats(bid)
             fmt = pick_format(formats, settings.format_priority)

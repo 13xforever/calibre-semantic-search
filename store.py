@@ -7,8 +7,8 @@ Public API (used by indexer/dialog/attributes):
     insert_chunk / commit
     search(query_vec, limit, min_score) -> list[SearchResult]
     book_chunks_text(book_id) -> list[str]
-    get_meta / set_meta / delete_meta
-    set_attrs / get_attrs / clear_attrs
+    get_meta / set_meta / delete_meta / meta_keys(prefix)
+    set_attrs / get_attrs / clear_attrs / attr_book_ids
     close
 
 Backends:
@@ -163,6 +163,14 @@ class MetaStore:
             self.conn.execute('DELETE FROM meta WHERE key=?', (key,))
             self.conn.commit()
 
+    def meta_keys(self, prefix: str = ''):
+        with self._lock:
+            if prefix:
+                rows = self.conn.execute('SELECT key FROM meta WHERE key LIKE ?', (prefix + '%',)).fetchall()
+            else:
+                rows = self.conn.execute('SELECT key FROM meta').fetchall()
+        return [r[0] for r in rows]
+
     # -- dirty queue -------------------------------------------------------------
 
     def add_dirty(self, book_id: int, fmt: str, reason: str = 'added'):
@@ -239,6 +247,11 @@ class MetaStore:
         with self._lock:
             self.conn.execute('DELETE FROM attrs_raw WHERE book_id=?', (book_id,))
             self.conn.commit()
+
+    def attr_book_ids(self):
+        with self._lock:
+            rows = self.conn.execute('SELECT book_id FROM attrs_raw').fetchall()
+        return [r[0] for r in rows]
 
 
 class SqliteVectorBackend:
@@ -545,6 +558,9 @@ class VectorStore:
     def delete_meta(self, key):
         self.meta.delete_meta(key)
 
+    def meta_keys(self, prefix=''):
+        return self.meta.meta_keys(prefix)
+
     def add_dirty(self, book_id, fmt, reason='added'):
         self.meta.add_dirty(book_id, fmt, reason)
 
@@ -598,6 +614,9 @@ class VectorStore:
 
     def clear_attrs(self, book_id):
         self.meta.clear_attrs(book_id)
+
+    def attr_book_ids(self):
+        return self.meta.attr_book_ids()
 
     # -- search ------------------------------------------------------------------------
 
