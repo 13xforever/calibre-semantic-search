@@ -395,18 +395,11 @@ class TestVecHelpers(unittest.TestCase):
         self.assertEqual(list(v), [0.0, 0.0])
 
 
-def _lancedb_available():
-    try:
-        import lancedb  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
-@unittest.skipUnless(_lancedb_available(), 'lancedb not installed')
 class TestVectorStoreLance(unittest.TestCase):
-    """Runtime coverage for the LanceDB backend (forced, not auto)."""
+    """Runtime coverage for the LanceDB backend (forced, not auto).
+
+    Not skipped when lancedb is missing: without the package, VectorStore raises a
+    clear install error and the tests fail loudly instead of passing silently."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
