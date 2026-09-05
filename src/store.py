@@ -901,7 +901,6 @@ class LanceVectorBackend:
     def search(self, query_vec, limit: int, min_score: float, model: str | None = None) -> list[SearchResult]:
         qv = l2_normalize(query_vec)
         vec = qv.tolist() if np is not None else list(qv)
-        dim = len(vec)
         candidates = []
         tables = [self._open_table(model)] if model is not None else self._all_tables()
         tables = [t for t in tables if t is not None]

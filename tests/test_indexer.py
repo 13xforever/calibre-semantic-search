@@ -1,9 +1,9 @@
+import importlib.util
+import json
 import os as _os
 import sys as _sys
-import json
 import tempfile
 import types
-import importlib.util
 import unittest
 
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))

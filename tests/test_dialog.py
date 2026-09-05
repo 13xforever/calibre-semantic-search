@@ -1,7 +1,7 @@
+import importlib.util
 import os as _os
 import sys as _sys
 import types
-import importlib.util
 import unittest
 
 SRC = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'src')

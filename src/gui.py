@@ -5,10 +5,17 @@ from __future__ import annotations
 import os
 import threading
 
-from qt.core import QDialog, QDialogButtonBox, QTextEdit, QToolButton, QTimer, QVBoxLayout, pyqtSignal
-
 from calibre.gui2.actions import InterfaceAction
 from calibre.utils.localization import _
+from qt.core import (
+    QDialog,
+    QDialogButtonBox,
+    QTextEdit,
+    QTimer,
+    QToolButton,
+    QVBoxLayout,
+    pyqtSignal,
+)
 
 from .store import VectorStore
 from .utils import load_settings, save_settings

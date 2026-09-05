@@ -1,11 +1,12 @@
 # AGENTS.md
 
-calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extracted book attributes. No build system, no package manifest, no linter/typechecker — verification is `py_compile` + the stdlib unittest suite.
+calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extracted book attributes. No build system, no package manifest, no typechecker — verification is ruff (pyflakes rules only) + `py_compile` + the stdlib unittest suite.
 
 ## Commands (run from repo root)
 
-- Full gate — compile + test + build, stop on first failure: `python dev.py`
+- Full gate — compile + lint + test + build, stop on first failure: `python dev.py`
 - Compile check (byte-compiles `src/` + `tests/`): `python dev.py compile`
+- Lint (ruff, pyflakes + isort rules — real bugs and consistent import order, nothing else; config in `ruff.toml`; needs `pip install ruff`, a missing tool fails the gate loudly like lancedb): `python dev.py lint`
 - Tests (all): `python dev.py test` (equivalent to `python -m unittest discover -s tests`)
 - One file: `python -m unittest discover -s tests -p "test_store.py"`
 - Build the installable ZIP: `python dev.py build` — the ZIP **mirrors `src/`**: `__init__.py`, the other modules, and the import-name `.txt` at the ZIP root (calibre's loader requires them there), assets under `assets/`. The script reopens the ZIP and verifies the entry set afterwards.

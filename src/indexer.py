@@ -6,14 +6,18 @@ Runs as a daemon thread. All calibre/Qt access happens through the injected
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import threading
 import time
 import unicodedata
 
-from .chunker import CONTEXT_OVERHEAD_TOKENS, chunks_from_pages, max_chunk_chars, split_plain_text
+from .chunker import (
+    CONTEXT_OVERHEAD_TOKENS,
+    chunks_from_pages,
+    max_chunk_chars,
+    split_plain_text,
+)
 from .store import VectorStore
 
 

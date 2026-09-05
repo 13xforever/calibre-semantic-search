@@ -1,0 +1,8 @@
+# Lint config for the semantic_search plugin.
+# Deliberately narrow: pyflakes (real bugs) + isort (consistent import order).
+# Run via `python dev.py lint` or `python -m ruff check src tests dev.py`.
+
+target-version = "py312"
+
+[lint]
+select = ["F", "I"]

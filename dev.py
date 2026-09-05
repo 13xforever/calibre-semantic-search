@@ -1,14 +1,16 @@
-'''Dev gate for the semantic_search plugin: compile, test, build.
+'''Dev gate for the semantic_search plugin: compile, lint, test, build.
 
 Usage:
-    python dev.py            # compile + test + build, stop on first failure
+    python dev.py            # compile + lint + test + build, stop on first failure
     python dev.py compile    # byte-compile src/ and tests/
+    python dev.py lint       # ruff check (pyflakes rules, see ruff.toml)
     python dev.py test       # run the unittest suite (tests/)
     python dev.py build      # write semantic_search.zip mirroring src/
 '''
 
 import os
 import py_compile
+import subprocess
 import sys
 import unittest
 import zipfile
@@ -35,6 +37,13 @@ def cmd_compile():
         py_compile.compile(path, doraise=True)
     print(f'compiled {len(files)} files')
     return True
+
+
+def cmd_lint():
+    proc = subprocess.run(
+        [sys.executable, '-m', 'ruff', 'check', '--output-format=concise', SRC, TESTS, os.path.join(ROOT, 'dev.py')]
+    )
+    return proc.returncode == 0
 
 
 def cmd_test():
@@ -78,7 +87,7 @@ def cmd_build():
 
 
 def main(argv):
-    steps = {'compile': cmd_compile, 'test': cmd_test, 'build': cmd_build}
+    steps = {'compile': cmd_compile, 'lint': cmd_lint, 'test': cmd_test, 'build': cmd_build}
     if not argv:
         plan = list(steps.items())
     elif len(argv) == 1 and argv[0] in steps:

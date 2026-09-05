@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from calibre.utils.localization import _
 from qt.core import (
     QCheckBox,
     QComboBox,
@@ -19,18 +20,16 @@ from qt.core import (
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
-    QTabWidget,
+    Qt,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QThread,
     QVBoxLayout,
     QWidget,
-    Qt,
     pyqtSignal,
 )
-
-from calibre.utils.localization import _
 
 from .utils import AttrField, Settings, install_lancedb, lancedb_status
 

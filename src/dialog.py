@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from calibre.utils.localization import _
 from qt.core import (
     QAbstractItemView,
     QDialog,
@@ -12,15 +13,13 @@ from qt.core import (
     QLabel,
     QLineEdit,
     QPushButton,
+    Qt,
     QTableWidget,
     QTableWidgetItem,
     QThread,
     QVBoxLayout,
-    Qt,
     pyqtSignal,
 )
-
-from calibre.utils.localization import _
 
 # Hard cap on rows per search, regardless of the score threshold (keeps the table usable
 # even if the user sets the minimum score to 0 on a large library).
