@@ -145,19 +145,16 @@ def lancedb_status() -> tuple[bool, str]:
         return False, str(e)
 
 
-def pip_install_command(extra_args=()) -> list[str]:
-    return [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *extra_args, 'lancedb']
+def pip_install_command(package: str = 'lancedb', extra_args=()) -> list[str]:
+    return [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *extra_args, package]
 
 
-def install_lancedb(progress=None, _popen=None) -> tuple[bool, str]:
-    """Install lancedb into calibre's own Python via pip.
-
-    Tries a normal install first, then falls back to --user (for permission
-    errors). progress(line) receives pip output lines as they arrive.
-    Returns (ok, message).
-    """
+def _pip_install(package: str, progress=None, _popen=None) -> tuple[bool, str]:
+    """Shared pip installer. Tries a normal install first, then falls back to
+    --user (for permission errors). progress(line) receives pip output lines as
+    they arrive. Returns (ok, message)."""
     popen = _popen or subprocess.Popen
-    attempts = (pip_install_command(), pip_install_command(('--user',)))
+    attempts = (pip_install_command(package), pip_install_command(package, ('--user',)))
     last_err = 'no install attempt was made'
     for cmd in attempts:
         try:
@@ -176,6 +173,26 @@ def install_lancedb(progress=None, _popen=None) -> tuple[bool, str]:
                     tail.pop(0)
         rc = proc.wait()
         if rc == 0:
-            return True, 'lancedb installed.'
+            return True, f'{package} installed.'
         last_err = '\n'.join(tail) or f'pip exited with code {rc}'
     return False, last_err
+
+
+def install_lancedb(progress=None, _popen=None) -> tuple[bool, str]:
+    """Install lancedb into calibre's own Python via pip (see _pip_install)."""
+    return _pip_install('lancedb', progress, _popen)
+
+
+def zstandard_status() -> tuple[bool, str]:
+    """Return (installed, version_or_error_message)."""
+    try:
+        import zstandard
+
+        return True, getattr(zstandard, '__version__', 'unknown')
+    except ImportError as e:
+        return False, str(e)
+
+
+def install_zstandard(progress=None, _popen=None) -> tuple[bool, str]:
+    """Install zstandard into calibre's own Python via pip (see _pip_install)."""
+    return _pip_install('zstandard', progress, _popen)

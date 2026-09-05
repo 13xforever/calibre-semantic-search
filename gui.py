@@ -123,6 +123,7 @@ class SemanticSearchAction(InterfaceAction):
 
     _status_sig = pyqtSignal(object)
     _db_sig = pyqtSignal(object)  # (method, args, kwargs, threading.Event)
+    _finalize_sig = pyqtSignal(object, object)  # (store, error-or-None)
 
     def __init__(self, parent, site_customization):
         super().__init__(parent, site_customization)
@@ -130,10 +131,12 @@ class SemanticSearchAction(InterfaceAction):
         self.indexer = None
         self.search_action = None
         self._reconcile_thread = None
+        self._finalize_thread = None
         self._last_status = None
         self._status_dialog = None
         self._status_sig.connect(self._on_status)
         self._db_sig.connect(self._on_db_write)
+        self._finalize_sig.connect(self._on_finalize_done)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -230,6 +233,11 @@ class SemanticSearchAction(InterfaceAction):
         return self.store is not None
 
     def _start_for_library(self, show_error: bool = False):
+        if self._finalize_thread is not None and self._finalize_thread.is_alive():
+            # don't close the store out from under an in-flight migration; give it a
+            # moment to finish (partial work resumes on the next start)
+            self._finalize_thread.join(timeout=5.0)
+        self._finalize_thread = None
         self._stop_indexer()
         if self.store is not None:
             try:
@@ -256,6 +264,16 @@ class SemanticSearchAction(InterfaceAction):
 
                 error_dialog(self.gui, 'Semantic search', f'Failed to open the semantic search store:\n{e}', show=True)
             return
+        if self.store.needs_finalize():
+            # legacy chunk tables / pending schema work: migrate in the background
+            # (can take minutes on large libraries), then start the indexer
+            t = threading.Thread(target=self._finalize_safe, args=(self.store,), name='SSFinalize', daemon=True)
+            self._finalize_thread = t
+            t.start()
+            return
+        self._begin_indexing()
+
+    def _begin_indexing(self):
         from .indexer import Indexer
 
         get_api = lambda: (self.gui.current_db.new_api if self.gui is not None else None)
@@ -273,6 +291,28 @@ class SemanticSearchAction(InterfaceAction):
         t = threading.Thread(target=self._reconcile_safe, name='SSReconcile', daemon=True)
         self._reconcile_thread = t
         t.start()
+
+    def _finalize_safe(self, store):
+        try:
+            store.finalize_schema()
+            self._finalize_sig.emit(store, None)
+        except Exception as e:
+            self._finalize_sig.emit(store, e)
+
+    def _on_finalize_done(self, store, error):
+        if store is not self.store:
+            return  # library switched while migrating; the new startup owns things now
+        if error is not None:
+            from calibre.gui2 import error_dialog
+
+            error_dialog(
+                self.gui,
+                'Semantic search',
+                f'Search database migration failed:\n{error!r}\n\nRestart calibre to retry.',
+                show=True,
+            )
+            return
+        self._begin_indexing()
 
     def library_changed(self, db):
         self._start_for_library()
@@ -407,6 +447,9 @@ class SemanticSearchAction(InterfaceAction):
         else:
             lines.append(f'Indexed books: {len(books)}')
         lines.append(f'Total chunks: {n_chunks}')
+        ft = getattr(self, '_finalize_thread', None)
+        if ft is not None and ft.is_alive():
+            lines.append('Migrating search database (first start after an upgrade; can take a while on large libraries)')
         st = self._last_status
         if st and st.get('state') == 'paused':
             lines.append(_('Indexing paused (use the menu to resume)'))
@@ -621,7 +664,7 @@ class SemanticSearchAction(InterfaceAction):
 
             error_dialog(self.gui, _('Semantic search'), f'No usable format for {self._book_label(book_id)}.', show=True)
             return
-        self.store.add_dirty(book_id, fmt, 'reindex')
+        self.store.add_dirty(book_id, 'reindex')
         from calibre.gui2 import info_dialog
 
         info_dialog(self.gui, _('Semantic search'), f'Queued {self._book_label(book_id)} for re-embedding.', show=True)
@@ -677,7 +720,7 @@ class SemanticSearchAction(InterfaceAction):
             fmt = pick_format(formats, settings.format_priority)
             if fmt is None:
                 continue
-            self.store.add_dirty(bid, fmt, 'reindex')
+            self.store.add_dirty(bid, 'reindex')
             queued += 1
         from calibre.gui2 import info_dialog
 
@@ -714,7 +757,7 @@ class SemanticSearchAction(InterfaceAction):
             fmt = pick_format(formats, settings.format_priority)
             if fmt is None:
                 continue
-            self.store.add_dirty(bid, fmt, 'reindex')
+            self.store.add_dirty(bid, 'reindex')
 
     def _check_llm_provider(self):
         """Return True if a text-to-text AI provider is configured; show an error otherwise."""

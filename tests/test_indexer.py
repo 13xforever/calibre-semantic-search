@@ -126,9 +126,9 @@ class TestAttrPhase(unittest.TestCase):
         return vs, ix, settings, statuses, done, writer
 
     def _index_book(self, vs, bid):
-        vs.upsert_book(bid, 'EPUB', 1, 'm', 8)
+        vs.upsert_book(bid, 'EPUB', 1, 'm')
         c = chunker.Chunk(chunk_no=0, text='x' * 3000, chapter_path=['c'], para_start=0, para_end=1, char_offset=0)
-        vs.insert_chunk(bid, c, c.text, c.chapter_path, 0, 1, 0, 'm', 8, [0.1] * 8)
+        vs.insert_chunk(bid, c, 'm', [0.1] * 8)
         vs.commit(bid)
 
     def test_persists_and_reports(self):
@@ -177,9 +177,9 @@ class TestAttrPhase(unittest.TestCase):
 
 
 def _index_book(vs, bid):
-    vs.upsert_book(bid, 'EPUB', 1, 'm', 8)
+    vs.upsert_book(bid, 'EPUB', 1, 'm')
     c = chunker.Chunk(chunk_no=0, text='x' * 3000, chapter_path=['c'], para_start=0, para_end=1, char_offset=0)
-    vs.insert_chunk(bid, c, c.text, c.chapter_path, 0, 1, 0, 'm', 8, [0.1] * 8)
+    vs.insert_chunk(bid, c, 'm', [0.1] * 8)
     vs.commit(bid)
 
 
@@ -279,19 +279,19 @@ class TestReconcile(unittest.TestCase):
         vs, ix = self._make([1])
         _index_book(vs, 2)
         vs.set_attrs(2, {'gender': 'f'})
-        vs.set_meta(indexer.file_info_key(2), 'EPUB|100|1234.0')
+        vs.set_file_info(2, 'EPUB', 100, 1234)
         vs.set_meta('failed', json.dumps({'2': {'error': 'x'}}))
         vs.set_meta('attr_failed', json.dumps({'2': {'error': 'y'}}))
         ix.reconcile()
         self.assertFalse(vs.book_is_indexed(2))
         self.assertEqual(vs.get_attrs(2), {})
-        self.assertIsNone(vs.get_meta(indexer.file_info_key(2)))
+        self.assertIsNone(vs.get_file_info(2))
         self.assertNotIn('2', json.loads(vs.get_meta('failed', '{}')))
         self.assertNotIn('2', json.loads(vs.get_meta('attr_failed', '{}')))
 
     def test_removed_dirty_book_dropped(self):
         vs, ix = self._make([1])
-        vs.add_dirty(3, 'EPUB')
+        vs.add_dirty(3)
         ix.reconcile()
         # book 3 vanished from the library; book 1 (present, unindexed) is queued
         self.assertNotIn(3, vs.dirty_book_ids())
@@ -300,30 +300,30 @@ class TestReconcile(unittest.TestCase):
         # rows left behind by older versions: attrs_raw + fileinfo with no books/dirty row
         vs, ix = self._make([1])
         vs.set_attrs(2, {'gender': 'f'})
-        vs.set_meta(indexer.file_info_key(2), 'EPUB|100|1234.0')
+        vs.set_file_info(2, 'EPUB', 100, 1234)
         ix.reconcile()
         self.assertEqual(vs.get_attrs(2), {})
-        self.assertIsNone(vs.get_meta(indexer.file_info_key(2)))
+        self.assertIsNone(vs.get_file_info(2))
         self.assertEqual(vs.attr_book_ids(), [])
 
     def test_failed_indexing_book_removed(self):
         # a book that failed indexing has no books row, only fileinfo + a failed entry
         vs, ix = self._make([1])
-        vs.set_meta(indexer.file_info_key(3), 'EPUB|100|1234.0')
+        vs.set_file_info(3, 'EPUB', 100, 1234)
         vs.set_meta('failed', json.dumps({'3': {'error': 'x'}}))
         ix.reconcile()
-        self.assertIsNone(vs.get_meta(indexer.file_info_key(3)))
+        self.assertIsNone(vs.get_file_info(3))
         self.assertNotIn('3', json.loads(vs.get_meta('failed', '{}')))
 
     def test_surviving_books_untouched(self):
         vs, ix = self._make([1])
         _index_book(vs, 1)
         vs.set_attrs(1, {'gender': 'm'})
-        vs.set_meta(indexer.file_info_key(1), 'EPUB|100|1234.0')
+        vs.set_file_info(1, 'EPUB', 100, 1234)
         ix.reconcile()
         self.assertTrue(vs.book_is_indexed(1))
         self.assertEqual(vs.get_attrs(1)['gender'], 'm')
-        self.assertEqual(vs.get_meta(indexer.file_info_key(1)), 'EPUB|100|1234.0')
+        self.assertEqual(vs.get_file_info(1), {'fmt': 'EPUB', 'size': 100, 'mtime_s': 1234})
 
 
 class TestPauseResume(unittest.TestCase):

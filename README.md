@@ -34,15 +34,16 @@ attributes in custom columns.
 
 1. Build the ZIP (from this directory):
 
-   ```powershell
-   python -m zipfile -c semantic_search.zip `
-     __init__.py gui.py dialog.py store.py chunker.py indexer.py `
-     embed_client.py attributes.py config_widget.py utils.py `
-       plugin-import-name-semantic_search.txt semantic_search.png `
-       semantic_search-for-light-theme.png semantic_search-for-dark-theme.png `
-       semantic_pause.png semantic_pause-for-light-theme.png semantic_pause-for-dark-theme.png `
-       semantic_play.png semantic_play-for-light-theme.png semantic_play-for-dark-theme.png
-    ```
+    ```powershell
+    python -m zipfile -c semantic_search.zip `
+      __init__.py gui.py dialog.py store.py chunker.py indexer.py `
+      embed_client.py attributes.py config_widget.py utils.py `
+        plugin-import-name-semantic_search.txt semantic_search.png `
+        semantic_search-for-light-theme.png semantic_search-for-dark-theme.png `
+        semantic_pause.png semantic_pause-for-light-theme.png semantic_pause-for-dark-theme.png `
+        semantic_play.png semantic_play-for-light-theme.png semantic_play-for-dark-theme.png `
+        default_compression_dict.bin
+     ```
 
 2. In calibre: *Preferences > Plugins > Custom plugins > `+`* and pick the ZIP.
 3. Open the new **Semantic search** menu (toolbar dropdown or the icon in the
@@ -73,8 +74,16 @@ attributes in custom columns.
 - Per-library SQLite file `semantic-search.db` next to `metadata.db` holds
   book registry, dirty queue, metadata, raw attribute JSON, and (for the
   sqlite backend) chunk text + vectors — one table per embedding model, so
-  different models never mix. Search reads vectors in RAM-budgeted batches
-  (half of the free RAM) instead of loading the whole index.
+  different models never mix. Chunk text is stored compressed (zstd with a
+  bundled compression dictionary when available, zlib otherwise), which keeps
+  the file noticeably smaller than the raw text would be. Search reads vectors
+  in RAM-budgeted batches (half of the free RAM) instead of loading the whole
+  index.
+- Databases created by older versions migrate automatically on first start
+  after upgrading. On large libraries this one-time migration can take a
+  while; *Index status* shows "Migrating search database" until it finishes,
+  and indexing starts only afterwards. The migration is resumable if calibre
+  is closed mid-way.
 - The **lancedb** backend keeps vectors in a sibling LanceDB directory
   (`semantic-search-lancedb/`), one table per embedding model; bookkeeping
   stays in SQLite either way.

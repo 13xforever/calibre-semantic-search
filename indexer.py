@@ -96,38 +96,38 @@ def pick_format(formats, priority: list[str]) -> str | None:
     return next(iter(formats))
 
 
-def _mtime_to_float(v):
-    """Normalize an mtime value (number or datetime) to a float epoch timestamp."""
+def _mtime_to_int(v):
+    """Normalize an mtime value (number or datetime) to integer epoch seconds."""
     if v is None:
         return None
     ts = getattr(v, 'timestamp', None)
     if callable(ts):
         try:
-            return float(ts())
+            return int(round(float(ts())))
         except Exception:
             pass
     try:
-        return float(v)
+        return int(round(float(v)))
     except (TypeError, ValueError):
         pass
     try:
         from datetime import datetime
 
-        return float(datetime.fromisoformat(str(v)).timestamp())
+        return int(round(datetime.fromisoformat(str(v)).timestamp()))
     except Exception:
         return None
 
 
-def file_info_value(fmt: str, md: dict) -> str:
-    """Serialize (fmt, size, mtime) for change detection; fmt-only if stat info is missing."""
+def file_info_from_md(fmt: str, md: dict):
+    """(size, mtime_s) for change detection; None when the stat info is missing."""
     try:
         size = int(md.get('size'))
     except (TypeError, ValueError):
-        size = None
-    mtime = _mtime_to_float(md.get('mtime'))
-    if size is not None and mtime is not None:
-        return f'{fmt}|{size}|{mtime}'
-    return fmt
+        return None
+    mtime_s = _mtime_to_int(md.get('mtime'))
+    if mtime_s is None:
+        return None
+    return size, mtime_s
 
 
 class Indexer(threading.Thread):
@@ -277,11 +277,7 @@ class Indexer(threading.Thread):
         # Every book id the store knows about, so a vanished book is cleaned up
         # even when it left no books/dirty row behind (failed indexing) and
         # orphans from older versions are swept on the first run.
-        known = set(indexed) | set(self.store.dirty_book_ids()) | set(self.store.attr_book_ids())
-        for key in self.store.meta_keys('fileinfo:'):
-            suffix = key.split(':', 1)[1] if ':' in key else ''
-            if suffix.isdigit():
-                known.add(int(suffix))
+        known = set(indexed) | set(self.store.dirty_book_ids()) | set(self.store.attr_book_ids()) | set(self.store.file_info_book_ids())
         for d in (failed, attr_failed):
             for k in d:
                 if str(k).isdigit():
@@ -290,7 +286,7 @@ class Indexer(threading.Thread):
         for bid in sorted(known - lib_ids):
             self.store.clear_book(bid)
             self.store.remove_dirty(bid)
-            self.store.delete_meta(file_info_key(bid))
+            self.store.clear_file_info(bid)
             self.store.clear_attrs(bid)
             failed.pop(str(bid), None)
             attr_failed.pop(str(bid), None)
@@ -303,41 +299,37 @@ class Indexer(threading.Thread):
                 md = api.format_metadata(bid, fmt)
             except Exception:
                 continue
-            fi_raw = self.store.get_meta(file_info_key(bid), '') or ''
-            parts = fi_raw.split('|')
+            fi = self.store.get_file_info(bid)
             info = indexed.get(bid)
             if info is None:
                 # never indexed; skip if it failed before and the file is unchanged
-                if str(bid) in failed and len(parts) == 3 and parts[0] == fmt and self._same_file(parts, md):
+                if str(bid) in failed and fi is not None and fi['fmt'] == fmt and self._same_file(fi, md):
                     continue
-                self.store.add_dirty(bid, fmt, 'added')
+                self.store.add_dirty(bid, 'added')
                 continue
-            if len(parts) == 3:
-                changed = parts[0] != fmt or not self._same_file(parts, md)
-            else:
+            if fi is None:
+                # no file info recorded (e.g. stat info was missing at index time)
                 changed = info['fmt'] != fmt
+            else:
+                changed = fi['fmt'] != fmt or not self._same_file(fi, md)
             if changed:
-                self.store.add_dirty(bid, fmt, 'changed')
+                self.store.add_dirty(bid, 'changed')
         self.store.set_meta('failed', json.dumps(failed))
         self.store.set_meta('attr_failed', json.dumps(attr_failed))
         try:
             # removed books may have been the last ones of their model
-            self.store.cleanup_stale_models()
+            self.store.cleanup_stale_models(settings.embed.model)
         except Exception:
             pass
 
     @staticmethod
-    def _same_file(parts: list[str], md: dict) -> bool:
+    def _same_file(fi: dict, md: dict) -> bool:
         try:
-            size = int(parts[1])
-            cur_size = int(md.get('size'))
-        except (IndexError, TypeError, ValueError):
-            return False
-        mtime = _mtime_to_float(parts[2])
-        cur_mtime = _mtime_to_float(md.get('mtime'))
-        if mtime is None or cur_mtime is None:
-            return False
-        return size == cur_size and abs(mtime - cur_mtime) < 1e-6
+            size_ok = int(md.get('size')) == fi['size']
+        except (TypeError, ValueError):
+            size_ok = False
+        mtime_s = _mtime_to_int(md.get('mtime'))
+        return size_ok and mtime_s is not None and mtime_s == fi['mtime_s']
 
     # -- worker loop ----------------------------------------------------------
 
@@ -361,7 +353,7 @@ class Indexer(threading.Thread):
                     self._process_one(pending[0])
                     try:
                         # a re-indexed book may have been the last one of its old model
-                        self.store.cleanup_stale_models()
+                        self.store.cleanup_stale_models(self.settings_provider().embed.model)
                     except Exception as e:
                         _default_log(f'stale model cleanup failed: {e!r}')
                     continue
@@ -440,7 +432,7 @@ class Indexer(threading.Thread):
         if kind == 'pages' and not any((p or '').strip() for p in payload):
             self._status('done', book_id, note='no text found')
             self.store.clear_book(book_id)
-            self.store.upsert_book(book_id, fmt, 0, settings.embed.model, 0)
+            self.store.upsert_book(book_id, fmt, 0, settings.embed.model)
             self.store.remove_dirty(book_id)
             return
 
@@ -455,7 +447,7 @@ class Indexer(threading.Thread):
             chunks = chunks[: settings.max_chunks_per_book]
         if not chunks:
             self.store.clear_book(book_id)
-            self.store.upsert_book(book_id, fmt, 0, settings.embed.model, 0)
+            self.store.upsert_book(book_id, fmt, 0, settings.embed.model)
             self.store.remove_dirty(book_id)
             return
 
@@ -483,19 +475,21 @@ class Indexer(threading.Thread):
         if len(vectors) != len(chunks):
             self._fail(book_id, f'embedding count mismatch: {len(vectors)} vs {len(chunks)}')
             return
-        dim = len(vectors[0])
         self._status('saving', book_id)
         from .store import l2_normalize
 
         self.store.clear_book(book_id)
         for c, v in zip(chunks, vectors):
-            self.store.insert_chunk(
-                book_id, c, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, settings.embed.model, dim, l2_normalize(v)
-            )
+            self.store.insert_chunk(book_id, c, settings.embed.model, l2_normalize(v))
         self.store.commit()
-        self.store.upsert_book(book_id, fmt, len(chunks), settings.embed.model, dim)
-        # record size/mtime for change detection
-        self.store.set_meta(file_info_key(book_id), file_info_value(fmt, md))
+        self.store.upsert_book(book_id, fmt, len(chunks), settings.embed.model)
+        # record size/mtime for change detection (no row when stat info is missing:
+        # a missing file_info falls back to format-only comparison in reconcile)
+        fi = file_info_from_md(fmt, md)
+        if fi is not None:
+            self.store.set_file_info(book_id, fmt, *fi)
+        else:
+            self.store.clear_file_info(book_id)
         import json
 
         try:
@@ -519,7 +513,11 @@ class Indexer(threading.Thread):
         if fmt is not None and api is not None:
             try:
                 md = api.format_metadata(book_id, fmt)
-                self.store.set_meta(file_info_key(book_id), file_info_value(fmt, md))
+                fi = file_info_from_md(fmt, md)
+                if fi is not None:
+                    self.store.set_file_info(book_id, fmt, *fi)
+                else:
+                    self.store.clear_file_info(book_id)
             except Exception:
                 pass
         failed = {}
@@ -532,7 +530,3 @@ class Indexer(threading.Thread):
         self.store.remove_dirty(book_id)
         self.current_book_id = None
         self._status('error', book_id, error=msg)
-
-
-def file_info_key(book_id: int) -> str:
-    return f'fileinfo:{book_id}'

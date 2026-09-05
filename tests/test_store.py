@@ -12,6 +12,32 @@ from util import load
 store = load('store')
 
 
+# v0 layout (pre-migration): used to build legacy DBs for the migration tests.
+LEGACY_META_SCHEMA = '''
+CREATE TABLE IF NOT EXISTS books(
+    id INTEGER PRIMARY KEY,
+    fmt TEXT NOT NULL,
+    indexed_at REAL,
+    n_chunks INTEGER DEFAULT 0,
+    model TEXT,
+    dim INTEGER
+);
+CREATE TABLE IF NOT EXISTS dirty(
+    book_id INTEGER PRIMARY KEY,
+    fmt TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT 'added',
+    added_at REAL
+);
+CREATE TABLE IF NOT EXISTS attrs_raw(
+    book_id INTEGER PRIMARY KEY,
+    json TEXT NOT NULL DEFAULT '{}',
+    fields TEXT NOT NULL DEFAULT '',
+    updated_at REAL
+);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+'''
+
+
 @dataclass
 class _C:
     chunk_no: int
@@ -59,9 +85,9 @@ class TestVectorStore(unittest.TestCase):
             vecs.append(v)
         q = [1.0] * dim  # closest to chunk 0 (all cos small positive)
         for c, v in zip(chunks, vecs):
-            s.insert_chunk(1, c, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, 'test-model', dim, store.l2_normalize(v))
+            s.insert_chunk(1, c, 'test-model', store.l2_normalize(v))
         s.commit()
-        s.upsert_book(1, 'EPUB', 5, 'test-model', dim)
+        s.upsert_book(1, 'EPUB', 5, 'test-model')
 
         self.assertTrue(s.book_is_indexed(1))
         books = s.indexed_books()
@@ -90,9 +116,9 @@ class TestVectorStore(unittest.TestCase):
         vecs = [[math.cos(i * 0.3 + t) for t in range(dim)] for i in range(5)]
         q = [1.0] * dim
         for c, v in zip(chunks, vecs):
-            s.insert_chunk(1, c, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, 'test-model', dim, store.l2_normalize(v))
+            s.insert_chunk(1, c, 'test-model', store.l2_normalize(v))
         s.commit()
-        s.upsert_book(1, 'EPUB', 5, 'test-model', dim)
+        s.upsert_book(1, 'EPUB', 5, 'test-model')
 
         all_res = s.search(q, limit=10)
         self.assertEqual(len(all_res), 5)
@@ -108,16 +134,16 @@ class TestVectorStore(unittest.TestCase):
         s = self.s
         chunks = self._chunks()[:1]
         for c in chunks:
-            s.insert_chunk(7, c, c.text, [], 0, 0, 0, 'model-a', 4, store.l2_normalize([1.0, 0.0, 0.0, 0.0]))
+            s.insert_chunk(7, c, 'model-a', store.l2_normalize([1.0, 0.0, 0.0, 0.0]))
         s.commit()
-        s.upsert_book(7, 'EPUB', 1, 'model-a', 4)
+        s.upsert_book(7, 'EPUB', 1, 'model-a')
         # query with different dim -> no results (no cross-dim search)
         self.assertEqual(s.search([1.0] * 8), [])
 
     def test_dirty_queue(self):
         s = self.s
-        s.add_dirty(1, 'EPUB', 'added')
-        s.add_dirty(2, 'MOBI', 'changed')
+        s.add_dirty(1, 'added')
+        s.add_dirty(2, 'changed')
         self.assertEqual(sorted(s.dirty_book_ids()), [1, 2])
         s.remove_dirty(1)
         self.assertEqual(s.dirty_book_ids(), [2])
@@ -126,9 +152,9 @@ class TestVectorStore(unittest.TestCase):
         s = self.s
         chunks = self._chunks()[:2]
         for c in chunks:
-            s.insert_chunk(9, c, c.text, [], 0, 0, 0, 'm', 3, store.l2_normalize([1.0, 0.0, 0.0]))
+            s.insert_chunk(9, c, 'm', store.l2_normalize([1.0, 0.0, 0.0]))
         s.commit()
-        s.upsert_book(9, 'EPUB', 2, 'm', 3)
+        s.upsert_book(9, 'EPUB', 2, 'm')
         self.assertTrue(s.book_is_indexed(9))
         s.clear_book(9)
         self.assertFalse(s.book_is_indexed(9))
@@ -179,9 +205,9 @@ class TestSqlitePerModel(unittest.TestCase):
         chunks = [_C(i, f'{model} chunk {i}', ['ch'], i, i + 1, i) for i in range(n)]
         vecs = [[math.cos(i * 0.7 + t) for t in range(dim)] for i in range(n)]
         for c, v in zip(chunks, vecs):
-            s.insert_chunk(book_id, c, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, model, dim, store.l2_normalize(v))
+            s.insert_chunk(book_id, c, model, store.l2_normalize(v))
         s.commit()
-        s.upsert_book(book_id, 'EPUB', n, model, dim)
+        s.upsert_book(book_id, 'EPUB', n, model)
 
     def test_one_table_per_model(self):
         s = self.s
@@ -217,7 +243,7 @@ class TestSqlitePerModel(unittest.TestCase):
         # re-index the book under a new model (what "Re-index all books" does per book)
         s.clear_book(1)
         self._index_book(s, 1, 'new-model', 8)
-        self.assertEqual(s.cleanup_stale_models(), 1)
+        self.assertEqual(s.cleanup_stale_models('new-model'), 1)
         self.assertEqual(self._tables(), ['chunks_new_model'])
         res = s.search([1.0] * 8, limit=10, model='new-model')
         self.assertTrue(res and all(r.book_id == 1 for r in res))
@@ -226,14 +252,18 @@ class TestSqlitePerModel(unittest.TestCase):
         s = self.s
         self._index_book(s, 1, 'alpha-model', 8)
         self._index_book(s, 2, 'beta_model', 8)
-        self.assertEqual(s.cleanup_stale_models(), 0)
+        self.assertEqual(s.cleanup_stale_models('alpha-model'), 0)
         self.assertEqual(len(self._tables()), 2)
 
     def test_legacy_chunks_table_migrated(self):
         self.s.close()
-        # build a db in the old single-table layout
+        for suffix in ('', '-wal', '-shm'):  # setUp already created a v2 db at this path
+            p = self.path + suffix
+            if os.path.exists(p):
+                os.remove(p)
+        # build a db in the old single-table layout (v0 meta schema + legacy chunks)
         conn = sqlite3.connect(self.path)
-        conn.executescript(store.META_SCHEMA)
+        conn.executescript(LEGACY_META_SCHEMA)
         conn.execute(
             '''CREATE TABLE chunks(
                 id INTEGER PRIMARY KEY, book_id INTEGER NOT NULL, chunk_no INTEGER NOT NULL,
@@ -253,6 +283,9 @@ class TestSqlitePerModel(unittest.TestCase):
 
         s = store.VectorStore(self.path, backend='sqlite')
         try:
+            self.assertTrue(s.needs_finalize())
+            s.finalize_schema()
+            self.assertFalse(s.needs_finalize())
             self.assertEqual(s.backend._chunk_tables(), ['chunks_old_model'])
             res = s.search([1.0] * 4, limit=5)
             self.assertEqual(len(res), 1)
@@ -272,9 +305,9 @@ class TestSqlitePerModel(unittest.TestCase):
             chunks = [_C(i, f'book {b} chunk {i} ' + 'x' * 20, [], i, i + 1, i) for i in range(n_chunks)]
             vecs = [store.l2_normalize([1.0 - 0.001 * (b - 1) * n_chunks - 0.001 * i] + [0.1] * (dim - 1)) for i in range(n_chunks)]
             for c, v in zip(chunks, vecs):
-                s.insert_chunk(b, c, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, 'bf-model', dim, v)
+                s.insert_chunk(b, c, 'bf-model', v)
             s.commit()
-            s.upsert_book(b, 'EPUB', n_chunks, 'bf-model', dim)
+            s.upsert_book(b, 'EPUB', n_chunks, 'bf-model')
 
         q = store.l2_normalize([1.0] + [0.0] * (dim - 1))
         rows = s.backend.conn.execute('SELECT book_id, chunk_no, vector FROM chunks_bf_model ORDER BY id').fetchall()
@@ -362,9 +395,9 @@ class TestVectorStoreLance(unittest.TestCase):
         dim = 8
         vecs = [[math.cos(i * 0.3 + t) for t in range(dim)] for i in range(5)]
         for c, v in zip(chunks, vecs):
-            s.insert_chunk(1, c, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, 'test-model', dim, store.l2_normalize(v))
+            s.insert_chunk(1, c, 'test-model', store.l2_normalize(v))
         s.commit()
-        s.upsert_book(1, 'EPUB', 5, 'test-model', dim)
+        s.upsert_book(1, 'EPUB', 5, 'test-model')
 
         results = s.search([1.0] * dim, limit=3)
         self.assertEqual(len(results), 3)
