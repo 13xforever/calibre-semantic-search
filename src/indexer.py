@@ -97,23 +97,24 @@ def pick_format(formats, priority: list[str]) -> str | None:
 
 
 def _mtime_to_int(v):
-    """Normalize an mtime value (number or datetime) to integer epoch seconds."""
+    """Normalize an mtime value (number or datetime) to integer epoch seconds (truncated,
+    never rounded into the future)."""
     if v is None:
         return None
     ts = getattr(v, 'timestamp', None)
     if callable(ts):
         try:
-            return int(round(float(ts())))
+            return int(float(ts()))
         except Exception:
             pass
     try:
-        return int(round(float(v)))
+        return int(float(v))
     except (TypeError, ValueError):
         pass
     try:
         from datetime import datetime
 
-        return int(round(datetime.fromisoformat(str(v)).timestamp()))
+        return int(datetime.fromisoformat(str(v)).timestamp())
     except Exception:
         return None
 

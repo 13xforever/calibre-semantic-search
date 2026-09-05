@@ -2,14 +2,37 @@ import math
 import os
 import sqlite3
 import tempfile
+import types
+import importlib
+import importlib.util
 import unittest
 from dataclasses import dataclass
 
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
-from util import load
 
-store = load('store')
+SRC = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'src')
+
+# Load plugin modules as a synthetic package so their relative imports resolve.
+_pkg = types.ModuleType('sspkg')
+_pkg.__path__ = [SRC]
+_sys.modules['sspkg'] = _pkg
+
+
+def _loadpkg(name):
+    key = 'sspkg.' + name
+    if key in _sys.modules:
+        return _sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, _os.path.join(SRC, name + '.py'))
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = 'sspkg'
+    _sys.modules[key] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+store = _loadpkg('store')
+_v2 = importlib.import_module('sspkg.migrations.v2')
 
 
 # v0 layout (pre-migration): used to build legacy DBs for the migration tests.
@@ -278,23 +301,29 @@ class TestSqlitePerModel(unittest.TestCase):
             (1, 0, 'legacy text', 'ch', 0, 2, 0, 'old-model', 4, store.vec_to_blob([1.0, 0.0, 0.0, 0.0])),
         )
         conn.execute('INSERT INTO books(id, fmt, indexed_at, n_chunks, model, dim) VALUES(?,?,?,?,?,?)', (1, 'EPUB', 0.0, 1, 'old-model', 4))
+        conn.execute("INSERT INTO meta(key, value) VALUES('fileinfo:1', 'EPUB|100|1598092103.694143')")
         conn.commit()
         conn.close()
 
         s = store.VectorStore(self.path, backend='sqlite')
         try:
+            # legacy mtime is truncated to whole seconds, never rounded into the future
+            self.assertEqual(s.get_file_info(1), {'fmt': 'EPUB', 'size': 100, 'mtime_s': 1598092103})
             self.assertTrue(s.needs_finalize())
             with s.meta._lock:
                 ac_before = s.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
             ac_during = {}
-            orig_slim = s.backend._slim_table
+            orig_slim = _v2.slim_table
 
-            def slim_probe(t):
+            def slim_probe(backend, t):
                 with s.meta._lock:
                     ac_during['v'] = s.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
-                return orig_slim(t)
-            s.backend._slim_table = slim_probe
-            s.finalize_schema()
+                return orig_slim(backend, t)
+            _v2.slim_table = slim_probe
+            try:
+                s.finalize_schema()
+            finally:
+                _v2.slim_table = orig_slim
             self.assertFalse(s.needs_finalize())
             self.assertEqual(ac_during.get('v'), 0)  # auto-checkpoint disabled during migration
             with s.meta._lock:

@@ -22,7 +22,8 @@ file_info registries) are versioned with PRAGMA user_version and migrated
 structurally on open. The sqlite chunk tables migrate from the legacy single
 `chunks` table to slim per-model tables whose text lives in a compressed `text_z`
 BLOB; the codec is recorded once in meta['text_codec'] and used verbatim by both
-reads and writes.
+reads and writes. Each migration step lives in the migrations/ package (one module
+per version step) and is imported at its call site below.
 '''
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ import threading
 import time
 import zlib
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
 
 try:
     import numpy as np  # optional, big speedup for search
@@ -161,7 +161,6 @@ def available_ram_bytes():
 # -- text compression -----------------------------------------------------------
 
 TEXT_CODEC_KEY = 'text_codec'
-MODEL_ALIASES_KEY = 'model_aliases'
 ZSTD_LEVEL = 3
 DEFAULT_DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'default_compression_dict.bin')
 
@@ -291,6 +290,8 @@ def ensure_codec_setup(meta: 'MetaStore', progress=None):
 
 # -- DDL ------------------------------------------------------------------------
 
+# Current schema version: brand-new DBs are created at this version, existing DBs
+# reach it through the migrations/ steps (one self-contained file per version).
 SCHEMA_VERSION = 2
 
 META_SCHEMA = '''
@@ -344,42 +345,6 @@ CREATE INDEX IF NOT EXISTS idx_{name}_book ON {name}(book_id);
 '''
 
 
-def chunks_table_sql_v1(name: str) -> str:
-    """Legacy (v1) chunk-table shape, used only as the v0->v1 split target."""
-    return f'''
-CREATE TABLE IF NOT EXISTS {name}(
-    id INTEGER PRIMARY KEY,
-    book_id INTEGER NOT NULL,
-    chunk_no INTEGER NOT NULL,
-    text TEXT NOT NULL,
-    chapter_path TEXT NOT NULL DEFAULT '',
-    para_start INTEGER NOT NULL DEFAULT 0,
-    para_end INTEGER NOT NULL DEFAULT 0,
-    char_offset INTEGER NOT NULL DEFAULT 0,
-    model TEXT NOT NULL,
-    dim INTEGER NOT NULL,
-    vector BLOB NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_{name}_book ON {name}(book_id);
-'''
-
-
-def _parse_fileinfo_value(value: str):
-    """Legacy meta value 'FMT|size|mtime' -> (fmt, size, mtime_s); None when incomplete."""
-    parts = (value or '').split('|')
-    if len(parts) != 3:
-        return None
-    fmt, size_s, mtime_s = parts
-    if not fmt:
-        return None
-    try:
-        size = int(size_s)
-        mtime = int(Decimal(mtime_s).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-    except (ValueError, ArithmeticError):
-        return None
-    return fmt, size, mtime
-
-
 class MetaStore:
     """SQLite bookkeeping: dirty queue, indexed-book registry, key/value meta."""
 
@@ -404,7 +369,9 @@ class MetaStore:
                 self.conn.execute('VACUUM')
                 self.conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
             else:
-                self.migrated = self._migrate_meta()
+                from .migrations.v1 import upgrade
+
+                self.migrated = upgrade(self)
             self.conn.commit()
 
     def close(self):
@@ -415,16 +382,7 @@ class MetaStore:
         """Drain the WAL into the main DB file and truncate it. Caller holds self._lock."""
         self.conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
 
-    # -- schema migration --------------------------------------------------------
-
-    def _user_version(self) -> int:
-        return int(self.conn.execute('PRAGMA user_version').fetchone()[0])
-
-    def _has_table(self, name: str) -> bool:
-        return self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
-
-    def _table_cols(self, name: str) -> set[str]:
-        return {r[1] for r in self.conn.execute(f'PRAGMA table_info({name})').fetchall()}
+    # -- models/formats registries (shared by the write path and migrations/meta.py) --
 
     def _upsert_model(self, model: str) -> int:
         self.conn.execute('INSERT INTO models(model) VALUES(?) ON CONFLICT(model) DO NOTHING', (model,))
@@ -441,136 +399,6 @@ class MetaStore:
     def _fmt_id(self, fmt: str) -> int:
         row = self.conn.execute('SELECT id FROM formats WHERE fmt=?', (fmt,)).fetchone()
         return row[0] if row else self._upsert_format(fmt)
-
-    def _record_model_alias(self, raw_model: str, norm: str):
-        try:
-            row = self.conn.execute('SELECT value FROM meta WHERE key=?', (MODEL_ALIASES_KEY,)).fetchone()
-            aliases = json.loads(row[0]) if row else {}
-        except Exception:
-            aliases = {}
-        if not isinstance(aliases, dict):
-            aliases = {}
-        if aliases.get(raw_model) != norm:
-            aliases[raw_model] = norm
-            self.conn.execute(
-                'INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                (MODEL_ALIASES_KEY, json.dumps(aliases)),
-            )
-
-    def _migrate_meta(self) -> bool:
-        """Bring the meta tables from any legacy shape to v2.
-
-        Structural and resumable: each sub-step detects whether its own work is
-        still pending and runs in its own committed transaction. Returns True when
-        anything was migrated (the caller then runs the final VACUUM).
-        """
-        if self._user_version() >= SCHEMA_VERSION:
-            return False
-        did = False
-        books_cols = self._table_cols('books')
-        dirty_cols = self._table_cols('dirty') if self._has_table('dirty') else set()
-        attrs_cols = self._table_cols('attrs_raw') if self._has_table('attrs_raw') else set()
-
-        # 1) models/formats registries, populated while the legacy columns still exist
-        model_names: set[str] = set()
-        fmt_names: set[str] = set()
-        raw_models: list[str] = []
-        if 'model' in books_cols:
-            raw_models = [r[0] for r in self.conn.execute('SELECT DISTINCT model FROM books')]
-            model_names = {normalize_model(m) for m in raw_models}
-        if 'fmt' in books_cols:
-            fmt_names |= {r[0] for r in self.conn.execute('SELECT DISTINCT fmt FROM books')}
-        if 'fmt' in dirty_cols:
-            fmt_names |= {r[0] for r in self.conn.execute('SELECT DISTINCT fmt FROM dirty')}
-        fileinfo_keys = [k for k in self._meta_keys_locked('fileinfo:') if k.split(':', 1)[1].isdigit()]
-        for key in fileinfo_keys:
-            parsed = _parse_fileinfo_value(self._meta_value_locked(key))
-            if parsed is not None:
-                fmt_names.add(parsed[0])
-        if model_names or fmt_names:
-            for m in sorted(model_names):
-                self._upsert_model(m)
-            for f in sorted(fmt_names):
-                self._upsert_format(f)
-            for raw in raw_models:
-                if raw is not None:
-                    self._record_model_alias(raw, normalize_model(raw))
-            self.conn.commit()
-            did = True
-
-        # 2) books: fmt/model TEXT -> fmt_id/model_id, indexed_at REAL -> INTEGER seconds
-        if 'model' in books_cols:
-            rows = self.conn.execute('SELECT id, fmt, indexed_at, n_chunks, model FROM books').fetchall()
-            self.conn.execute('DROP TABLE IF EXISTS books__new')
-            self.conn.execute(
-                'CREATE TABLE books__new('
-                'id INTEGER PRIMARY KEY, fmt_id INTEGER NOT NULL, indexed_at INTEGER, '
-                'n_chunks INTEGER NOT NULL DEFAULT 0, model_id INTEGER NOT NULL)'
-            )
-            self.conn.executemany(
-                'INSERT INTO books__new(id, fmt_id, indexed_at, n_chunks, model_id) VALUES(?,?,?,?,?)',
-                [
-                    (bid, self._fmt_id(fmt), int(round(iat)) if iat is not None else None, nch, self._model_id(normalize_model(model)))
-                    for bid, fmt, iat, nch, model in rows
-                ],
-            )
-            self.conn.execute('DROP TABLE books')
-            self.conn.execute('ALTER TABLE books__new RENAME TO books')
-            self.conn.commit()
-            did = True
-
-        # 3) dirty: drop write-only fmt column, added_at REAL -> INTEGER seconds
-        if 'fmt' in dirty_cols:
-            rows = self.conn.execute('SELECT book_id, reason, added_at FROM dirty').fetchall()
-            self.conn.execute('DROP TABLE IF EXISTS dirty__new')
-            self.conn.execute(
-                'CREATE TABLE dirty__new('
-                'book_id INTEGER PRIMARY KEY, reason TEXT NOT NULL DEFAULT \'added\', added_at INTEGER)'
-            )
-            self.conn.executemany(
-                'INSERT INTO dirty__new(book_id, reason, added_at) VALUES(?,?,?)',
-                [(bid, reason, int(round(at)) if at is not None else None) for bid, reason, at in rows],
-            )
-            self.conn.execute('DROP TABLE dirty')
-            self.conn.execute('ALTER TABLE dirty__new RENAME TO dirty')
-            self.conn.commit()
-            did = True
-
-        # 4) attrs_raw: drop never-read updated_at column
-        if 'updated_at' in attrs_cols:
-            rows = self.conn.execute('SELECT book_id, json, fields FROM attrs_raw').fetchall()
-            self.conn.execute('DROP TABLE IF EXISTS attrs_raw__new')
-            self.conn.execute(
-                "CREATE TABLE attrs_raw__new("
-                "book_id INTEGER PRIMARY KEY, json TEXT NOT NULL DEFAULT '{}', fields TEXT NOT NULL DEFAULT '')"
-            )
-            self.conn.executemany('INSERT INTO attrs_raw__new(book_id, json, fields) VALUES(?,?,?)', rows)
-            self.conn.execute('DROP TABLE attrs_raw')
-            self.conn.execute('ALTER TABLE attrs_raw__new RENAME TO attrs_raw')
-            self.conn.commit()
-            did = True
-
-        # 5) file_info: move meta['fileinfo:<id>'] values into a table (all NOT NULL;
-        #    incomplete legacy values are dropped — a missing row means "unknown file
-        #    info", which already triggers a reindex)
-        if fileinfo_keys:
-            for key in fileinfo_keys:
-                bid = int(key.split(':', 1)[1])
-                parsed = _parse_fileinfo_value(self._meta_value_locked(key))
-                if parsed is not None:
-                    fmt, size, mtime_s = parsed
-                    self.conn.execute(
-                        'INSERT INTO file_info(book_id, fmt_id, size, mtime_s) VALUES(?,?,?,?) '
-                        'ON CONFLICT(book_id) DO UPDATE SET fmt_id=excluded.fmt_id, size=excluded.size, mtime_s=excluded.mtime_s',
-                        (bid, self._fmt_id(fmt), size, mtime_s),
-                    )
-                self.conn.execute('DELETE FROM meta WHERE key=?', (key,))
-            self.conn.commit()
-            did = True
-
-        self.conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
-        self.conn.commit()
-        return did
 
     def _meta_keys_locked(self, prefix: str) -> list[str]:
         if prefix:
@@ -669,7 +497,6 @@ class MetaStore:
                 'n_chunks=excluded.n_chunks, model_id=excluded.model_id',
                 (book_id, self._fmt_id(fmt), int(time.time()), n_chunks, self._model_id(norm)),
             )
-            self._record_model_alias(model, norm)
             self.conn.commit()
 
     # -- file change-detection registry ---------------------------------------------
@@ -764,170 +591,41 @@ class SqliteVectorBackend:
     def _table_for(self, model: str) -> str:
         return model_table_name(normalize_model(model))
 
-    def _set_chunk_model(self, name: str, norm: str):
-        self.conn.execute(
-            'INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-            (f'chunk_model:{name}', norm),
-        )
-
     def _ensure_table(self, model: str) -> str:
         name = self._table_for(model)
         with self.meta._lock:
             if not self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone():
                 self.conn.executescript(chunks_table_sql(name))
-                self._set_chunk_model(name, normalize_model(model))
                 self.conn.commit()
         return name
 
     # -- migration -----------------------------------------------------------------
 
-    def _legacy_table_locked(self):
-        """First per-model table still in the legacy (v1) shape, or None."""
-        for t in self._chunk_tables_locked():
-            cols = {r[1] for r in self.conn.execute(f'PRAGMA table_info({t})').fetchall()}
-            if 'text' in cols:
-                return t
-        return None
-
     def pending_work(self) -> bool:
-        with self.meta._lock:
-            if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone():
-                return True
-            return self._legacy_table_locked() is not None
+        from .migrations.v2 import pending
+
+        return pending(self)
 
     def finalize(self) -> bool:
-        """Run the pending chunk migrations (v0 split, then v2 slim per table).
+        """Run the pending chunk migration. See migrations.v2."""
+        from .migrations.v2 import upgrade
 
-        Each model group / table is committed independently so progress survives an
-        interrupt. While running, WAL auto-checkpointing is disabled and the WAL is
-        checkpointed explicitly (TRUNCATE) at phase boundaries: with a multi-GB WAL
-        the default in-commit passive checkpoint can stall for minutes on slow
-        storage. Returns True when anything was migrated."""
-        did = False
-        with self.meta._lock:
-            prev_ac = self.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
-            self.conn.execute('PRAGMA wal_autocheckpoint=0')
-        try:
-            with self.meta._lock:
-                if self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone():
-                    self._split_legacy_chunks()
-                    did = True
-                self.meta.wal_checkpoint_truncate()
-            while True:
-                with self.meta._lock:
-                    t = self._legacy_table_locked()
-                if t is None:
-                    break
-                self._slim_table(t)
-                with self.meta._lock:
-                    self.meta.wal_checkpoint_truncate()
-                did = True
-        finally:
-            with self.meta._lock:
-                self.conn.execute(f'PRAGMA wal_autocheckpoint={prev_ac}')
-        return did
-
-    def _legacy_where(self, raws):
-        parts, params = [], []
-        for m in raws:
-            if m is None:
-                parts.append('model IS NULL')
-            else:
-                parts.append('model=?')
-                params.append(m)
-        return '(' + ' OR '.join(parts) + ')', params
-
-    def _split_legacy_chunks(self):
-        """v0 -> v1: copy rows from the single `chunks` table into per-model tables
-        (grouped by normalized model name), then drop it. One commit per model group
-        bounds WAL growth; a group whose target already holds all source rows is
-        skipped, so an interrupted split resumes where it left off."""
-        raw_models = [r[0] for r in self.conn.execute('SELECT DISTINCT model FROM chunks')]
-        groups: dict[str, list] = {}
-        for m in raw_models:
-            groups.setdefault(normalize_model(m), []).append(m)
-        cols = 'book_id, chunk_no, text, chapter_path, para_start, para_end, char_offset, model, dim, vector'
-        for norm, raws in sorted(groups.items()):
-            name = model_table_name(norm)
-            if not self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone():
-                self.conn.executescript(chunks_table_sql_v1(name))
-            where, params = self._legacy_where(raws)
-            src = self.conn.execute(f'SELECT COUNT(*) FROM chunks WHERE {where}', params).fetchone()[0]
-            dst = self.conn.execute(f'SELECT COUNT(*) FROM {name}').fetchone()[0]
-            if dst < src:
-                # OR REPLACE: rows can pre-exist after an interrupted split; re-copying
-                # the same ids is safe (identical values).
-                self.conn.execute(f'INSERT OR REPLACE INTO {name}({cols}) SELECT {cols} FROM chunks WHERE {where}', params)
-                self._set_chunk_model(name, norm)
-            self.conn.commit()
-        self.conn.execute('DROP TABLE chunks')
-        self.conn.commit()
-
-    def _slim_table(self, t):
-        """Rebuild one legacy-shape chunk table into the slim v2 shape. Single forward
-        pass into a staging table (keyset resume point = staging MAX(id)); the swap is
-        one transaction so the old table stays fully readable until it commits. The
-        lock is only held for SQL, so searches can interleave between batches."""
-        staging = f'{t}__new'
-        with self.meta._lock:
-            row = self.conn.execute(f'SELECT model FROM {t} LIMIT 1').fetchone()
-            norm = normalize_model(row[0]) if row and row[0] else 'model'
-            self.conn.execute(
-                f'CREATE TABLE IF NOT EXISTS {staging}('
-                'id INTEGER PRIMARY KEY, book_id INTEGER NOT NULL, chunk_no INTEGER NOT NULL, '
-                "text_z BLOB NOT NULL, chapter_path TEXT NOT NULL DEFAULT '', vector BLOB NOT NULL)"
-            )
-        codec = self._codec
-        while True:
-            with self.meta._lock:
-                last_id = self.conn.execute(f'SELECT COALESCE(MAX(id), 0) FROM {staging}').fetchone()[0]
-                rows = self.conn.execute(
-                    f'SELECT id, book_id, chunk_no, text, chapter_path, vector FROM {t} WHERE id>? ORDER BY id LIMIT 2000',
-                    (last_id,),
-                ).fetchall()
-            if not rows:
-                break
-            payload = [(i, b, n, codec.compress(tx), cp or '', v) for (i, b, n, tx, cp, v) in rows]
-            with self.meta._lock:
-                self.conn.executemany(
-                    'INSERT INTO {}(id, book_id, chunk_no, text_z, chapter_path, vector) VALUES(?,?,?,?,?,?)'.format(staging),
-                    payload,
-                )
-                self.conn.commit()
-        with self.meta._lock:
-            total = self.conn.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
-            done = self.conn.execute(f'SELECT COUNT(*) FROM {staging}').fetchone()[0]
-            if done != total:
-                raise RuntimeError(f'chunk migration row count mismatch for {t}: {done}/{total}')
-            for _sid, stz, old in self.conn.execute(f'SELECT s.id, s.text_z, o.text FROM {staging} s JOIN {t} o ON o.id=s.id LIMIT 5'):
-                if codec.decompress(stz) != old:
-                    raise RuntimeError(f'chunk migration round-trip mismatch for {t}')
-            canonical = model_table_name(norm)
-            if canonical != t and self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (canonical,)).fetchone():
-                canonical = t  # name already taken by another table; keep this one
-            self.conn.execute(f'DROP TABLE {t}')
-            self.conn.execute(f'ALTER TABLE {staging} RENAME TO {canonical}')
-            self.conn.execute(f'CREATE INDEX idx_{canonical}_book ON {canonical}(book_id)')
-            if canonical != t:
-                self.conn.execute('DELETE FROM meta WHERE key=?', (f'chunk_model:{t}',))
-                self._set_chunk_model(canonical, norm)
-            self.conn.commit()
+        return upgrade(self)
 
     def drop_stale_models(self, current_model: str | None = None) -> int:
-        """Drop chunk tables whose model no longer has any indexed book (e.g. after a model switch)."""
+        """Drop chunk tables whose model no longer has any indexed book (e.g. after a model switch).
+
+        Table names are canonical (chunks_<normalized model>), so ownership is derived
+        from the name; anything else is stale."""
         in_use = {b['model'] for b in self.meta.indexed_books() if b.get('model')}
         if current_model:
             in_use.add(normalize_model(current_model))
+        keep = {model_table_name(m) for m in in_use}
         dropped = 0
         with self.meta._lock:
             for t in self._chunk_tables_locked():
-                row = self.conn.execute('SELECT value FROM meta WHERE key=?', (f'chunk_model:{t}',)).fetchone()
-                norm = row[0] if row else None
-                if norm is None:
-                    continue  # unknown table; leave it alone
-                if norm not in in_use:
+                if t not in keep:
                     self.conn.execute(f'DROP TABLE {t}')
-                    self.conn.execute('DELETE FROM meta WHERE key=?', (f'chunk_model:{t}',))
                     dropped += 1
             if dropped:
                 self.conn.commit()
@@ -1069,9 +767,8 @@ class SqliteVectorBackend:
 class LanceVectorBackend:
     """Vectors + chunk text in LanceDB (optional dependency).
 
-    One table per embedding model so dimension changes never mix vectors.
-    Table names keep the historical raw-model slug so existing tables are
-    untouched; new tables use the slim schema.
+    One table per embedding model so dimension changes never mix vectors;
+    tables are named from the normalized model name, like the sqlite backend.
     """
 
     name = 'lancedb'
@@ -1091,36 +788,21 @@ class LanceVectorBackend:
         return False
 
     def _table_name(self, model: str) -> str:
-        # historical naming: slug of the raw model string as passed at insert time
-        return model_table_name(model or '')
+        return model_table_name(normalize_model(model or ''))
 
     def _candidate_models(self, current_model: str | None = None):
-        """Model spellings whose tables may hold live data.
-
-        indexed_books() returns normalized names, but pre-existing tables are named
-        after the raw setting string — so keep both spellings in play.
-        """
-        in_use = {i['model'] for i in self.meta.indexed_books() if i.get('model')}
+        """Normalized model names whose tables may hold live data."""
+        out = {i['model'] for i in self.meta.indexed_books() if i.get('model')}
         if current_model:
-            in_use.add(normalize_model(current_model))
-        try:
-            aliases = json.loads(self.meta.get_meta(MODEL_ALIASES_KEY, '{}') or '{}')
-        except Exception:
-            aliases = {}
-        if not isinstance(aliases, dict):
-            aliases = {}
-        out = set(in_use)
-        for raw, norm in aliases.items():
-            if norm in in_use:
-                out.add(raw)
+            out.add(normalize_model(current_model))
         return out
 
     def _open_table(self, model: str):
-        for name in {self._table_name(model), self._table_name(normalize_model(model))}:
-            if name in self._table_names():
-                t = self._db.open_table(name)
-                self._tables[name] = t
-                return t
+        name = self._table_name(model)
+        if name in self._table_names():
+            t = self._db.open_table(name)
+            self._tables[name] = t
+            return t
         return None
 
     def drop_stale_models(self, current_model: str | None = None) -> int:
@@ -1144,11 +826,11 @@ class LanceVectorBackend:
         return list(tables)
 
     def _get_table(self, model: str, dim: int):
-        for name in {self._table_name(model), self._table_name(normalize_model(model))}:
-            if name in self._table_names():
-                t = self._db.open_table(name)
-                self._tables[name] = t
-                return t
+        name = self._table_name(model)
+        if name in self._table_names():
+            t = self._db.open_table(name)
+            self._tables[name] = t
+            return t
         import pyarrow as pa
 
         schema = pa.schema(
@@ -1160,8 +842,8 @@ class LanceVectorBackend:
                 ('vector', pa.list_(pa.float32(), dim)),
             ]
         )
-        t = self._db.create_table(self._table_name(model), schema=schema)
-        self._tables[self._table_name(model)] = t
+        t = self._db.create_table(name, schema=schema)
+        self._tables[name] = t
         return t
 
     def _all_tables(self):

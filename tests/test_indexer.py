@@ -98,6 +98,21 @@ class FakeWriter:
         self.fields.setdefault(key, {}).update(mapping)
 
 
+class TestMtimeToInt(unittest.TestCase):
+    def test_float_truncated_not_rounded(self):
+        # a stored mtime must never be later than the file's real one
+        self.assertEqual(indexer._mtime_to_int(1598092103.694143), 1598092103)
+        self.assertEqual(indexer._mtime_to_int(1622500000.5), 1622500000)
+
+    def test_int_and_none(self):
+        self.assertEqual(indexer._mtime_to_int(1234), 1234)
+        self.assertIsNone(indexer._mtime_to_int(None))
+
+    def test_datetime_truncated(self):
+        from datetime import datetime, timezone
+        self.assertEqual(indexer._mtime_to_int(datetime.fromtimestamp(1598092103.694143, tz=timezone.utc)), 1598092103)
+
+
 class TestAttrPhase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
