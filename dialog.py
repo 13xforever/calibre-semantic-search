@@ -39,13 +39,14 @@ class SearchWorker(QThread):
     finished_ok = pyqtSignal(object)  # list[SearchResult]
     failed = pyqtSignal(str)
 
-    def __init__(self, store, client, query: str, limit: int, min_score: float):
+    def __init__(self, store, client, query: str, limit: int, min_score: float, model: str | None = None):
         super().__init__()
         self.store = store
         self.client = client
         self.query = query
         self.limit = limit
         self.min_score = min_score
+        self.model = model
 
     def run(self):
         try:
@@ -53,7 +54,7 @@ class SearchWorker(QThread):
             if not vecs:
                 self.failed.emit(_('No embedding returned'))
                 return
-            res = self.store.search(vecs[0], limit=self.limit, min_score=self.min_score)
+            res = self.store.search(vecs[0], limit=self.limit, min_score=self.min_score, model=self.model)
             self.finished_ok.emit(res)
         except Exception as e:
             self.failed.emit(str(e))
@@ -149,7 +150,7 @@ class SemanticSearchDialog(QDialog):
         min_score = min(1.0, max(0.0, float(settings.search_min_score)))
         self.btn_search.setEnabled(False)
         self.status_label.setText(_('Searching...'))
-        w = SearchWorker(self.store, client, q, limit=MAX_RESULTS, min_score=min_score)
+        w = SearchWorker(self.store, client, q, limit=MAX_RESULTS, min_score=min_score, model=settings.embed.model)
         self.worker = w
         _live_workers.add(w)
         w.finished_ok.connect(self._on_results)

@@ -72,10 +72,14 @@ attributes in custom columns.
 
 - Per-library SQLite file `semantic-search.db` next to `metadata.db` holds
   book registry, dirty queue, metadata, raw attribute JSON, and (for the
-  sqlite backend) chunk text + vectors.
+  sqlite backend) chunk text + vectors — one table per embedding model, so
+  different models never mix. Search reads vectors in RAM-budgeted batches
+  (half of the free RAM) instead of loading the whole index.
 - The **lancedb** backend keeps vectors in a sibling LanceDB directory
   (`semantic-search-lancedb/`), one table per embedding model; bookkeeping
   stays in SQLite either way.
+- Chunk tables left over from an old embedding model are dropped automatically
+  once no indexed book uses that model anymore (after re-indexing / removal).
 - Attributes are also written to calibre custom columns, so they survive even
   if the store file is deleted.
 
@@ -85,5 +89,6 @@ attributes in custom columns.
 python -m unittest discover -s tests
 ```
 
-(39 tests: chunker, store roundtrip/search/dirty queue, embed client against a
-mock HTTP server, settings persistence, attribute extraction with a fake LLM.)
+(134 tests: chunker, store roundtrip/search/per-model tables/dirty queue,
+embed client against a mock HTTP server, indexer phases/reconcile, settings
+persistence, attribute extraction with a fake LLM, dialog behavior.)

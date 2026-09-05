@@ -5,13 +5,14 @@ Public API (used by indexer/dialog/attributes):
     add_dirty / dirty_book_ids / remove_dirty
     book_is_indexed / indexed_books / clear_book / upsert_book
     insert_chunk / commit
-    search(query_vec, limit, min_score) -> list[SearchResult]
+    search(query_vec, limit, min_score, model=None) -> list[SearchResult]
     book_chunks_text(book_id) -> list[str]
     get_meta / set_meta / delete_meta / meta_keys(prefix)
     set_attrs / get_attrs / clear_attrs / attr_book_ids
+    cleanup_stale_models()
     close
 
-Backends:
+Backends (both keep one chunk table per embedding model):
   'sqlite'  - vectors in a local SQLite file (always available; numpy speeds it up)
   'lancedb' - vectors in LanceDB (optional dependency, lazy import)
   'auto'    - lancedb if importable, else sqlite
@@ -19,8 +20,10 @@ Backends:
 
 from __future__ import annotations
 
+import heapq
 import json
 import os
+import re
 import sqlite3
 import struct
 import threading
@@ -80,6 +83,57 @@ def l2_normalize(vec):
     return [x / s for x in vec]
 
 
+def model_table_name(model: str) -> str:
+    """Chunk-table name for an embedding model (shared by both backends)."""
+    slug = re.sub(r'[^a-zA-Z0-9]+', '_', model or '').strip('_').lower() or 'model'
+    return f'chunks_{slug}'[:80]
+
+
+# Memory budget for the batched sqlite search: half of the available RAM, with a floor.
+SEARCH_MIN_BUDGET = 10 * 1024 * 1024
+
+
+def available_ram_bytes():
+    """Best-effort available RAM in bytes; None when it cannot be determined."""
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    if os.name == 'nt':
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', ctypes.c_ulong),
+                    ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong),
+                    ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong),
+                    ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong),
+                    ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                ]
+
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+        except Exception:
+            pass
+    try:
+        with open('/proc/meminfo') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
 META_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS books(
     id INTEGER PRIMARY KEY,
@@ -104,8 +158,10 @@ CREATE TABLE IF NOT EXISTS attrs_raw(
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 '''
 
-CHUNKS_SCHEMA = '''
-CREATE TABLE IF NOT EXISTS chunks(
+def chunks_table_sql(name: str) -> str:
+    """DDL for one per-model chunk table (identifier comes from model_table_name)."""
+    return f'''
+CREATE TABLE IF NOT EXISTS {name}(
     id INTEGER PRIMARY KEY,
     book_id INTEGER NOT NULL,
     chunk_no INTEGER NOT NULL,
@@ -118,7 +174,7 @@ CREATE TABLE IF NOT EXISTS chunks(
     dim INTEGER NOT NULL,
     vector BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_chunks_book ON chunks(book_id, chunk_no);
+CREATE INDEX IF NOT EXISTS idx_{name}_book ON {name}(book_id);
 '''
 
 
@@ -255,30 +311,89 @@ class MetaStore:
 
 
 class SqliteVectorBackend:
-    """Vectors + chunk text in the same SQLite file."""
+    """Vectors + chunk text in the same SQLite file, one table per embedding model."""
 
     name = 'sqlite'
 
     def __init__(self, meta: MetaStore):
         self.meta = meta
         self.conn = meta.conn  # share connection/lock
-        with meta._lock:
-            self.conn.executescript(CHUNKS_SCHEMA)
+        self._migrate_legacy_chunks()
+
+    # -- table management ------------------------------------------------------
+
+    def _chunk_tables_locked(self) -> list[str]:
+        rows = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        return sorted(r[0] for r in rows if r[0].startswith('chunks_'))
+
+    def _chunk_tables(self) -> list[str]:
+        with self.meta._lock:
+            return self._chunk_tables_locked()
+
+    def _table_exists(self, name: str) -> bool:
+        with self.meta._lock:
+            row = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone()
+        return row is not None
+
+    def _ensure_table(self, model: str) -> str:
+        name = model_table_name(model)
+        with self.meta._lock:
+            self.conn.executescript(chunks_table_sql(name))
+        return name
+
+    def _migrate_legacy_chunks(self):
+        """Move rows from the pre-per-model single `chunks` table into per-model tables."""
+        if not self._table_exists('chunks'):
+            return
+        cols = 'book_id, chunk_no, text, chapter_path, para_start, para_end, char_offset, model, dim, vector'
+        with self.meta._lock:
+            models = [r[0] for r in self.conn.execute('SELECT DISTINCT model FROM chunks')]
+            for m in models:
+                name = model_table_name(m or '')
+                self.conn.executescript(chunks_table_sql(name))
+                if m is None:
+                    self.conn.execute(f'INSERT INTO {name}({cols}) SELECT {cols} FROM chunks WHERE model IS NULL')
+                else:
+                    self.conn.execute(f'INSERT INTO {name}({cols}) SELECT {cols} FROM chunks WHERE model=?', (m,))
+            self.conn.execute('DROP TABLE chunks')
             self.conn.commit()
+
+    def _table_model(self, name: str):
+        with self.meta._lock:
+            row = self.conn.execute(f'SELECT model FROM {name} LIMIT 1').fetchone()
+        return row[0] if row else None
+
+    def drop_stale_models(self) -> int:
+        """Drop chunk tables whose model no longer has any indexed book (e.g. after a model switch)."""
+        in_use = {b['model'] for b in self.meta.indexed_books() if b['model']}
+        dropped = 0
+        with self.meta._lock:
+            for t in self._chunk_tables_locked():
+                row = self.conn.execute(f'SELECT model FROM {t} LIMIT 1').fetchone()
+                if (row[0] if row else None) not in in_use:
+                    self.conn.execute(f'DROP TABLE {t}')
+                    dropped += 1
+            if dropped:
+                self.conn.commit()
+        return dropped
+
+    # -- writes ------------------------------------------------------------------
 
     def delete_book(self, book_id: int):
         with self.meta._lock:
-            self.conn.execute('DELETE FROM chunks WHERE book_id=?', (book_id,))
+            for t in self._chunk_tables_locked():
+                self.conn.execute(f'DELETE FROM {t} WHERE book_id=?', (book_id,))
 
     def insert_chunks(self, book_id: int, items):
-        """items: list of (chunk, vector) already normalized."""
+        """items: list of (chunk, vector, model, dim) already normalized."""
+        name = self._ensure_table(items[0][2])
         rows = [
             (book_id, c.chunk_no, c.text, ' > '.join(c.chapter_path), c.para_start, c.para_end, c.char_offset, model, dim, vec_to_blob(v))
             for c, v, model, dim in items
         ]
         with self.meta._lock:
             self.conn.executemany(
-                'INSERT INTO chunks(book_id, chunk_no, text, chapter_path, para_start, para_end, char_offset, model, dim, vector) '
+                f'INSERT INTO {name}(book_id, chunk_no, text, chapter_path, para_start, para_end, char_offset, model, dim, vector) '
                 'VALUES(?,?,?,?,?,?,?,?,?,?)',
                 rows,
             )
@@ -288,63 +403,109 @@ class SqliteVectorBackend:
             self.conn.commit()
 
     def book_chunks_text(self, book_id: int):
+        out = []
         with self.meta._lock:
-            rows = self.conn.execute('SELECT text FROM chunks WHERE book_id=? ORDER BY chunk_no', (book_id,)).fetchall()
-        return [r[0] for r in rows]
+            for t in self._chunk_tables_locked():
+                rows = self.conn.execute(f'SELECT chunk_no, text FROM {t} WHERE book_id=?', (book_id,)).fetchall()
+                out.extend(rows)
+        out.sort(key=lambda r: r[0])
+        return [r[1] for r in out]
 
-    def search(self, query_vec, limit: int, min_score: float) -> list[SearchResult]:
+    # -- search --------------------------------------------------------------------
+
+    def _search_budget(self) -> int:
+        free = available_ram_bytes()
+        if free is None:
+            free = SEARCH_MIN_BUDGET * 4  # unknown: assume a modest amount of headroom
+        return max(SEARCH_MIN_BUDGET, free // 2)
+
+    def _table_dim(self, name: str):
+        with self.meta._lock:
+            row = self.conn.execute(f'SELECT dim FROM {name} LIMIT 1').fetchone()
+        return row[0] if row else None
+
+    def _avg_text_chars(self, name: str) -> int:
+        with self.meta._lock:
+            row = self.conn.execute(f'SELECT AVG(LENGTH(text)) FROM (SELECT text FROM {name} LIMIT 200)').fetchone()
+        return int(row[0]) if row and row[0] is not None else 1024
+
+    def _score_rows(self, rows, qv) -> list[float]:
+        """Dot products of each row's vector (last column) with the query vector."""
+        if np is not None:
+            m = np.empty((len(rows), len(qv)), dtype='<f4')
+            for i, r in enumerate(rows):
+                m[i] = np.frombuffer(r[-1], dtype='<f4')
+            return list(m @ np.asarray(qv, dtype='<f4'))
+        import array
+
+        qa = array.array('f')
+        qa.frombytes(vec_to_blob(qv))
+        out = []
+        for r in rows:
+            va = array.array('f')
+            va.frombytes(r[-1])
+            s = 0.0
+            for a, b in zip(qa, va):
+                s += a * b
+            out.append(s)
+        return out
+
+    def search(self, query_vec, limit: int, min_score: float, model: str | None = None) -> list[SearchResult]:
+        """Top-k by cosine similarity.
+
+        Reads vectors in RAM-budgeted batches (half the available free RAM, with a
+        SEARCH_MIN_BUDGET floor) and keeps only a top-`limit` heap, so memory stays
+        bounded no matter how many chunks are stored.
+        """
         qv = l2_normalize(query_vec)
         dim = qv.shape[0] if np is not None else len(qv)
-        with self.meta._lock:
-            rows = self.conn.execute(
-                'SELECT c.book_id, c.chunk_no, c.text, c.chapter_path, c.para_start, c.para_end, c.char_offset, b.fmt, c.vector '
-                'FROM chunks c LEFT JOIN books b ON b.id=c.book_id WHERE c.dim=?',
-                (dim,),
-            ).fetchall()
-        if not rows:
-            return []
-        qblob = vec_to_blob(qv)
-        score_map = {}
-        if np is not None:
-            q = np.frombuffer(qblob, dtype='<f4')
-            for i, r in enumerate(rows):
-                v = np.frombuffer(r[8], dtype='<f4')
-                score_map[i] = float(np.dot(q, v))
-        else:
-            import array
-
-            qa = array.array('f')
-            qa.frombytes(qblob)
-            for i, r in enumerate(rows):
-                va = array.array('f')
-                va.frombytes(r[8])
-                s = 0.0
-                for a, b in zip(qa, va):
-                    s += a * b
-                score_map[i] = s
-        order = sorted(score_map, key=lambda i: score_map[i], reverse=True)
-        out = []
-        for i in order:
-            s = score_map[i]
-            if s < min_score:
-                break
-            r = rows[i]
-            out.append(
-                SearchResult(
-                    book_id=r[0],
-                    fmt=r[7] or '',
-                    chunk_no=r[1],
-                    text=r[2],
-                    chapter_path=[p for p in r[3].split(' > ') if p],
-                    para_start=r[4],
-                    para_end=r[5],
-                    char_offset=r[6],
-                    score=s,
-                )
-            )
-            if len(out) >= limit:
-                break
-        return out
+        tables = [model_table_name(model)] if model is not None else self._chunk_tables()
+        budget = self._search_budget()
+        top: list[tuple[float, int, SearchResult]] = []  # min-heap of (score, seq, result)
+        seq = 0
+        for t in tables:
+            if not self._table_exists(t) or self._table_dim(t) != dim:
+                continue
+            row_bytes = dim * 4 + self._avg_text_chars(t) + 64
+            batch = max(1, budget // max(1, row_bytes))
+            last_id = 0
+            while True:
+                with self.meta._lock:
+                    rows = self.conn.execute(
+                        f'SELECT c.id, c.book_id, c.chunk_no, c.text, c.chapter_path, c.para_start, c.para_end, '
+                        f'c.char_offset, b.fmt, c.vector FROM {t} c LEFT JOIN books b ON b.id=c.book_id '
+                        'WHERE c.id>? ORDER BY c.id LIMIT ?',
+                        (last_id, batch),
+                    ).fetchall()
+                if not rows:
+                    break
+                last_id = rows[-1][0]
+                for r, s in zip(rows, self._score_rows(rows, qv)):
+                    if s < min_score:
+                        continue
+                    heapq.heappush(
+                        top,
+                        (
+                            s,
+                            seq,
+                            SearchResult(
+                                book_id=r[1],
+                                fmt=r[8] or '',
+                                chunk_no=r[2],
+                                text=r[3],
+                                chapter_path=[p for p in r[4].split(' > ') if p],
+                                para_start=r[5],
+                                para_end=r[6],
+                                char_offset=r[7],
+                                score=s,
+                            ),
+                        ),
+                    )
+                    seq += 1
+                    if len(top) > limit:
+                        heapq.heappop(top)
+        top.sort(key=lambda e: (-e[0], e[1]))
+        return [r for _, _, r in top]
 
 
 class LanceVectorBackend:
@@ -364,10 +525,29 @@ class LanceVectorBackend:
         self._tables: dict[str, object] = {}
 
     def _table_name(self, model: str) -> str:
-        import re
+        return model_table_name(model)
 
-        slug = re.sub(r'[^a-zA-Z0-9]+', '_', model).strip('_').lower() or 'model'
-        return f'chunks_{slug}'[:80]
+    def _open_table(self, model: str):
+        name = self._table_name(model)
+        if name not in self._table_names():
+            return None
+        t = self._db.open_table(name)
+        self._tables[name] = t
+        return t
+
+    def drop_stale_models(self) -> int:
+        in_use = {i['model'] for i in self.meta.indexed_books() if i['model']}
+        keep = {self._table_name(m) for m in in_use}
+        dropped = 0
+        for name in self._table_names():
+            if name not in keep:
+                try:
+                    self._db.drop_table(name)
+                except Exception:
+                    continue
+                self._tables.pop(name, None)
+                dropped += 1
+        return dropped
 
     def _table_names(self):
         res = self._db.list_tables()
@@ -467,12 +647,14 @@ class LanceVectorBackend:
             out.extend(str(x) for x in df['text'])
         return out
 
-    def search(self, query_vec, limit: int, min_score: float) -> list[SearchResult]:
+    def search(self, query_vec, limit: int, min_score: float, model: str | None = None) -> list[SearchResult]:
         qv = l2_normalize(query_vec)
         vec = qv.tolist() if np is not None else list(qv)
         dim = len(vec)
         candidates = []
-        for t in self._all_tables():
+        tables = [self._open_table(model)] if model is not None else self._all_tables()
+        tables = [t for t in tables if t is not None]
+        for t in tables:
             try:
                 df = t.search(vec).metric('cosine').limit(limit * 3).to_pandas()
             except Exception:
@@ -620,8 +802,12 @@ class VectorStore:
 
     # -- search ------------------------------------------------------------------------
 
-    def search(self, query_vec, limit: int = 20, min_score: float = 0.0) -> list[SearchResult]:
-        return self.backend.search(query_vec, limit, min_score)
+    def search(self, query_vec, limit: int = 20, min_score: float = 0.0, model: str | None = None) -> list[SearchResult]:
+        return self.backend.search(query_vec, limit, min_score, model)
 
     def book_chunks_text(self, book_id: int):
         return self.backend.book_chunks_text(book_id)
+
+    def cleanup_stale_models(self):
+        """Drop chunk tables left over from embedding models no book is indexed with."""
+        return self.backend.drop_stale_models()

@@ -320,6 +320,11 @@ class Indexer(threading.Thread):
                 self.store.add_dirty(bid, fmt, 'changed')
         self.store.set_meta('failed', json.dumps(failed))
         self.store.set_meta('attr_failed', json.dumps(attr_failed))
+        try:
+            # removed books may have been the last ones of their model
+            self.store.cleanup_stale_models()
+        except Exception:
+            pass
 
     @staticmethod
     def _same_file(parts: list[str], md: dict) -> bool:
@@ -354,6 +359,11 @@ class Indexer(threading.Thread):
                     # before any attribute work so the two models are used in batches.
                     idle_since = None
                     self._process_one(pending[0])
+                    try:
+                        # a re-indexed book may have been the last one of its old model
+                        self.store.cleanup_stale_models()
+                    except Exception as e:
+                        _default_log(f'stale model cleanup failed: {e!r}')
                     continue
                 settings = self.settings_provider()
                 if self._attr_requested.is_set() or getattr(settings, 'auto_extract_attributes', True):
