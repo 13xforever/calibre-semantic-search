@@ -163,10 +163,18 @@ def available_ram_bytes():
 TEXT_CODEC_KEY = 'text_codec'
 MODEL_ALIASES_KEY = 'model_aliases'
 ZSTD_LEVEL = 3
-DEFAULT_DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'default_compression_dict.bin')
+DEFAULT_DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'default_compression_dict.bin')
 
 
 def _load_default_dict() -> bytes:
+    # Installed plugins load from the ZIP via calibre's custom loader (virtual
+    # __file__), so filesystem lookups never work there; get_resources is
+    # injected by that loader and reads the zip. Running from source uses the file.
+    g = globals().get('get_resources')
+    if callable(g):
+        data = g('assets/default_compression_dict.bin')
+        if data is not None:
+            return data
     with open(DEFAULT_DICT_PATH, 'rb') as f:
         return f.read()
 

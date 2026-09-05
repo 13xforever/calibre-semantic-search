@@ -4,7 +4,7 @@ import types
 import importlib.util
 import unittest
 
-ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+SRC = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'src')
 
 
 def _install_stubs():
@@ -74,7 +74,7 @@ _install_stubs()
 # Load plugin modules as a synthetic package so relative imports resolve (same
 # pattern as test_indexer.py / test_gui_status.py).
 _pkg = types.ModuleType('sspkg')
-_pkg.__path__ = [ROOT]
+_pkg.__path__ = [SRC]
 _sys.modules['sspkg'] = _pkg
 
 
@@ -82,7 +82,7 @@ def _loadpkg(name):
     key = 'sspkg.' + name
     if key in _sys.modules:
         return _sys.modules[key]
-    spec = importlib.util.spec_from_file_location(key, _os.path.join(ROOT, name + '.py'))
+    spec = importlib.util.spec_from_file_location(key, _os.path.join(SRC, name + '.py'))
     mod = importlib.util.module_from_spec(spec)
     mod.__package__ = 'sspkg'
     _sys.modules[key] = mod

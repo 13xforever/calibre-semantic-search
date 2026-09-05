@@ -7,6 +7,8 @@ import unittest
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
 ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+SRC = _os.path.join(ROOT, 'src')
+ASSETS = _os.path.join(SRC, 'assets')
 
 
 def _install_qt_stubs():
@@ -57,7 +59,7 @@ _install_qt_stubs()
 # Load plugin modules as a synthetic package so relative imports resolve (same
 # pattern as test_indexer.py).
 _pkg = types.ModuleType('sspkg')
-_pkg.__path__ = [ROOT]
+_pkg.__path__ = [SRC]
 _sys.modules['sspkg'] = _pkg
 
 
@@ -65,7 +67,7 @@ def _loadpkg(name):
     key = 'sspkg.' + name
     if key in _sys.modules:
         return _sys.modules[key]
-    spec = importlib.util.spec_from_file_location(key, _os.path.join(ROOT, name + '.py'))
+    spec = importlib.util.spec_from_file_location(key, _os.path.join(SRC, name + '.py'))
     mod = importlib.util.module_from_spec(spec)
     mod.__package__ = 'sspkg'
     _sys.modules[key] = mod
@@ -170,11 +172,54 @@ class TestPluginIconTheme(unittest.TestCase):
         # extension (semantic_search-for-dark-theme.png), not appended to the
         # whole filename.
         ic = self._pick(True)
-        self.assertEqual(ic.path, _os.path.join(ROOT, 'semantic_search-for-dark-theme.png'))
+        self.assertEqual(ic.path, _os.path.join(ASSETS, 'semantic_search-for-dark-theme.png'))
 
     def test_light_theme_picks_light_variant(self):
         ic = self._pick(False)
-        self.assertEqual(ic.path, _os.path.join(ROOT, 'semantic_search-for-light-theme.png'))
+        self.assertEqual(ic.path, _os.path.join(ASSETS, 'semantic_search-for-light-theme.png'))
+
+
+class TestPluginIconZipBranch(unittest.TestCase):
+    # Installed plugins load from the ZIP via calibre's loader, which injects
+    # get_icons into the module; _plugin_icon must use it with assets/ arcnames.
+
+    def _pick(self, dark, found):
+        calls = []
+
+        class _ZipIcon:
+            def __init__(self, name):
+                self.name = name
+
+            def isNull(self):
+                return not found
+
+        def fake_get_icons(name):
+            calls.append(name)
+            return _ZipIcon(name) if found else None
+
+        gui2 = _sys.modules['calibre.gui2']
+        gui2.is_dark_theme = lambda: dark
+        old = getattr(gui, 'get_icons', None)
+        gui.get_icons = fake_get_icons
+        try:
+            ic = gui._plugin_icon('semantic_search.png')
+        finally:
+            if old is None:
+                del gui.get_icons
+            else:
+                gui.get_icons = old
+            del gui2.is_dark_theme
+        return ic, calls
+
+    def test_zip_resource_used_with_assets_prefix(self):
+        ic, calls = self._pick(True, found=True)
+        self.assertEqual(ic.name, 'assets/semantic_search-for-dark-theme.png')
+        self.assertEqual(calls, ['assets/semantic_search-for-dark-theme.png'])
+
+    def test_falls_back_to_file_when_zip_resource_missing(self):
+        ic, calls = self._pick(False, found=False)
+        self.assertEqual(ic.path, _os.path.join(ASSETS, 'semantic_search-for-light-theme.png'))
+        self.assertEqual(calls, ['assets/semantic_search-for-light-theme.png'])
 
 
 class TestPauseIconTheme(unittest.TestCase):
@@ -189,18 +234,18 @@ class TestPauseIconTheme(unittest.TestCase):
             del gui2.is_dark_theme
 
     def test_pause_glyph_light(self):
-        self.assertEqual(self._path(False, False), _os.path.join(ROOT, 'semantic_pause-for-light-theme.png'))
+        self.assertEqual(self._path(False, False), _os.path.join(ASSETS, 'semantic_pause-for-light-theme.png'))
 
     def test_pause_glyph_dark(self):
         # Qt's standard media icons are fixed near-black in both themes, so the
         # pause/resume glyphs must come from the shipped themed variants
-        self.assertEqual(self._path(False, True), _os.path.join(ROOT, 'semantic_pause-for-dark-theme.png'))
+        self.assertEqual(self._path(False, True), _os.path.join(ASSETS, 'semantic_pause-for-dark-theme.png'))
 
     def test_play_glyph_light(self):
-        self.assertEqual(self._path(True, False), _os.path.join(ROOT, 'semantic_play-for-light-theme.png'))
+        self.assertEqual(self._path(True, False), _os.path.join(ASSETS, 'semantic_play-for-light-theme.png'))
 
     def test_play_glyph_dark(self):
-        self.assertEqual(self._path(True, True), _os.path.join(ROOT, 'semantic_play-for-dark-theme.png'))
+        self.assertEqual(self._path(True, True), _os.path.join(ASSETS, 'semantic_play-for-dark-theme.png'))
 
 
 class _FakeSignal:

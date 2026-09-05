@@ -29,15 +29,18 @@ def _plugin_icon(name):
     except Exception:
         pass
     for cand in candidates:
+        # Installed plugins load from the ZIP via calibre's custom loader (virtual
+        # __file__), so filesystem lookups never work there; get_icons is injected
+        # by that loader and reads the zip. Running from source uses the file.
         g = globals().get('get_icons')
         if callable(g):
             try:
-                ic = g(cand)
+                ic = g(f'assets/{cand}')
                 if ic is not None and not ic.isNull():
                     return ic
             except Exception:
                 pass
-        p = os.path.join(os.path.dirname(__file__), cand)
+        p = os.path.join(os.path.dirname(__file__), 'assets', cand)
         if os.path.exists(p):
             from qt.core import QIcon
 

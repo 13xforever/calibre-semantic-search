@@ -35,15 +35,11 @@ attributes in custom columns.
 1. Build the ZIP (from this directory):
 
     ```powershell
-    python -m zipfile -c semantic_search.zip `
-      __init__.py gui.py dialog.py store.py chunker.py indexer.py `
-      embed_client.py attributes.py config_widget.py utils.py `
-        plugin-import-name-semantic_search.txt semantic_search.png `
-        semantic_search-for-light-theme.png semantic_search-for-dark-theme.png `
-        semantic_pause.png semantic_pause-for-light-theme.png semantic_pause-for-dark-theme.png `
-        semantic_play.png semantic_play-for-light-theme.png semantic_play-for-dark-theme.png `
-        default_compression_dict.bin
-     ```
+    python dev.py build
+    ```
+
+    (`python dev.py` with no arguments runs the full gate: compile check, test
+    suite, then the ZIP build.)
 
 2. In calibre: *Preferences > Plugins > Custom plugins > `+`* and pick the ZIP.
 3. Open the new **Semantic search** menu (toolbar dropdown or the icon in the
@@ -100,6 +96,8 @@ attributes in custom columns.
 python -m unittest discover -s tests
 ```
 
-(134 tests: chunker, store roundtrip/search/per-model tables/dirty queue,
+(or `python dev.py test`; `python dev.py` runs compile + tests + ZIP build.)
+
+(138 tests: chunker, store roundtrip/search/per-model tables/dirty queue,
 embed client against a mock HTTP server, indexer phases/reconcile, settings
 persistence, attribute extraction with a fake LLM, dialog behavior.)

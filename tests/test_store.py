@@ -427,5 +427,33 @@ class TestVectorStoreLance(unittest.TestCase):
         self.assertEqual(s.search([1.0] * dim), [])
 
 
+class TestDefaultDictLoading(unittest.TestCase):
+    def setUp(self):
+        self._saved = getattr(store, 'get_resources', None)
+
+    def tearDown(self):
+        if self._saved is None:
+            del store.get_resources
+        else:
+            store.get_resources = self._saved
+
+    def test_zip_branch_reads_injected_resource(self):
+        seen = []
+
+        def fake_get_resources(name):
+            seen.append(name)
+            return b'zipdict'
+
+        store.get_resources = fake_get_resources
+        self.assertEqual(store._load_default_dict(), b'zipdict')
+        self.assertEqual(seen, ['assets/default_compression_dict.bin'])
+
+    def test_falls_back_to_file_when_resource_missing(self):
+        store.get_resources = lambda name: None
+        with open(store.DEFAULT_DICT_PATH, 'rb') as f:
+            expected = f.read()
+        self.assertEqual(store._load_default_dict(), expected)
+
+
 if __name__ == '__main__':
     unittest.main()
