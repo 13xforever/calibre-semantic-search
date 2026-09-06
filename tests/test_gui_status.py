@@ -463,6 +463,7 @@ class _FakeButton:
     def __init__(self):
         self.text = ''
         self.icon = None
+        self.enabled = True
         self.clicked = _FakeSignal()
 
     def setText(self, t):
@@ -471,10 +472,15 @@ class _FakeButton:
     def setIcon(self, ic):
         self.icon = ic
 
+    def setEnabled(self, on):
+        self.enabled = bool(on)
+
 
 class _FakeDialogAction:
     def __init__(self, paused):
         self.indexer = types.SimpleNamespace(paused=paused)
+        self.store = object()  # an open store; the button is enabled unless migrating
+        self._finalize_thread = None
         self.toggle_calls = 0
 
     def toggle_pause(self):
@@ -520,76 +526,58 @@ class TestStatusDialogPauseButton(unittest.TestCase):
         self.assertEqual(d.pause_btn.text, 'Resume indexing')
 
 
-class TestNumpyEnsure(unittest.TestCase):
-    def _action(self):
-        a = object.__new__(gui.SemanticSearchAction)
-        a._numpy_thread = None
-        a.emitted = []
-        a._numpy_sig = types.SimpleNamespace(emit=a.emitted.append)
-        return a
+class TestStatusDialogBusyState(unittest.TestCase):
+    def _dialog(self, action):
+        d = object.__new__(gui.StatusDialog)
+        d.action = action
+        d.pause_btn = _FakeButton()
+        return d
 
-    def _patch(self, installed, install_result):
-        self._orig = (gui.numpy_status, gui.install_numpy)
-        gui.numpy_status = lambda: (installed, '2.3.0' if installed else 'no numpy')
-        calls = []
-        gui.install_numpy = lambda *a, **k: (calls.append(1), install_result)[1]
-        return calls
+    def test_enabled_when_store_open_and_idle(self):
+        d = self._dialog(_FakeDialogAction(paused=False))
+        gui.StatusDialog._update_pause_button(d)
+        self.assertTrue(d.pause_btn.enabled)
 
-    def _restore(self):
-        gui.numpy_status, gui.install_numpy = self._orig
-
-    def test_present_does_nothing(self):
-        calls = self._patch(True, None)
-        a = self._action()
-        try:
-            a._ensure_numpy()
-        finally:
-            self._restore()
-        self.assertEqual(calls, [])
-        self.assertIsNone(a._numpy_thread)
-
-    def test_missing_installs_in_background_and_reports(self):
-        calls = self._patch(False, (True, 'numpy installed.'))
-        a = self._action()
-        try:
-            a._ensure_numpy()
-            self.assertIsNotNone(a._numpy_thread)
-            a._numpy_thread.join(timeout=5)
-        finally:
-            self._restore()
-        self.assertEqual(calls, [1])
-        self.assertEqual(a.emitted, [(True, 'numpy installed.')])
-
-    def test_missing_install_failure_reported(self):
-        self._patch(False, (False, 'pip boom'))
-        a = self._action()
-        try:
-            a._ensure_numpy()
-            a._numpy_thread.join(timeout=5)
-        finally:
-            self._restore()
-        self.assertEqual(a.emitted, [(False, 'pip boom')])
-
-    def test_no_restart_while_running(self):
+    def test_disabled_while_migrating(self):
         gate = threading.Event()
-        self._orig = (gui.numpy_status, gui.install_numpy)
-        gui.numpy_status = lambda: (False, 'no numpy')
-
-        def slow_install(*a, **k):
-            gate.wait(timeout=5)
-            return True, 'numpy installed.'
-
-        gui.install_numpy = slow_install
-        a = self._action()
+        action = _FakeDialogAction(paused=False)
+        action._finalize_thread = threading.Thread(target=lambda: gate.wait(timeout=5), daemon=True)
+        action._finalize_thread.start()
         try:
-            a._ensure_numpy()
-            first = a._numpy_thread
-            a._ensure_numpy()
-            self.assertIs(a._numpy_thread, first)
+            d = self._dialog(action)
+            gui.StatusDialog._update_pause_button(d)
+            self.assertFalse(d.pause_btn.enabled)
         finally:
             gate.set()
-            self._restore()
-            a._numpy_thread.join(timeout=5)
+            action._finalize_thread.join(timeout=5)
+
+    def test_disabled_without_store(self):
+        action = _FakeDialogAction(paused=False)
+        action.store = None
+        d = self._dialog(action)
+        gui.StatusDialog._update_pause_button(d)
+        self.assertFalse(d.pause_btn.enabled)
+
+
+class TestBlockedStatusLines(unittest.TestCase):
+    def test_blocked_shows_message(self):
+        a = object.__new__(gui.SemanticSearchAction)
+        a.store = None
+        a._blocked_dep = 'lancedb'
+        a._blocked_has_data = True
+        a._blocked_want = 'lancedb'
+        lines = gui.SemanticSearchAction.status_lines(a)
+        self.assertEqual(lines[0], 'Store not started.')
+        joined = '\n'.join(lines)
+        self.assertIn('LanceDB', joined)
+        self.assertIn('Dependencies tab', joined)
+
+    def test_no_store_no_block_is_plain(self):
+        a = object.__new__(gui.SemanticSearchAction)
+        a.store = None
+        a._blocked_dep = None
+        lines = gui.SemanticSearchAction.status_lines(a)
+        self.assertEqual(lines, ['Store not started.'])
 
 
 if __name__ == '__main__':

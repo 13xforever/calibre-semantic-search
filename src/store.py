@@ -1,7 +1,7 @@
 '''Vector store: SQLite metadata + pluggable vector backend.
 
 Public API (used by indexer/dialog/attributes):
-  VectorStore(db_path, backend='auto') -> facade with:
+  VectorStore(db_path, backend=None) -> facade with:
     add_dirty / dirty_book_ids / remove_dirty
     book_is_indexed / indexed_books / clear_book / upsert_book
     insert_chunk / commit
@@ -15,7 +15,15 @@ Public API (used by indexer/dialog/attributes):
 Backends (both keep one chunk table per embedding model):
   'sqlite'  - vectors in a local SQLite file (always available; numpy speeds it up)
   'lancedb' - vectors in LanceDB (optional dependency, lazy import)
-  'auto'    - lancedb if importable, else sqlite
+
+The backend choice is stored PER LIBRARY in meta['vector_backend'] (this file's
+MetaStore always exists, for both backends). The `backend` argument is only a
+default for libraries that have no data yet; a library with existing data keeps
+it where the data lives until the user picks another backend in settings, which
+VectorStore.finalize_schema() then carries out as a resumable cross-backend
+transfer. Likewise the sqlite text codec (meta['text_codec']) is converted in
+place when zstandard appears/disappears. Opening a store whose data cannot be
+read with the currently installed packages raises MissingDependencyError.
 
 Schema versioning: the meta tables (books/dirty/attrs_raw plus the models/formats/
 file_info registries) are versioned with PRAGMA user_version and migrated
@@ -33,10 +41,9 @@ import heapq
 import json
 import os
 import re
+import shutil
 import sqlite3
 import struct
-import subprocess
-import sys
 import threading
 import time
 import zlib
@@ -60,6 +67,31 @@ class SearchResult:
     @property
     def chapter_label(self) -> str:
         return ' > '.join(self.chapter_path)
+
+
+class MissingDependencyError(RuntimeError):
+    """A library's search data cannot be read because an optional package is missing.
+
+    Raised by VectorStore.__init__ (which then closes its MetaStore). `dep` is the
+    package name; `has_data` says whether the library actually holds chunk data,
+    which decides how the GUI explains the block (and whether switching backends
+    is possible at all)."""
+
+    def __init__(self, dep: str, has_data: bool = False, want_backend: str | None = None):
+        self.dep = dep
+        self.has_data = has_data
+        self.want_backend = want_backend
+        super().__init__(f"this library's search data needs the '{dep}' package, which is not installed")
+
+
+def _module_available(name: str) -> bool:
+    """True when `name` can be imported right now (find_spec: no import side effects)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
 
 
 def vec_to_blob(vec) -> bytes:
@@ -164,6 +196,11 @@ TEXT_CODEC_KEY = 'text_codec'
 ZSTD_LEVEL = 3
 DEFAULT_DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'default_compression_dict.bin')
 
+# Per-library choices and in-flight migration progress, all in the meta table:
+BACKEND_KEY = 'vector_backend'  # 'sqlite' | 'lancedb' — where this library's chunks should live
+MIGRATE_KEY = 'backend_migrate'  # JSON progress of an in-flight cross-backend transfer
+RECOMPRESS_KEY = 'recompress'  # JSON progress of an in-flight sqlite codec conversion
+
 
 def _load_default_dict() -> bytes:
     # Installed plugins load from the ZIP via calibre's custom loader (virtual
@@ -183,65 +220,6 @@ def build_codec_spec(zstandard_ok: bool) -> dict:
     if zstandard_ok:
         return {'name': 'zstd', 'dictionary': base64.b64encode(_load_default_dict()).decode('ascii')}
     return {'name': 'zlib'}
-
-
-def _install_zstandard(progress=None) -> bool:
-    """Best-effort pip install of zstandard into calibre's Python.
-
-    Self-contained on purpose: this module is loaded standalone in tests and
-    cannot import from the plugin package (see utils.install_zstandard for the
-    shared-UI twin). Returns True when the package imports afterwards.
-    """
-
-    def log(line):
-        if progress is not None:
-            try:
-                progress(line)
-            except Exception:
-                pass
-        print(f'[semantic-search] {line}', file=sys.stderr, flush=True)
-
-    for extra in ((), ('--user',)):
-        cmd = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *extra, 'zstandard']
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        except Exception as e:
-            log(f'zstandard install did not start: {e!r}')
-            continue
-        try:
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    log(line)
-            rc = proc.wait(timeout=300)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            log('zstandard install timed out')
-            continue
-        if rc == 0:
-            return True
-        log(f'pip exited with code {rc}')
-    return False
-
-
-def _import_zstandard(progress=None):
-    try:
-        import zstandard
-
-        return zstandard
-    except ImportError:
-        pass
-    if _install_zstandard(progress):
-        import importlib
-
-        importlib.invalidate_caches()
-        try:
-            import zstandard
-
-            return zstandard
-        except ImportError:
-            pass
-    return None
 
 
 class TextCodec:
@@ -276,15 +254,18 @@ class TextCodec:
         return zlib.decompress(blob).decode('utf-8')
 
 
-def ensure_codec_setup(meta: 'MetaStore', progress=None):
+def ensure_codec_setup(meta: 'MetaStore'):
     """Record the text codec in meta (once per DB).
 
-    Runs at migration / new-DB init only — never on the write path. Installs
-    zstandard when it is missing; falls back to zlib when that is impossible.
+    Runs at migration / new-DB init only — never on the write path. Uses zstd when
+    zstandard is importable, else zlib; it never installs anything (that is the
+    user's choice in the settings dialog). An existing DB whose recorded codec no
+    longer matches the installed packages is converted by
+    VectorStore._recompress_chunks during finalize_schema().
     """
     if meta.get_meta(TEXT_CODEC_KEY) is not None:
         return
-    spec = build_codec_spec(_import_zstandard(progress) is not None)
+    spec = build_codec_spec(_module_available('zstandard'))
     meta.set_meta(TEXT_CODEC_KEY, json.dumps(spec))
 
 
@@ -357,7 +338,6 @@ class MetaStore:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('PRAGMA synchronous=NORMAL')
-        self.migrated = False
         with self._lock:
             pre_existing = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone() is not None
             self.conn.executescript(META_SCHEMA)
@@ -371,7 +351,7 @@ class MetaStore:
             else:
                 from .migrations.v1 import upgrade
 
-                self.migrated = upgrade(self)
+                upgrade(self)
             self.conn.commit()
 
     def close(self):
@@ -798,7 +778,9 @@ class LanceVectorBackend:
         return out
 
     def _open_table(self, model: str):
-        name = self._table_name(model)
+        return self._open_named(self._table_name(model))
+
+    def _open_named(self, name):
         if name in self._table_names():
             t = self._db.open_table(name)
             self._tables[name] = t
@@ -934,25 +916,86 @@ class LanceVectorBackend:
         return out[:limit]
 
 
+class _MigrateRow:
+    """Minimal chunk shape so backend.insert_chunks() can be reused for migrations."""
+
+    __slots__ = ('chunk_no', 'chapter_path', 'text', 'para_start', 'para_end', 'char_offset')
+
+    def __init__(self, chunk_no, chapter_path, text):
+        self.chunk_no = chunk_no
+        self.chapter_path = chapter_path
+        self.text = text
+        self.para_start = 0
+        self.para_end = 0
+        self.char_offset = 0
+
+
 class VectorStore:
     """Facade combining MetaStore + a vector backend."""
 
-    def __init__(self, db_path: str, backend: str = 'auto'):
+    def __init__(self, db_path: str, backend: str | None = None):
         self.db_path = db_path
         self.meta = MetaStore(db_path)
-        self.backend_name = self._select_backend(backend)
-        if self.backend_name == 'lancedb':
-            self.backend = LanceVectorBackend(self.meta)
+        # Per-library resolution: meta[BACKEND_KEY] is the source of truth. The
+        # argument (the global default from settings) only applies to libraries that
+        # hold no chunk data yet; a library with data keeps it where the data lives
+        # until the user picks another backend, which finalize_schema() then performs.
+        stored = self.meta.get_meta(BACKEND_KEY)
+        if stored not in ('sqlite', 'lancedb'):
+            stored = None
+        loc = self._data_location()
+        if loc is None:
+            want = backend if backend in ('sqlite', 'lancedb') else 'sqlite'
         else:
-            self.backend = SqliteVectorBackend(self.meta)
+            want = stored if stored is not None else loc
+        self.meta.set_meta(BACKEND_KEY, want)
+        self.want_backend = want
+        self.backend_name = loc if loc is not None else want
+        # Pre-flight: what is stored must be readable with the currently installed
+        # packages. A pending switch to an unavailable backend does NOT block — the
+        # data stays where it is until the migration can run (installing the package,
+        # or switching back in settings, unblocks it). For a fresh library
+        # backend_name == want_backend, so this covers that case too.
+        dep = self._missing_dependency(self.backend_name)
+        if dep is not None:
+            self._raise_missing(dep)
+        rp = self._recompress_progress()
+        if rp is not None and rp.get('target') == 'zstd' and not _module_available('zstandard'):
+            self._raise_missing('zstandard')
+        # No transfer in flight, yet both locations hold data: the extra one is a
+        # leftover of an interrupted/abandoned transfer; drop it so its space is
+        # reclaimed. (While MIGRATE_KEY is set the other side is the source of a
+        # resumable transfer, not garbage.)
+        if self.backend_name == self.want_backend and self.meta.get_meta(MIGRATE_KEY) is None:
+            other = 'lancedb' if self.backend_name == 'sqlite' else 'sqlite'
+            if (other == 'lancedb' and self._lancedb_has_data()) or (other == 'sqlite' and self._sqlite_has_chunks()):
+                self._drop_backend_storage(other)
+        self._swap_backend(self.backend_name)
         self._pending: list[tuple[int, object]] = []  # (book_id, [(chunk, vec, model)])
-        self._finalized = False
+
+    def _wanted_backend(self):
+        """The backend meta says this library should use, read live (a settings change
+        can land while the store is open; __init__'s copy may be stale)."""
+        w = self.meta.get_meta(BACKEND_KEY)
+        return w if w in ('sqlite', 'lancedb') else self.want_backend
+
+    def pending_stages(self) -> list[str]:
+        """Ordered migration stages still to run: 'schema', 'backend', 'codec'."""
+        want = self._wanted_backend()
+        stages = []
+        if self.backend.pending_work():
+            stages.append('schema')
+        # a transfer is pending when the backends differ, or when one was interrupted
+        # (MIGRATE_KEY is set from the first inserted row until completion)
+        if self.backend_name != want or self.meta.get_meta(MIGRATE_KEY) is not None:
+            stages.append('backend')
+        if self.backend_name == 'sqlite' and (self._codec_mismatch() or self.meta.get_meta(RECOMPRESS_KEY) is not None):
+            stages.append('codec')
+        return stages
 
     def needs_finalize(self) -> bool:
         """True when a migration ran or is pending and the final VACUUM has not run yet."""
-        if self._finalized:
-            return False
-        if self.meta.migrated or self.backend.pending_work():
+        if self.pending_stages():
             return True
         # fully migrated but the final VACUUM never completed (e.g. interrupted last time):
         # in WAL mode the auto_vacuum setting only persists through a finished VACUUM,
@@ -960,17 +1003,38 @@ class VectorStore:
         with self.meta._lock:
             return self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0] != 2
 
-    def finalize_schema(self):
-        """Run pending chunk migrations, then one final VACUUM if anything was migrated
-        or the previous VACUUM never completed.
+    def finalize_schema(self, progress=None):
+        """Run pending migrations (schema -> backend -> codec), then one final VACUUM.
 
-        Idempotent; returns immediately when nothing is pending. Meant to be called
-        from a worker thread before indexing starts (see gui._start_for_library)."""
-        did = self.backend.finalize()
+        Idempotent and resumable: every stage records its progress in meta, so an
+        interrupted run continues where it stopped on the next open. `progress` is
+        called as progress(stage, detail) with human-readable strings. Meant to be
+        called from a worker thread before indexing starts (see gui._start_for_library)."""
+
+        def say(stage, detail):
+            if progress is not None:
+                try:
+                    progress(stage, detail)
+                except Exception:
+                    pass
+
+        did = False
+        if self.backend.pending_work():
+            say('schema', 'migrating chunk tables')
+            self.backend.finalize()
+            did = True
+        src, dst = self._pending_transfer()
+        if dst is not None and dst != src:
+            say('backend', f'moving data to the {dst} backend')
+            self._migrate_backend(src, dst)
+            did = True
+        if self.backend_name == 'sqlite' and (self._codec_mismatch() or self.meta.get_meta(RECOMPRESS_KEY) is not None):
+            say('codec', 'recompressing chunk text')
+            self._recompress_chunks(say)
+            did = True
         with self.meta._lock:
             av = self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0]
-        if not (did or self.meta.migrated) and av == 2:
-            self._finalized = True
+        if not did and av == 2:
             return
         with self.meta._lock:
             prev_ac = self.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
@@ -984,27 +1048,283 @@ class VectorStore:
                 self.meta.wal_checkpoint_truncate()
             finally:
                 self.meta.conn.execute(f'PRAGMA wal_autocheckpoint={prev_ac}')
-        self._finalized = True
 
-    def _select_backend(self, want: str) -> str:
-        if want in ('sqlite', 'lancedb'):
-            if want == 'lancedb':
-                try:
-                    import lancedb  # noqa: F401
-                except ImportError:
-                    raise RuntimeError(
-                        "vector backend 'lancedb' selected but the 'lancedb' package is not installed. "
-                        "Install it (pip install lancedb) or choose 'sqlite' in settings."
-                    )
-            return want
-        if want == 'auto':
+    # -- backend/codec state -------------------------------------------------------
+
+    def _lancedb_dir(self) -> str:
+        return os.path.splitext(self.db_path)[0] + '-lancedb'
+
+    def _lancedb_has_data(self) -> bool:
+        try:
+            d = self._lancedb_dir()
+            return any(n.endswith('.lance') and os.path.isdir(os.path.join(d, n)) for n in os.listdir(d))
+        except OSError:
+            return False
+
+    def _sqlite_has_chunks(self) -> bool:
+        with self.meta._lock:
+            rows = self.meta.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'chunks_%'").fetchall()
+        return any(not n[0].endswith('__new') for n in rows)
+
+    def _data_location(self):
+        """Where chunk data currently lives ('sqlite'/'lancedb'), or None when neither has any."""
+        stored = self.meta.get_meta(BACKEND_KEY)
+        l = self._lancedb_has_data()
+        s = self._sqlite_has_chunks()
+        if stored in ('sqlite', 'lancedb') and ((stored == 'lancedb' and l) or (stored == 'sqlite' and s)):
+            return stored
+        if l:
+            return 'lancedb'
+        if s:
+            return 'sqlite'
+        return None
+
+    def _recorded_codec_name(self):
+        raw = self.meta.get_meta(TEXT_CODEC_KEY)
+        if raw is None:
+            return None  # created on demand with whatever is available; never blocks
+        try:
+            name = json.loads(raw).get('name')
+        except Exception:
+            return None
+        return name
+
+    def _missing_dependency(self, backend_name):
+        """Package missing for `backend_name` to be usable (its data readable), or None."""
+        if backend_name == 'lancedb' and not _module_available('lancedb'):
+            return 'lancedb'
+        if backend_name == 'sqlite' and self._recorded_codec_name() == 'zstd' and not _module_available('zstandard'):
+            return 'zstandard'
+        return None
+
+    def _raise_missing(self, dep):
+        has_data = self._data_location() is not None
+        try:
+            self.meta.close()
+        except Exception:
+            pass
+        raise MissingDependencyError(dep, has_data, getattr(self, 'want_backend', None)) from None
+
+    def _swap_backend(self, name):
+        """(Re)build the backend object; picks up any meta changes (codec spec, tables)."""
+        self.backend_name = name
+        if name == 'lancedb':
+            self.backend = LanceVectorBackend(self.meta)
+        else:
+            self.backend = SqliteVectorBackend(self.meta)
+
+    def _drop_backend_storage(self, name):
+        """Delete the chunk storage of backend `name` (its tables / directory)."""
+        if name == 'sqlite':
+            with self.meta._lock:
+                rows = self.meta.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'chunks_%'").fetchall()
+                for (t,) in rows:
+                    self.meta.conn.execute(f'DROP TABLE {t}')
+                if rows:
+                    self.meta.conn.commit()
+        else:
+            shutil.rmtree(self._lancedb_dir(), ignore_errors=True)
+
+    # -- backend migration -----------------------------------------------------------
+
+    def _pending_transfer(self):
+        """(src, dst) of the cross-backend transfer to run (dst may equal src).
+
+        Prefers the in-flight marker (a resume keeps its original src even after a
+        crash flipped where the data is seen to live); otherwise the data moves from
+        where it currently is to the wanted backend. A corrupt marker is dropped:
+        it cannot be resumed, and the store must not stay wedged on it."""
+        raw = self.meta.get_meta(MIGRATE_KEY)
+        if raw is not None:
             try:
-                import lancedb  # noqa: F401
+                p = json.loads(raw)
+                src, dst = p.get('src'), p.get('dst')
+                if src in ('sqlite', 'lancedb') and dst in ('sqlite', 'lancedb') and src != dst:
+                    return src, dst
+            except Exception:
+                pass
+            self.meta.delete_meta(MIGRATE_KEY)
+        return self.backend_name, self._wanted_backend()
 
-                return 'lancedb'
-            except ImportError:
-                return 'sqlite'
-        raise ValueError(f'unknown vector backend: {want!r}')
+    def _new_migrate_progress(self, src, dst):
+        prog = {'src': src, 'dst': dst, 'models_done': [], 'books_done': []}
+        # mark in-flight BEFORE the first row moves: a crash at any point after this
+        # must resume the transfer instead of sweeping the source as an orphan
+        self.meta.set_meta(MIGRATE_KEY, json.dumps(prog))
+        return prog
+
+    def _load_migrate_progress(self, src, dst):
+        raw = self.meta.get_meta(MIGRATE_KEY)
+        if raw is not None:
+            try:
+                p = json.loads(raw)
+                if p.get('src') == src and p.get('dst') == dst and isinstance(p.get('models_done'), list) and isinstance(p.get('books_done'), list):
+                    return p
+            except Exception:
+                pass
+        return self._new_migrate_progress(src, dst)
+
+    def _save_migrate_progress(self, prog):
+        self.meta.set_meta(MIGRATE_KEY, json.dumps({'src': prog['src'], 'dst': prog['dst'], 'models_done': sorted(prog['models_done']), 'books_done': sorted(prog['books_done'])}))
+
+    def _backend_book_items(self, src: str, reader, model: str, table: str, book_id: int):
+        """(shim_chunk, vector) pairs of one book's chunks in backend `src` (table `table`)."""
+        if src == 'sqlite':
+            with self.meta._lock:
+                rows = self.meta.conn.execute(
+                    f'SELECT chunk_no, text_z, chapter_path, vector FROM {table} WHERE book_id=? ORDER BY chunk_no', (book_id,)
+                ).fetchall()
+            codec = reader._codec
+            return [(_MigrateRow(n, [p for p in cp.split(' > ') if p], codec.decompress(z)), blob_to_vec(v)) for n, z, cp, v in rows]
+        t = reader._open_named(table)
+        if t is None:
+            return []
+        rows = t.search().where(f'book_id = {int(book_id)}').limit(10_000_000).to_list()
+        rows.sort(key=lambda r: int(r['chunk_no']))
+        return [(_MigrateRow(int(r['chunk_no']), [p for p in str(r['chapter_path']).split(' > ') if p], str(r['text'])), r['vector']) for r in rows]
+
+    def _migrate_backend(self, src: str, dst: str):
+        """Move all chunk data from the `src` backend to `dst`, then drop the src storage.
+
+        Resumable: meta[MIGRATE_KEY] marks the transfer in-flight from the first row
+        moved until completion and records per-book progress; each book is re-created
+        in the target (delete + insert), so a restart never duplicates. The
+        meta[BACKEND_KEY] flip happens only after every book has moved, and the old
+        storage is dropped last — an interruption always leaves a consistent state
+        that the next open resumes."""
+        dep = self._missing_dependency(dst)
+        if dep is not None:  # e.g. switching to lancedb before its package is installed
+            raise MissingDependencyError(dep, True, dst)
+        target = LanceVectorBackend(self.meta) if dst == 'lancedb' else SqliteVectorBackend(self.meta)
+        # the current backend object can read its own storage directly; only a resume
+        # (after a crash flipped where the data is seen to live) needs a second one
+        reader = self.backend if src == self.backend_name else (SqliteVectorBackend(self.meta) if src == 'sqlite' else LanceVectorBackend(self.meta))
+        books_by_model: dict[str, list[int]] = {}
+        for b in self.meta.indexed_books():
+            if b['n_chunks'] and b.get('model'):
+                books_by_model.setdefault(b['model'], []).append(b['id'])
+        prog = self._load_migrate_progress(src, dst)
+        models_done = set(prog['models_done'])
+        books_done = set(prog['books_done'])
+
+        def save():
+            prog['models_done'] = sorted(models_done)
+            prog['books_done'] = sorted(books_done)
+            self._save_migrate_progress(prog)
+
+        for model in sorted(books_by_model):
+            if model in models_done:
+                continue
+            table = model_table_name(model)
+            for bid in books_by_model[model]:
+                if bid in books_done:
+                    continue
+                items = self._backend_book_items(src, reader, model, table, bid)
+                target.delete_book(bid)
+                if items:
+                    target.insert_chunks(bid, [(c, v, model) for c, v in items])
+                books_done.add(bid)
+                save()
+            models_done.add(model)
+            with self.meta._lock:
+                self.meta.wal_checkpoint_truncate()
+            save()
+        self.meta.set_meta(BACKEND_KEY, dst)
+        self.meta.delete_meta(MIGRATE_KEY)
+        self.meta.delete_meta(RECOMPRESS_KEY)  # the data left sqlite; a codec conversion is moot
+        self._drop_backend_storage(src)
+        self._swap_backend(dst)
+
+    # -- codec conversion --------------------------------------------------------------
+
+    def _recompress_progress(self):
+        raw = self.meta.get_meta(RECOMPRESS_KEY)
+        if raw is None:
+            return None
+        try:
+            p = json.loads(raw)
+        except Exception:
+            return None
+        return p if isinstance(p, dict) else None
+
+    def _codec_mismatch(self) -> bool:
+        cur = self._recorded_codec_name()
+        if cur is None:
+            return False  # created on demand with whatever is available
+        target = 'zstd' if _module_available('zstandard') else 'zlib'
+        return cur != target
+
+    def _recompress_chunks(self, say):
+        """Convert every sqlite chunk row from the recorded codec to the target one.
+
+        In place and resumable: rows are updated in keyset batches, each batch
+        committed together with its progress marker (meta[RECOMPRESS_KEY]); a row
+        already in the target format is recognized by magic bytes and skipped, so
+        a restart never double-converts. The codec meta flips only after every
+        table has been fully converted."""
+        cur_spec = json.loads(self.meta.get_meta(TEXT_CODEC_KEY))
+        prog = self._recompress_progress()
+        if prog is None or prog.get('target') not in ('zstd', 'zlib'):
+            prog = {'target': 'zstd' if _module_available('zstandard') else 'zlib', 'done': [], 'cur_table': None, 'last_id': 0}
+        target_spec = build_codec_spec(_module_available('zstandard'))
+        src = TextCodec(cur_spec)
+        dstc = TextCodec(target_spec)
+        tables = self.backend._chunk_tables()
+        done = set(prog.get('done') or [])
+        zstd_magic = b'\x28\xb5\x2f\xfd'
+
+        def convert(blob):
+            if prog['target'] == 'zstd':
+                if blob[:4] == zstd_magic:
+                    return None  # already converted
+                text = src.decompress(blob)
+            else:
+                if blob[:1] == b'\x78':
+                    return None
+                text = src.decompress(blob)
+            return dstc.compress(text)
+
+        with self.meta._lock:
+            prev_ac = self.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
+            self.meta.conn.execute('PRAGMA wal_autocheckpoint=0')
+        try:
+            for t in tables:
+                if t in done:
+                    continue
+                last_id = prog['last_id'] if prog.get('cur_table') == t else 0
+                while True:
+                    with self.meta._lock:
+                        rows = self.meta.conn.execute(f'SELECT id, text_z FROM {t} WHERE id>? ORDER BY id LIMIT 500', (last_id,)).fetchall()
+                    if not rows:
+                        break
+                    updates = []
+                    for rid, blob in rows:
+                        new = convert(blob)
+                        if new is not None and new != blob:
+                            updates.append((new, rid))
+                    last_id = rows[-1][0]
+                    with self.meta._lock:
+                        if updates:
+                            self.meta.conn.executemany(f'UPDATE {t} SET text_z=? WHERE id=?', updates)
+                    prog['cur_table'] = t
+                    prog['last_id'] = last_id
+                    self.meta.set_meta(RECOMPRESS_KEY, json.dumps(prog))  # commits the batch + progress atomically
+                    say('codec', f'{t}: row {last_id}')
+                done.add(t)
+                prog['done'] = sorted(done)
+                prog['cur_table'] = None
+                prog['last_id'] = 0
+                self.meta.set_meta(RECOMPRESS_KEY, json.dumps(prog))
+                with self.meta._lock:
+                    self.meta.wal_checkpoint_truncate()
+        finally:
+            with self.meta._lock:
+                self.meta.conn.execute(f'PRAGMA wal_autocheckpoint={prev_ac}')
+        self.meta.delete_meta(RECOMPRESS_KEY)
+        self.meta.set_meta(TEXT_CODEC_KEY, json.dumps(target_spec))
+        with self.meta._lock:
+            self.meta.wal_checkpoint_truncate()
+        self._swap_backend('sqlite')  # rebuild the TextCodec on the new spec
 
     # -- pass-throughs -------------------------------------------------------------
 

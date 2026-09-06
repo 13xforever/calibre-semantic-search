@@ -176,6 +176,72 @@ class TestNumpyInstall(unittest.TestCase):
         self.assertIsInstance(info, str)
 
 
+class TestUninstall(unittest.TestCase):
+    def _fake_popen(self, results):
+        calls = []
+
+        class FakeProc:
+            def __init__(self, rc, lines):
+                self._rc = rc
+                self.stdout = iter(lines)
+
+            def wait(self):
+                return self._rc
+
+        def popen(cmd, **kw):
+            calls.append(list(cmd))
+            rc, lines = results.pop(0)
+            return FakeProc(rc, lines)
+
+        return popen, calls
+
+    def test_pip_uninstall_command(self):
+        cmd = utils.pip_uninstall_command('zstandard')
+        self.assertEqual(cmd[:4], [sys.executable, '-m', 'pip', 'uninstall'])
+        self.assertIn('-y', cmd)
+        self.assertEqual(cmd[-1], 'zstandard')
+
+    def test_success_reports_uninstalled(self):
+        popen, calls = self._fake_popen([(0, ['Found existing installation: numpy 2.3.0', 'Successfully uninstalled numpy-2.3.0'])])
+        seen = []
+        ok, msg = utils.uninstall_numpy(progress=seen.append, _popen=popen)
+        self.assertTrue(ok)
+        self.assertEqual(msg, 'numpy uninstalled.')
+        self.assertEqual(len(calls), 1)
+        self.assertIn('uninstall', calls[0])
+        self.assertTrue(any('Successfully uninstalled' in l for l in seen))
+
+    def test_single_attempt_no_user_fallback(self):
+        # unlike install, uninstall must not retry with --user
+        popen, calls = self._fake_popen([(1, ['boom'])])
+        ok, msg = utils.uninstall_lancedb(_popen=popen)
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('--user', calls[0])
+
+    def test_failure_reports_tail(self):
+        popen, _ = self._fake_popen([(1, ['first error'])])
+        ok, msg = utils.uninstall_zstandard(_popen=popen)
+        self.assertFalse(ok)
+        self.assertIn('first error', msg)
+
+    def test_no_output_reports_command(self):
+        popen, _ = self._fake_popen([(2, [])])
+        ok, msg = utils.uninstall_numpy(_popen=popen)
+        self.assertFalse(ok)
+        self.assertIn('no output', msg)
+        self.assertIn('-m pip uninstall', msg)
+
+    def test_popen_exception_reported(self):
+        def popen(cmd, **kw):
+            raise OSError('spawn failed')
+
+        ok, msg = utils.uninstall_numpy(_popen=popen)
+        self.assertFalse(ok)
+        self.assertIn('OSError', msg)
+        self.assertIn('spawn failed', msg)
+
+
 class TestInterpreterNote(unittest.TestCase):
     def test_reports_interpreter_and_pip_state(self):
         note = utils._interpreter_note()

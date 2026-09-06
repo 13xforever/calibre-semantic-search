@@ -364,5 +364,344 @@ class TestLanceDb(_LifecycleOps, unittest.TestCase):
         self._assert_persisted(self.s)
 
 
+class _MigrateOps:
+    """Shared helpers for the backend/codec migration scenarios."""
+
+    MODEL = 'migrate-model'
+    DIM = 8
+    BOOKS = ((601, 'EPUB', 3), (602, 'PDF', 2))
+
+    def _vec(self, bid, i):
+        if bid == 601 and i == 0:  # aligned with the query [1]*DIM -> deterministic top hit
+            return store.l2_normalize([1.0] * self.DIM)
+        return store.l2_normalize([math.cos(0.3 * (bid * 10 + i) + t) for t in range(self.DIM)])
+
+    def _index(self, s, bid, fmt, n):
+        chunks = [_C(i, f'book {bid} chunk {i}', ['Ch', f'S{i}']) for i in range(n)]
+        for i, c in enumerate(chunks):
+            s.insert_chunk(bid, c, self.MODEL, self._vec(bid, i))
+        s.commit(bid)
+        s.upsert_book(bid, fmt, n, self.MODEL)
+
+    def _check(self, s):
+        q = [1.0] * self.DIM
+        res = s.search(q, limit=5, min_score=-1.0)
+        self.assertEqual(len(res), 5)
+        self.assertEqual((res[0].book_id, res[0].chunk_no), (601, 0))
+        self.assertGreater(res[0].score, 0.999)
+        self.assertEqual(res[0].text, 'book 601 chunk 0')
+        self.assertEqual(s.book_chunks_text(602), [f'book 602 chunk {i}' for i in range(2)])
+
+    def _codec_name(self, s):
+        return store.json.loads(s.get_meta(store.TEXT_CODEC_KEY))['name']
+
+
+class TestCodecRecompress(_MigrateOps, unittest.TestCase):
+    """The sqlite text codec converts in place when zstandard availability changes.
+
+    The test env has zstandard installed; unavailability is simulated by patching
+    store._module_available (the real module stays importable, which mirrors an
+    in-session uninstall where the already-loaded module still works)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'semantic-search.db')
+        self.s = None
+        self._orig_avail = store._module_available
+
+    def tearDown(self):
+        if self.s is not None:
+            self.s.close()
+        store._module_available = self._orig_avail
+        self.tmp.cleanup()
+
+    def _avail(self, zstandard_ok):
+        real = self._orig_avail
+        store._module_available = lambda name: False if (name == 'zstandard' and not zstandard_ok) else real(name)
+
+    def test_zstd_to_zlib_and_back(self):
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        self.assertEqual(self._codec_name(s), 'zstd')  # zstandard is installed in the test env
+        self._check(s)
+
+        # "uninstall" zstandard (in-session): the open store converts on finalize
+        self._avail(False)
+        self.assertEqual(s.pending_stages(), ['codec'])
+        stages = []
+        s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        self.assertEqual(self._codec_name(s), 'zlib')
+        self.assertIsNone(s.get_meta(store.RECOMPRESS_KEY))
+        self.assertTrue(any(st == 'codec' for st, _ in stages))
+        self.assertFalse(s.needs_finalize())
+        self._check(s)
+
+        # reopen without zstandard: the zlib DB is readable, nothing pending
+        s.close()
+        self.s = store.VectorStore(self.path, backend='sqlite')
+        self.assertEqual(self.s.pending_stages(), [])
+        self.assertFalse(self.s.needs_finalize())
+        self._check(self.s)
+
+        # "install" zstandard again: converts back to zstd in place
+        self._avail(True)
+        self.assertEqual(self.s.pending_stages(), ['codec'])
+        self.s.finalize_schema()
+        self.assertEqual(self._codec_name(self.s), 'zstd')
+        self._check(self.s)
+
+    def test_reopen_zstd_db_without_zstandard_blocks(self):
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        self.assertEqual(self._codec_name(s), 'zstd')
+        s.close()
+        self.s = None
+        self._avail(False)
+        try:
+            with self.assertRaises(store.MissingDependencyError) as cm:
+                store.VectorStore(self.path, backend='sqlite')
+            self.assertEqual(cm.exception.dep, 'zstandard')
+            self.assertTrue(cm.exception.has_data)
+        finally:
+            self._avail(True)
+
+    def test_fresh_library_never_blocks_on_codec(self):
+        # no data yet: the codec is created on demand with whatever is available
+        self._avail(False)
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        self.assertEqual(self._codec_name(s), 'zlib')
+        self._check(s)
+
+
+class TestBackendMigration(_MigrateOps, unittest.TestCase):
+    """Cross-backend transfer (sqlite <-> lancedb), resumable and orphan-safe."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'semantic-search.db')
+        self.s = None
+
+    def tearDown(self):
+        if self.s is not None:
+            self.s.close()
+        self.tmp.cleanup()
+
+    def test_sqlite_to_lancedb_and_back(self):
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        self.assertEqual(s.get_meta(store.BACKEND_KEY), 'sqlite')
+        # the settings dialog flips the per-library meta; the migration runs on open
+        s.set_meta(store.BACKEND_KEY, 'lancedb')
+        s.close()
+
+        s = store.VectorStore(self.path)
+        self.s = s
+        self.assertEqual(s.backend_name, 'sqlite')
+        self.assertEqual(s.want_backend, 'lancedb')
+        self.assertEqual(s.pending_stages(), ['backend'])
+        self.assertTrue(s.needs_finalize())
+        stages = []
+        s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        self.assertEqual(stages, [('backend', 'moving data to the lancedb backend')])
+        self.assertEqual(s.backend_name, 'lancedb')
+        self.assertEqual(s.get_meta(store.BACKEND_KEY), 'lancedb')
+        self.assertIsNone(s.get_meta(store.MIGRATE_KEY))
+        self.assertFalse(s._sqlite_has_chunks())  # source storage dropped
+        self.assertTrue(s._lancedb_has_data())
+        self.assertFalse(s.needs_finalize())
+        self._check(s)
+
+        # reopen: stable, no stages
+        s.close()
+        self.s = store.VectorStore(self.path)
+        self.assertEqual(self.s.backend_name, 'lancedb')
+        self.assertEqual(self.s.pending_stages(), [])
+        self._check(self.s)
+
+        # switch back to sqlite
+        self.s.set_meta(store.BACKEND_KEY, 'sqlite')
+        self.s.close()
+        self.s = store.VectorStore(self.path)
+        self.assertEqual(self.s.backend_name, 'lancedb')
+        self.assertEqual(self.s.want_backend, 'sqlite')
+        self.assertEqual(self.s.pending_stages(), ['backend'])
+        self.s.finalize_schema()
+        self.assertEqual(self.s.backend_name, 'sqlite')
+        self.assertFalse(self.s._lancedb_has_data())  # lancedb dir removed
+        self.assertTrue(self.s._sqlite_has_chunks())
+        self._check(self.s)
+
+    def test_interrupted_transfer_resumes(self):
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        model = store.normalize_model(self.MODEL)
+        table = store.model_table_name(model)
+
+        # simulate a crash mid-transfer: book 601 already moved to lancedb, progress
+        # recorded, but the meta flip and source drop never happened
+        lance = store.LanceVectorBackend(s.meta)
+        items = s._backend_book_items('sqlite', s.backend, model, table, 601)
+        lance.insert_chunks(601, [(c, v, self.MODEL) for c, v in items])
+        s.set_meta(store.BACKEND_KEY, 'lancedb')
+        s.set_meta(store.MIGRATE_KEY, store.json.dumps({'src': 'sqlite', 'dst': 'lancedb', 'models_done': [], 'books_done': [601]}))
+        s.close()
+
+        s = store.VectorStore(self.path)
+        self.s = s
+        # the partial lancedb data decides where the store opens, and the marker keeps
+        # the transfer pending (and protects the sqlite source from the orphan sweep)
+        self.assertEqual(s.backend_name, 'lancedb')
+        self.assertEqual(s.want_backend, 'lancedb')
+        self.assertTrue(s._sqlite_has_chunks())  # not swept while in flight
+        self.assertEqual(s.pending_stages(), ['backend'])
+        s.finalize_schema()
+        self.assertEqual(s.backend_name, 'lancedb')
+        self.assertIsNone(s.get_meta(store.MIGRATE_KEY))
+        self.assertFalse(s._sqlite_has_chunks())
+        self._check(s)  # both books survived the "crash"
+
+    def test_orphan_storage_swept(self):
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        # move everything to lancedb...
+        s.set_meta(store.BACKEND_KEY, 'lancedb')
+        s.close()
+        self.s = store.VectorStore(self.path)
+        self.s.finalize_schema()
+        # ...then leave stale sqlite chunk data behind (an abandoned source remnant)
+        with self.s.meta._lock:
+            self.s.meta.conn.executescript(store.chunks_table_sql(store.model_table_name(store.normalize_model(self.MODEL))))
+            self.s.meta.conn.commit()
+        self.assertTrue(self.s._sqlite_has_chunks())
+        self.s.close()
+        # reopen sweeps it: no transfer in flight, so the extra storage is garbage
+        self.s = store.VectorStore(self.path)
+        self.assertEqual(self.s.backend_name, 'lancedb')
+        self.assertFalse(self.s._sqlite_has_chunks())
+        self._check(self.s)
+
+
+class TestBlockedStates(unittest.TestCase):
+    """Pre-flight blocks: stored data that the installed packages cannot read."""
+
+    DIM = 8
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'semantic-search.db')
+        self.s = None
+        self._orig_avail = store._module_available
+
+    def tearDown(self):
+        if self.s is not None:
+            self.s.close()
+        store._module_available = self._orig_avail
+        self.tmp.cleanup()
+
+    def _avail(self, name, ok):
+        real = self._orig_avail
+        store._module_available = lambda n: False if (n == name and not ok) else real(n)
+
+    def test_lancedb_data_without_package_blocks(self):
+        s = store.VectorStore(self.path, backend='lancedb')
+        self.s = s
+        vec = store.l2_normalize([1.0] * self.DIM)
+        s.insert_chunk(1, _C(0, 'hello', ['Ch']), 'block-model', vec)
+        s.commit(1)
+        s.upsert_book(1, 'EPUB', 1, 'block-model')
+        s.close()
+        self.s = None
+        self._avail('lancedb', False)
+        try:
+            with self.assertRaises(store.MissingDependencyError) as cm:
+                store.VectorStore(self.path)
+            self.assertEqual(cm.exception.dep, 'lancedb')
+            self.assertTrue(cm.exception.has_data)
+        finally:
+            self._avail('lancedb', True)
+
+    def test_fresh_lancedb_default_without_package_blocks_without_data(self):
+        self._avail('lancedb', False)
+        try:
+            with self.assertRaises(store.MissingDependencyError) as cm:
+                store.VectorStore(self.path, backend='lancedb')
+            self.assertEqual(cm.exception.dep, 'lancedb')
+            self.assertFalse(cm.exception.has_data)
+        finally:
+            self._avail('lancedb', True)
+
+    def test_pending_switch_to_unavailable_backend_does_not_block(self):
+        # data in sqlite stays readable while the wanted backend's package is missing;
+        # the migration simply waits (and fails with a clear error when attempted)
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        vec = store.l2_normalize([1.0] * self.DIM)
+        s.insert_chunk(1, _C(0, 'hello', ['Ch']), 'block-model', vec)
+        s.commit(1)
+        s.upsert_book(1, 'EPUB', 1, 'block-model')
+        s.set_meta(store.BACKEND_KEY, 'lancedb')
+        self._avail('lancedb', False)
+        try:
+            # the open store is fine...
+            self.assertEqual(s.backend_name, 'sqlite')
+            self.assertEqual(s.pending_stages(), ['backend'])
+            # ...and a fresh open of it is fine too (data readable, switch pending)
+            s.close()
+            self.s = store.VectorStore(self.path)
+            self.assertEqual(self.s.backend_name, 'sqlite')
+            self.assertEqual(self.s.want_backend, 'lancedb')
+            with self.assertRaises(store.MissingDependencyError):
+                self.s.finalize_schema()  # the migration itself names the missing package
+        finally:
+            self._avail('lancedb', True)
+
+
+class TestPerLibraryIndependence(_MigrateOps, unittest.TestCase):
+    """Two libraries in different backends, open at once, do not interfere."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path_a = os.path.join(self.tmp.name, 'liba.db')
+        self.path_b = os.path.join(self.tmp.name, 'libb.db')
+        self.sa = None
+        self.sb = None
+
+    def tearDown(self):
+        for s in (self.sa, self.sb):
+            if s is not None:
+                s.close()
+        self.tmp.cleanup()
+
+    def test_two_backends_side_by_side(self):
+        sa = store.VectorStore(self.path_a, backend='sqlite')
+        sb = store.VectorStore(self.path_b, backend='lancedb')
+        self.sa, self.sb = sa, sb
+        for s, bid in ((sa, 701), (sb, 702)):
+            chunks = [_C(i, f'book {bid} chunk {i}', ['Ch']) for i in range(2)]
+            for i, c in enumerate(chunks):
+                s.insert_chunk(bid, c, self.MODEL, store.l2_normalize([math.cos(0.3 * (bid + i) + t) for t in range(self.DIM)]))
+            s.commit(bid)
+            s.upsert_book(bid, 'EPUB', 2, self.MODEL)
+        ra = sa.search([1.0] * self.DIM, limit=5, min_score=-1.0)
+        rb = sb.search([1.0] * self.DIM, limit=5, min_score=-1.0)
+        self.assertEqual({r.book_id for r in ra}, {701})
+        self.assertEqual({r.book_id for r in rb}, {702})
+        self.assertEqual(sa.backend_name, 'sqlite')
+        self.assertEqual(sb.backend_name, 'lancedb')
+
+
 if __name__ == '__main__':
     unittest.main()

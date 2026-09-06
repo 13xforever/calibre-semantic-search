@@ -11,6 +11,7 @@ from qt.core import (
     QDoubleSpinBox,
     QEvent,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -31,7 +32,19 @@ from qt.core import (
     pyqtSignal,
 )
 
-from .utils import AttrField, Settings, install_lancedb, lancedb_status
+from .utils import (
+    AttrField,
+    Settings,
+    install_lancedb,
+    install_numpy,
+    install_zstandard,
+    lancedb_status,
+    numpy_status,
+    uninstall_lancedb,
+    uninstall_numpy,
+    uninstall_zstandard,
+    zstandard_status,
+)
 
 
 class _HelpFilter(QObject):
@@ -49,12 +62,18 @@ class _HelpFilter(QObject):
         return False
 
 
-class _LanceInstallWorker(QThread):
+class _DepWorker(QThread):
+    """Runs one utils install/uninstall function off the GUI thread."""
+
     line = pyqtSignal(str)
     finished_ok = pyqtSignal(bool, str)
 
+    def __init__(self, func):
+        super().__init__()
+        self._func = func
+
     def run(self):
-        ok, msg = install_lancedb(progress=self.line.emit)
+        ok, msg = self._func(progress=self.line.emit)
         self.finished_ok.emit(ok, msg)
 
 
@@ -96,11 +115,23 @@ HELP_CONCURRENCY = _(
 HELP_TIMEOUT = _('Per-request timeout in seconds. Raise it if indexing stalls on a slow CPU server.')
 
 HELP_BACKEND = _(
-    "Where chunk vectors are stored.\n"
-    "- auto (default): LanceDB if the 'lancedb' Python package is installed, otherwise SQLite\n"
+    "Where this library's chunk vectors are stored.\n"
     '- sqlite: always available; vectors live in a file next to metadata.db\n'
-    "- lancedb: requires 'pip install lancedb'\n\n"
-    'Changing the backend or the embedding model requires re-indexing for consistent results.'
+    "- lancedb: requires the 'lancedb' package (see the Dependencies tab)\n\n"
+    "This choice is per-library. Changing it moves the existing data automatically — a migration "
+    "runs before indexing starts, and search stays available in the meantime only after it finishes. "
+    "New libraries use your last choice as their default."
+)
+
+HELP_DEPS = _(
+    'Packages the plugin can install into calibre\'s own Python (via pip). Installing or uninstalling '
+    'does not restart anything automatically: a running session keeps using what it already loaded, and '
+    'the change fully takes effect after restarting calibre.\n\n'
+    '- numpy: speeds up SQLite vector search (~36x); without it the plugin still works, just slower\n'
+    '- zstandard: compresses chunk text in the SQLite backend (smaller database, faster reads)\n'
+    "- lancedb: the optional LanceDB storage backend\n\n"
+    'Uninstalling a package that a library currently needs blocks that library until the package is '
+    "reinstalled (see the block message in the plugin's status)."
 )
 
 HELP_FORMATS = _(
@@ -182,10 +213,14 @@ HELP_CONTEXT = _(
 
 
 class SettingsWidget(QDialog):
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, action=None, library_backend=None, blocked_dep=None, blocked_has_data=False):
         super().__init__()
         self.s = settings
+        self.action = action  # the plugin action (for on_dependency_changed), or None in tests
         self._worker = None
+        self._lib_backend = library_backend  # where this library's data lives; None = no library context
+        self._blocked_dep = blocked_dep
+        self._blocked_has_data = blocked_has_data
         self.setWindowTitle(_('Semantic search settings'))
         self.resize(760, 610)
         v = QVBoxLayout(self)
@@ -220,9 +255,18 @@ class SettingsWidget(QDialog):
         idx_tab = QWidget()
         f2 = QFormLayout(idx_tab)
         f2.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        # per-library backend: where this library's data lives (or would live);
+        # the global default below only seeds it when there is no library context
+        cur_backend = self._lib_backend if self._lib_backend is not None else self.s.vector_backend
         self.i_backend = QComboBox()
-        self.i_backend.addItems(['auto', 'sqlite', 'lancedb'])
-        self.i_backend.setCurrentText(self.s.vector_backend)
+        self.i_backend.addItems(['sqlite', 'lancedb'])
+        self.i_backend.setCurrentText(cur_backend)
+        if self._blocked_dep is not None and self._blocked_has_data:
+            # data exists but is unreadable without a missing package: switching now
+            # would orphan it, so the choice is locked until it is readable again
+            self.i_backend.setEnabled(False)
+        self.backend_note = QLabel()
+        self.backend_note.setWordWrap(True)
         self.i_formats = QPlainTextEdit('\n'.join(self.s.format_priority))
         self.i_formats.setPlaceholderText(_('One format per line, in priority order'))
         self.i_target = QSpinBox()
@@ -247,15 +291,9 @@ class SettingsWidget(QDialog):
         self.i_attrmode = QComboBox()
         self.i_attrmode.addItems(['sampled', 'fulltext'])
         self.i_attrmode.setCurrentText(self.s.attr_mode)
-        f2.addRow(_('Vector backend:'), self.i_backend)
-        lance_row = QHBoxLayout()
-        self.lance_status = QLabel()
-        self.b_install_lance = QPushButton(_('Install lancedb...'))
-        self.b_install_lance.clicked.connect(self._install_lancedb)
-        lance_row.addWidget(self.lance_status, 1)
-        lance_row.addWidget(self.b_install_lance)
-        f2.addRow('', lance_row)
-        self.i_backend.currentTextChanged.connect(lambda _t: self._update_lance_status())
+        f2.addRow(_('Vector backend (this library):'), self.i_backend)
+        f2.addRow('', self.backend_note)
+        self.i_backend.currentTextChanged.connect(lambda _t: self._update_backend_note())
         f2.addRow(_('Format priority:'), self.i_formats)
         f2.addRow(_('Target chunk size (chars):'), self.i_target)
         f2.addRow(_('Overlap (chars):'), self.i_overlap)
@@ -309,6 +347,32 @@ class SettingsWidget(QDialog):
         av.addLayout(btns)
         tabs.addTab(att_tab, _('Attributes'))
 
+        # -- Dependencies tab (last) ---------------------------------------------
+        dep_tab = QWidget()
+        grid = QGridLayout(dep_tab)
+        grid.setColumnStretch(2, 1)
+        # (key, status_fn, install_fn, uninstall_fn, purpose)
+        self._dep_funcs = {
+            'numpy': (numpy_status, install_numpy, uninstall_numpy, _('Speeds up SQLite vector search (~36x faster).')),
+            'zstandard': (zstandard_status, install_zstandard, uninstall_zstandard, _('Compresses chunk text in the SQLite backend (smaller database, faster reads).')),
+            'lancedb': (lancedb_status, install_lancedb, uninstall_lancedb, _('The optional LanceDB storage backend.')),
+        }
+        self._dep_rows = {}
+        r = 0
+        for dep, (_status_fn, _inst, _uninst, purpose) in self._dep_funcs.items():
+            name = QLabel(dep)
+            button = QPushButton()
+            button.clicked.connect(lambda _c=False, d=dep: self._toggle_dep(d))
+            note = QLabel(purpose)
+            note.setWordWrap(True)
+            grid.addWidget(name, r, 0)
+            grid.addWidget(button, r, 1)
+            grid.addWidget(note, r + 1, 0, 1, 3)
+            self._dep_rows[dep] = {'name': name, 'button': button, 'note': note}
+            r += 2
+        grid.setRowStretch(r, 1)  # keep the rows at natural height, extra space goes below
+        tabs.addTab(dep_tab, _('Dependencies'))
+
         # -- help box + per-option hints -----------------------------------------
         self.help_box = QTextEdit()
         self.help_box.setReadOnly(True)
@@ -339,13 +403,18 @@ class SettingsWidget(QDialog):
         B(HELP_ATTR_TABLE, self.attr_table)
         B(HELP_CONTEXT, self.e_ctx)
         B(HELP_AUTO_ATTR, self.e_auto_attr)
+        for dep, (_status_fn, _inst, _uninst, purpose) in self._dep_funcs.items():
+            row = self._dep_rows[dep]
+            B(f'{purpose}\n\n{HELP_DEPS}', row['name'], row['button'], row['note'])
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.accepted.connect(self._collect_and_accept)
         box.rejected.connect(self.reject)
         v.addWidget(box)
 
-        self._update_lance_status()
+        self._update_backend_note()
+        for dep in self._dep_funcs:
+            self._update_dep_row(dep)
 
     def _bind_help(self, text: str, *widgets):
         """Give widgets a tooltip and make hovering them update the help box."""
@@ -374,56 +443,91 @@ class SettingsWidget(QDialog):
         if r >= 0:
             self.attr_table.removeRow(r)
 
-    # -- lancedb install ---------------------------------------------------------
+    # -- dependencies -------------------------------------------------------------
 
-    def _update_lance_status(self):
-        ok, info = lancedb_status()
-        if ok:
-            self.lance_status.setText(_('lancedb {v} detected.').format(v=info))
-            self.b_install_lance.hide()
-            return
-        self.b_install_lance.show()
-        backend = self.i_backend.currentText()
-        if backend == 'lancedb':
-            self.lance_status.setText(_('lancedb is not installed — required for this backend.'))
-        elif backend == 'auto':
-            self.lance_status.setText(_("lancedb is not installed — 'auto' will use SQLite."))
+    def _update_backend_note(self):
+        cur = self.i_backend.currentText()
+        if self._blocked_dep is not None and self._blocked_has_data:
+            self.backend_note.setText(
+                _("This library's data needs the '{dep}' package, which is not installed — the backend cannot be "
+                  'switched until it is readable again.').format(dep=self._blocked_dep)
+            )
+        elif cur == 'lancedb' and not lancedb_status()[0]:
+            self.backend_note.setText(_("lancedb is not installed — install it in the Dependencies tab."))
         else:
-            self.lance_status.setText('')
+            self.backend_note.setText('')
 
-    def _install_lancedb(self):
+    def _update_dep_row(self, dep):
+        status_fn = self._dep_funcs[dep][0]
+        ok, _info = status_fn()
+        row = self._dep_rows[dep]
+        row['button'].setText(_('Uninstall...') if ok else _('Install...'))
+        row['note'].setText(self._dep_funcs[dep][3])
+
+    def _toggle_dep(self, dep):
         if self._worker is not None:
             return
-        self._worker = _LanceInstallWorker()
-        self._worker.line.connect(lambda l: self.lance_status.setText(l[-140:]))
-        self._worker.finished_ok.connect(self._lance_install_done)
-        self.b_install_lance.setEnabled(False)
-        self.lance_status.setText(_("Installing lancedb into calibre's Python — this can take a few minutes..."))
+        status_fn, install_fn, uninstall_fn = self._dep_funcs[dep][:3]
+        ok, _info = status_fn()
+        fn, verb = (uninstall_fn, _('Uninstalling')) if ok else (install_fn, _('Installing'))
+        self._worker = _DepWorker(fn)
+        self._worker.line.connect(lambda l, d=dep: self._dep_rows[d]['note'].setText(l[-140:]))
+        self._worker.finished_ok.connect(lambda ok, msg, d=dep: self._dep_done(d, ok, msg))
+        for r in self._dep_rows.values():
+            r['button'].setEnabled(False)
+        self._dep_rows[dep]['note'].setText(
+            _('{verb} {pkg} into calibre\'s Python — this can take a few minutes...').format(verb=verb, pkg=dep)
+        )
         self._worker.start()
 
-    def _lance_install_done(self, ok, msg):
+    def _dep_done(self, dep, ok, msg):
         self._worker = None
-        if ok:
-            import importlib
-
-            importlib.invalidate_caches()
-            self._update_lance_status()
-            QMessageBox.information(
-                self,
-                _('Semantic search'),
-                _('lancedb was installed successfully.\n\nRestart calibre to use the LanceDB backend.'),
-            )
-        else:
-            self.b_install_lance.setEnabled(True)
-            self.lance_status.setText(_('Installation failed.'))
+        for r in self._dep_rows.values():
+            r['button'].setEnabled(True)
+        if not ok:
+            self._update_dep_row(dep)
             QMessageBox.critical(
                 self,
                 _('Semantic search'),
-                _('lancedb could not be installed automatically.\n\n') + msg + '\n\n' + _(
-                    "If this was a permissions error, run calibre as administrator and try again, or install manually "
-                    "into calibre's Python:  pip install lancedb"
-                ),
+                _('{pkg} operation failed.\n\n{msg}\n\nIf this was a permissions error, run calibre as '
+                  'administrator and try again, or do it manually into calibre\'s Python:  pip {verb} {pkg}').format(
+                      pkg=dep, msg=msg, verb='uninstall' if self._dep_funcs[dep][0]()[0] else 'install'
+                  ),
             )
+            return
+        import importlib
+
+        importlib.invalidate_caches()
+        self._update_dep_row(dep)
+        self._update_backend_note()
+        if self.action is not None:
+            # let the plugin react (e.g. convert an open SQLite library's codec)
+            self.action.on_dependency_changed(dep)
+        QMessageBox.information(self, _('Semantic search'), self._dep_done_message(dep))
+
+    def _dep_done_message(self, dep):
+        installed = self._dep_funcs[dep][0]()[0]
+        if dep == 'numpy':
+            return (
+                _('numpy was installed successfully.\n\nRestart calibre to enable fast SQLite search.')
+                if installed
+                else _("numpy was uninstalled from calibre's Python.\n\nThis session is unaffected; after a restart, "
+                      'SQLite search falls back to the slower pure-Python path until it is reinstalled.')
+            )
+        if dep == 'zstandard':
+            return (
+                _('zstandard was installed successfully.\n\nOpen SQLite libraries using zlib compression will be '
+                  'converted to zstd automatically (a short migration runs before indexing).')
+                if installed
+                else _("zstandard was uninstalled from calibre's Python.\n\nThe open library (if any) is being "
+                      'converted to zlib compression so it stays readable after a restart.')
+            )
+        return (
+            _('lancedb was installed successfully.\n\nRestart calibre to use the LanceDB backend.')
+            if installed
+            else _("lancedb was uninstalled from calibre's Python.\n\nLibraries that store their data in LanceDB "
+                   'will be blocked until it is reinstalled.')
+        )
 
     def closeEvent(self, ev):
         w = self._worker
@@ -431,7 +535,7 @@ class SettingsWidget(QDialog):
             r = QMessageBox.question(
                 self,
                 _('Semantic search'),
-                _('lancedb is still being installed. Close the dialog anyway?'),
+                _('A package operation is still running. Close the dialog anyway?'),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -484,3 +588,9 @@ class SettingsWidget(QDialog):
 
     def settings(self) -> Settings:
         return getattr(self, '_result', self.s)
+
+    def backend_choice(self):
+        """Backend selected for the current library, or None when there was no library context."""
+        if self._lib_backend is None:
+            return None
+        return self.i_backend.currentText()

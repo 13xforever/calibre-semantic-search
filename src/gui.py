@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import threading
 
 from calibre.gui2.actions import InterfaceAction
@@ -18,8 +17,14 @@ from qt.core import (
     pyqtSignal,
 )
 
-from .store import VectorStore
-from .utils import install_numpy, load_settings, numpy_status, save_settings
+from .store import (
+    BACKEND_KEY,
+    MIGRATE_KEY,
+    MetaStore,
+    MissingDependencyError,
+    VectorStore,
+)
+from .utils import load_settings, save_settings
 
 
 def _plugin_icon(name):
@@ -123,6 +128,9 @@ class StatusDialog(QDialog):
         icon = self.action._pause_icon(paused)
         if icon is not None:
             self.pause_btn.setIcon(icon)
+        ft = getattr(self.action, '_finalize_thread', None)
+        busy = ft is not None and ft.is_alive()
+        self.pause_btn.setEnabled(self.action.store is not None and not busy)
 
     def refresh(self):
         self._update_pause_button()
@@ -152,7 +160,8 @@ class SemanticSearchAction(InterfaceAction):
     _status_sig = pyqtSignal(object)
     _db_sig = pyqtSignal(object)  # (method, args, kwargs, threading.Event)
     _finalize_sig = pyqtSignal(object, object)  # (store, error-or-None)
-    _numpy_sig = pyqtSignal(object)  # (ok, message) from the background numpy install
+    _inplace_sig = pyqtSignal(object)  # (store, error-or-None, resume_after) from an in-session finalize
+    _finalize_prog_sig = pyqtSignal(object)  # (stage, detail) migration progress lines
 
     def __init__(self, parent, site_customization):
         super().__init__(parent, site_customization)
@@ -161,13 +170,21 @@ class SemanticSearchAction(InterfaceAction):
         self.search_action = None
         self._reconcile_thread = None
         self._finalize_thread = None
-        self._numpy_thread = None
         self._last_status = None
+        self._last_finalize = None  # (stage, detail) of the running/pending migration
+        self._blocked_dep = None  # package missing for this library ('lancedb'/'zstandard')
+        self._blocked_has_data = False
+        self._blocked_want = None
         self._status_dialog = None
+        self._search_menu_action = None
+        self._attrs_action = None
+        self._reindex_new_action = None
+        self._reindex_action = None
         self._status_sig.connect(self._on_status)
         self._db_sig.connect(self._on_db_write)
         self._finalize_sig.connect(self._on_finalize_done)
-        self._numpy_sig.connect(self._on_numpy_done)
+        self._inplace_sig.connect(self._on_inplace_done)
+        self._finalize_prog_sig.connect(self._on_finalize_progress)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -220,6 +237,7 @@ class SemanticSearchAction(InterfaceAction):
         m.addAction(self._pause_action)
         ac_attrs = self.create_action(spec=(_('Extract attributes...'), 'ai.png', _('Run LLM attribute extraction on indexed books'), None), attr='attrs')
         ac_attrs.triggered.connect(self.extract_attributes_menu)
+        self._attrs_action = ac_attrs
         m.addAction(ac_attrs)
         m.addSeparator()
         # && renders as a literal & in Qt action text (a single & would become a mnemonic)
@@ -228,9 +246,11 @@ class SemanticSearchAction(InterfaceAction):
             attr='reindex_new',
         )
         ac_reindex_new.triggered.connect(self.reindex_new_and_failed)
+        self._reindex_new_action = ac_reindex_new
         m.addAction(ac_reindex_new)
         ac_reindex = self.create_action(spec=(_('Re-index all books'), 'view-refresh.png', _('Queue every book for re-indexing'), None), attr='reindex')
         ac_reindex.triggered.connect(self.reindex_all)
+        self._reindex_action = ac_reindex
         m.addAction(ac_reindex)
         m.addSeparator()
         ac_settings = self.create_action(spec=(_('Settings'), 'config.png', _('Semantic search settings'), None), attr='settings')
@@ -242,7 +262,6 @@ class SemanticSearchAction(InterfaceAction):
     def initialization_complete(self):
         # called once at GUI startup; library_changed only fires on library switches
         # gui.search does not exist yet during genesis, so the search-bar icon goes here
-        self._ensure_numpy()
         try:
             sb = getattr(self.gui, 'search', None)
             if sb is not None and hasattr(sb, 'add_action'):
@@ -258,45 +277,6 @@ class SemanticSearchAction(InterfaceAction):
         self._apply_theme_icon()
         self._hook_palette_changes()
         self._start_for_library()
-
-    def _ensure_numpy(self):
-        # numpy is required for fast sqlite search but calibre does not bundle it;
-        # install it in the background on load when missing. store.py caches its
-        # import, so a calibre restart is needed to pick up a fresh install.
-        if self._numpy_thread is not None and self._numpy_thread.is_alive():
-            return
-        ok, _ver = numpy_status()
-        if ok:
-            return
-        t = threading.Thread(target=self._install_numpy_safe, name='SSNumpyInstall', daemon=True)
-        self._numpy_thread = t
-        t.start()
-
-    def _install_numpy_safe(self):
-        try:
-            ok, msg = install_numpy()
-        except Exception as e:
-            ok, msg = False, repr(e)
-        self._numpy_sig.emit((ok, msg))
-
-    def _on_numpy_done(self, payload):
-        ok, msg = payload
-        if ok:
-            from calibre.gui2 import info_dialog
-
-            info_dialog(self.gui, 'Semantic search', 'numpy was installed for fast vector search.\n\nRestart calibre to enable it.', show=True)
-        else:
-            from calibre.gui2 import error_dialog
-
-            error_dialog(
-                self.gui,
-                'Semantic search',
-                'numpy could not be installed automatically (sqlite search will be slow until it is available):\n\n'
-                + msg
-                + "\n\nInstall manually with calibre's own Python:\n    "
-                + f'{sys.executable} -m pip install numpy',
-                show=True,
-            )
 
     def _ensure_started(self) -> bool:
         if self.store is None:
@@ -329,20 +309,74 @@ class SemanticSearchAction(InterfaceAction):
         settings = self.get_settings()
         try:
             self.store = VectorStore(os.path.join(libdir, 'semantic-search.db'), backend=settings.vector_backend)
+        except MissingDependencyError as e:
+            # the library's stored data needs a package that is not installed; the
+            # store cannot be opened at all. Block until it is reinstalled (or the
+            # backend is switched in settings when no data is involved yet).
+            self._blocked_dep = e.dep
+            self._blocked_has_data = e.has_data
+            self._blocked_want = e.want_backend
+            if show_error:
+                from calibre.gui2 import error_dialog
+
+                error_dialog(self.gui, 'Semantic search', self._block_message(), show=True)
+            self.qaction.setToolTip(_('Indexing disabled: a required package is missing (see Settings)'))
+            self._update_action_availability()
+            return
         except Exception as e:
             if show_error:
                 from calibre.gui2 import error_dialog
 
                 error_dialog(self.gui, 'Semantic search', f'Failed to open the semantic search store:\n{e}', show=True)
             return
+        self._blocked_dep = None
+        self._blocked_has_data = False
+        self._blocked_want = None
         if self.store.needs_finalize():
-            # legacy chunk tables / pending schema work: migrate in the background
-            # (can take minutes on large libraries), then start the indexer
+            # legacy chunk tables / pending schema work (backend switch, codec
+            # change): migrate in the background (can take minutes on large
+            # libraries), then start the indexer
+            self._last_finalize = None
             t = threading.Thread(target=self._finalize_safe, args=(self.store,), name='SSFinalize', daemon=True)
             self._finalize_thread = t
             t.start()
+            self._update_action_availability()
             return
         self._begin_indexing()
+        self._update_action_availability()
+
+    def _block_message(self):
+        if self._blocked_dep == 'lancedb':
+            if self._blocked_has_data:
+                return (
+                    "This library's search data is stored with the LanceDB backend, but the 'lancedb' package is not installed.\n\n"
+                    'Install it from the Semantic search settings (Dependencies tab) to make this library readable again.'
+                )
+            return (
+                "This library would use the LanceDB backend, but the 'lancedb' package is not installed.\n\n"
+                'Install it from the Semantic search settings (Dependencies tab), or switch this library to the SQLite backend there.'
+            )
+        if self._blocked_dep == 'zstandard':
+            return (
+                "This library's chunk text is zstd-compressed, but the 'zstandard' package is not installed.\n\n"
+                "Re-install it from the Semantic search settings (Dependencies tab), or switch this library to a state that does not need it there."
+            )
+        return f'The {self._blocked_dep} package is required for this library but is not installed.'
+
+    def _update_action_availability(self):
+        """Enable/disable the indexing-related actions while blocked or migrating."""
+        ft = getattr(self, '_finalize_thread', None)
+        busy = ft is not None and ft.is_alive()
+        enabled = self.store is not None and not busy
+        for act in (self._search_menu_action, self._pause_action, self._attrs_action, self._reindex_new_action, self._reindex_action):
+            if act is not None:
+                act.setEnabled(enabled)
+        if self.search_action is not None:
+            self.search_action.setEnabled(enabled)
+
+    def _on_finalize_progress(self, payload):
+        # called from the finalize thread via signal; (stage, detail)
+        self._last_finalize = payload
 
     def _begin_indexing(self):
         from .indexer import Indexer
@@ -368,10 +402,14 @@ class SemanticSearchAction(InterfaceAction):
 
     def _finalize_safe(self, store):
         try:
-            store.finalize_schema()
+            store.finalize_schema(progress=self._emit_finalize_progress)
             self._finalize_sig.emit(store, None)
         except Exception as e:
             self._finalize_sig.emit(store, e)
+
+    def _emit_finalize_progress(self, stage, detail):
+        # called from the finalize thread; marshal to the GUI thread via signal
+        self._finalize_prog_sig.emit((stage, detail))
 
     def _on_finalize_done(self, store, error):
         if store is not self.store:
@@ -387,6 +425,47 @@ class SemanticSearchAction(InterfaceAction):
             )
             return
         self._begin_indexing()
+        self._update_action_availability()
+
+    def _inplace_finalize_safe(self, store, resume_after):
+        # dependency install/uninstall changed what the sqlite codec can be: convert
+        # in place. Indexing was paused by the caller if it was running.
+        try:
+            store.finalize_schema(progress=self._emit_finalize_progress)
+            self._inplace_sig.emit((store, None, resume_after))
+        except Exception as e:
+            self._inplace_sig.emit((store, e, resume_after))
+
+    def _on_inplace_done(self, payload):
+        store, error, resume_after = payload
+        if store is not self.store:
+            return  # library switched mid-way; the new startup owns things now
+        if resume_after and self.indexer is not None and self.indexer.paused:
+            self.indexer.resume()
+        if error is not None:
+            from calibre.gui2 import error_dialog
+
+            error_dialog(self.gui, 'Semantic search', f'Updating the search database failed:\n{error!r}', show=True)
+            return
+        self._update_action_availability()
+
+    def on_dependency_changed(self, dep):
+        """Called from the settings dialog after a package was installed/uninstalled."""
+        import importlib
+
+        importlib.invalidate_caches()
+        # A zstandard change affects an open sqlite library's text codec: convert it
+        # in place now (the in-process module still works on uninstall, and the DB
+        # must be readable without the package after a restart). Pause indexing for
+        # the duration so no insert races the codec swap.
+        if dep == 'zstandard' and self.store is not None and self.store.backend_name == 'sqlite':
+            idx = self.indexer
+            resume_after = idx is not None and not idx.paused
+            if resume_after:
+                idx.pause()
+            t = threading.Thread(target=self._inplace_finalize_safe, args=(self.store, resume_after), name='SSFinalize', daemon=True)
+            self._finalize_thread = t
+            t.start()
 
     def library_changed(self, db):
         self._start_for_library()
@@ -470,9 +549,70 @@ class SemanticSearchAction(InterfaceAction):
 
         from .config_widget import SettingsWidget
 
-        w = SettingsWidget(self.get_settings())
+        # per-library backend context for the dialog: where this library's data
+        # lives (or would live), even when the store is currently blocked
+        lib_backend = None
+        if self.store is not None:
+            lib_backend = self.store.want_backend
+        elif self._blocked_dep is not None:
+            lib_backend = self._blocked_want
+        w = SettingsWidget(
+            self.get_settings(),
+            action=self,
+            library_backend=lib_backend,
+            blocked_dep=self._blocked_dep,
+            blocked_has_data=self._blocked_has_data,
+        )
         if w.exec() == 1:
             save_settings(gprefs, w.settings())
+            self._apply_library_backend(w)
+
+    def _apply_library_backend(self, w):
+        """Apply the backend chosen in settings to the current library.
+
+        The choice is written per-library (meta key) and takes effect on the next
+        open; if data must move, the migration runs in the background before
+        indexing starts.
+        """
+        choice = w.backend_choice()
+        if choice is None:
+            return  # no library context: only the global default changed
+        cur = self.store.want_backend if self.store is not None else self._blocked_want
+        if choice == cur:
+            return
+        ft = getattr(self, '_finalize_thread', None)
+        if ft is not None and ft.is_alive():
+            from calibre.gui2 import info_dialog
+
+            info_dialog(
+                self.gui,
+                'Semantic search',
+                'A database migration is already running. The backend change will apply after it finishes (or on the next restart).',
+                show=True,
+            )
+            return
+        try:
+            if self.store is not None:
+                self.store.set_meta(BACKEND_KEY, choice)
+                # abandon any in-flight transfer/recompress: the data moves as-is
+                self.store.delete_meta(MIGRATE_KEY)
+            else:
+                # blocked without an open store: write the meta directly so the
+                # next open can proceed (only reachable when no data is involved)
+                db = self.gui.current_db
+                libdir = os.path.dirname(db.backend.dbpath)
+                ms = MetaStore(os.path.join(libdir, 'semantic-search.db'))
+                try:
+                    ms.set_meta(BACKEND_KEY, choice)
+                    ms.delete_meta(MIGRATE_KEY)
+                finally:
+                    ms.close()
+        except Exception as e:
+            from calibre.gui2 import error_dialog
+
+            error_dialog(self.gui, 'Semantic search', f'Could not change this library\'s backend:\n{e}', show=True)
+            return
+        self._start_for_library()  # reopens and runs the migration in the background
 
     def open_dialog(self):
         if not self._ensure_started():
@@ -507,6 +647,11 @@ class SemanticSearchAction(InterfaceAction):
 
     def status_lines(self):
         if self.store is None:
+            if self._blocked_dep is not None:
+                lines = ['Store not started.', '']
+                for ln in self._block_message().splitlines():
+                    lines.append(ln)
+                return lines
             return ['Store not started.']
         books = self.store.indexed_books()
         dirty = self.store.dirty_book_ids()
@@ -523,7 +668,8 @@ class SemanticSearchAction(InterfaceAction):
         lines.append(f'Total chunks: {n_chunks}')
         ft = getattr(self, '_finalize_thread', None)
         if ft is not None and ft.is_alive():
-            lines.append('Migrating search database (first start after an upgrade; can take a while on large libraries)')
+            detail = self._last_finalize[1] if self._last_finalize else 'in progress'
+            lines.append(f'Migrating search database: {detail} (can take a while on large libraries)')
         st = self._last_status
         if st and st.get('state') == 'paused':
             lines.append(_('Indexing paused (use the menu to resume)'))

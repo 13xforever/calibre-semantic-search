@@ -67,7 +67,7 @@ DEFAULT_ATTRIBUTES = (
 @dataclass
 class Settings:
     embed: EmbedSettings = field(default_factory=EmbedSettings)
-    vector_backend: str = 'auto'  # auto | sqlite | lancedb
+    vector_backend: str = 'sqlite'  # default backend for NEW libraries (a library's actual choice is stored in its store meta)
     format_priority: list[str] = field(default_factory=lambda: list(DEFAULT_FORMAT_PRIORITY))
     target_chars: int = 1000
     overlap_chars: int = 150
@@ -93,6 +93,10 @@ def _settings_from_dict(data: dict[str, Any]) -> Settings:
     for key in ('vector_backend', 'format_priority', 'target_chars', 'overlap_chars', 'embed_context_tokens', 'max_chunks_per_book', 'search_min_score', 'attr_mode', 'attr_context_tokens', 'auto_extract_attributes'):
         if key in data:
             setattr(ans, key, data[key])
+    if ans.vector_backend == 'auto':
+        # legacy global value; per-library backend now lives in the store meta, so the
+        # global is only a default for new libraries and must be an explicit choice
+        ans.vector_backend = 'sqlite'
     attrs = data.get('attributes')
     if isinstance(attrs, list):
         merged = []
@@ -147,6 +151,10 @@ def lancedb_status() -> tuple[bool, str]:
 
 def pip_install_command(package: str = 'lancedb', extra_args=()) -> list[str]:
     return [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *extra_args, package]
+
+
+def pip_uninstall_command(package: str = 'lancedb') -> list[str]:
+    return [sys.executable, '-m', 'pip', 'uninstall', '-y', '--disable-pip-version-check', package]
 
 
 def _interpreter_note() -> str:
@@ -210,6 +218,34 @@ def _pip_install(package: str, progress=None, _popen=None) -> tuple[bool, str]:
     return False, f'{last_err}\n\n{_interpreter_note()}'
 
 
+def _pip_uninstall(package: str, progress=None, _popen=None) -> tuple[bool, str]:
+    """Shared pip uninstaller. Single attempt (no --user fallback for uninstall).
+    progress(line) receives pip output lines; returns (ok, message)."""
+    popen = _popen or subprocess.Popen
+    cmd = pip_uninstall_command(package)
+    try:
+        proc = popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+    except Exception as e:
+        return False, f'{type(e).__name__}: {e}\ncommand: {" ".join(cmd)}\n\n{_interpreter_note()}'
+    tail: list[str] = []
+    for line in proc.stdout:
+        line = line.rstrip()
+        if progress is not None and line:
+            progress(line)
+        if line:
+            tail.append(line)
+            if len(tail) > 12:
+                tail.pop(0)
+    rc = proc.wait()
+    if rc == 0:
+        return True, f'{package} uninstalled.'
+    if tail:
+        last_err = '\n'.join(tail)
+    else:
+        last_err = f'pip exited with code {rc} and produced no output\ncommand: {" ".join(cmd)}'
+    return False, f'{last_err}\n\n{_interpreter_note()}'
+
+
 def install_lancedb(progress=None, _popen=None) -> tuple[bool, str]:
     """Install lancedb into calibre's own Python via pip (see _pip_install)."""
     return _pip_install('lancedb', progress, _popen)
@@ -243,3 +279,18 @@ def numpy_status() -> tuple[bool, str]:
 def install_numpy(progress=None, _popen=None) -> tuple[bool, str]:
     """Install numpy into calibre's own Python via pip (see _pip_install)."""
     return _pip_install('numpy', progress, _popen)
+
+
+def uninstall_lancedb(progress=None, _popen=None) -> tuple[bool, str]:
+    """Uninstall lancedb from calibre's own Python via pip (see _pip_uninstall)."""
+    return _pip_uninstall('lancedb', progress, _popen)
+
+
+def uninstall_zstandard(progress=None, _popen=None) -> tuple[bool, str]:
+    """Uninstall zstandard from calibre's own Python via pip (see _pip_uninstall)."""
+    return _pip_uninstall('zstandard', progress, _popen)
+
+
+def uninstall_numpy(progress=None, _popen=None) -> tuple[bool, str]:
+    """Uninstall numpy from calibre's own Python via pip (see _pip_uninstall)."""
+    return _pip_uninstall('numpy', progress, _popen)
