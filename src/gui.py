@@ -176,7 +176,6 @@ class SemanticSearchAction(InterfaceAction):
         self._blocked_has_data = False
         self._blocked_want = None
         self._status_dialog = None
-        self._search_menu_action = None
         self._attrs_action = None
         self._reindex_new_action = None
         self._reindex_action = None
@@ -195,8 +194,6 @@ class SemanticSearchAction(InterfaceAction):
         icon = _plugin_icon('semantic_search.png')
         if icon is not None:
             self.qaction.setIcon(icon)
-            if getattr(self, '_search_menu_action', None) is not None:
-                self._search_menu_action.setIcon(icon)
             if self.search_action is not None:
                 self.search_action.setIcon(icon)
         # Qt's standard media icons (pause/resume) are generated from the active
@@ -222,10 +219,6 @@ class SemanticSearchAction(InterfaceAction):
         assert m is not None
         # main button click opens the search dialog; the arrow shows this menu
         self.qaction.triggered.connect(self.open_dialog)
-        ac_search = self.create_action(spec=(_('Search...'), 'semantic_search.png', _('Open the semantic search dialog'), None), attr='search')
-        self._search_menu_action = ac_search
-        ac_search.triggered.connect(self.open_dialog)
-        m.addAction(ac_search)
         ac_status = self.create_action(spec=(_('Index status'), 'book.png', _('Show indexing status'), None), attr='status')
         ac_status.triggered.connect(self.show_status)
         m.addAction(ac_status)
@@ -368,7 +361,7 @@ class SemanticSearchAction(InterfaceAction):
         ft = getattr(self, '_finalize_thread', None)
         busy = ft is not None and ft.is_alive()
         enabled = self.store is not None and not busy
-        for act in (self._search_menu_action, self._pause_action, self._attrs_action, self._reindex_new_action, self._reindex_action):
+        for act in (self._pause_action, self._attrs_action, self._reindex_new_action, self._reindex_action):
             if act is not None:
                 act.setEnabled(enabled)
         if self.search_action is not None:
@@ -654,10 +647,20 @@ class SemanticSearchAction(InterfaceAction):
                 return lines
             return ['Store not started.']
         books = self.store.indexed_books()
-        dirty = self.store.dirty_book_ids()
         n_chunks = sum(b['n_chunks'] for b in books)
         api = self._api()
         lines = []
+        st = self._last_status
+        if st and st.get('state') == 'paused':
+            lines.append(_('Indexing paused'))
+        elif st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
+            if st.get('state') == 'attributes':
+                line = f"Extracting attributes ({st.get('done')}/{st.get('total')}): {self._book_label(st.get('book_id'), api)}"
+            else:
+                line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
+                if st.get('total'):
+                    line += f" {st.get('done')}/{st.get('total')}"
+            lines.append(line)
         if api is not None:
             try:
                 lines.append(f'Books indexed: {len(books)}/{len(api.all_book_ids())}')
@@ -670,17 +673,6 @@ class SemanticSearchAction(InterfaceAction):
         if ft is not None and ft.is_alive():
             detail = self._last_finalize[1] if self._last_finalize else 'in progress'
             lines.append(f'Migrating search database: {detail} (can take a while on large libraries)')
-        st = self._last_status
-        if st and st.get('state') == 'paused':
-            lines.append(_('Indexing paused (use the menu to resume)'))
-        elif st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
-            if st.get('state') == 'attributes':
-                line = f"Extracting attributes ({st.get('done')}/{st.get('total')}): {self._book_label(st.get('book_id'), api)}"
-            else:
-                line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
-                if st.get('total'):
-                    line += f" {st.get('done')}/{st.get('total')}"
-            lines.append(line)
         try:
             settings = self.get_settings()
             from .attributes import pending_attribute_books
@@ -691,7 +683,6 @@ class SemanticSearchAction(InterfaceAction):
             lines.append(f'Attributes stored: {done_attrs}/{len(with_chunks)} books')
         except Exception:
             pass
-        lines.append(f'Pending: {len(dirty)}')
         import json
 
         try:
@@ -937,7 +928,6 @@ class SemanticSearchAction(InterfaceAction):
             failed = set(json.loads(self.store.get_meta('failed', '{}') or '{}').keys())
         except Exception:
             failed = set()
-        queued = 0
         for bid in sorted(api.all_book_ids()):
             if bid in indexed and str(bid) not in failed:
                 continue  # already indexed without error -> skip
@@ -948,13 +938,6 @@ class SemanticSearchAction(InterfaceAction):
             if fmt is None:
                 continue
             self.store.add_dirty(bid, 'reindex')
-            queued += 1
-        from calibre.gui2 import info_dialog
-
-        if queued:
-            info_dialog(self.gui, _('Semantic search'), f'Queued {queued} book(s) for (re-)indexing.', show=True)
-        else:
-            info_dialog(self.gui, _('Semantic search'), 'Nothing to do: every book is already indexed without errors.', show=True)
 
     def reindex_all(self):
         if not self._ensure_started():
@@ -970,7 +953,6 @@ class SemanticSearchAction(InterfaceAction):
             'Re-index ALL books?\n\n'
             'This queues every book in the library for re-indexing, re-reading and re-embedding all of them. '
             'It can take a long time and uses many embedding API calls.',
-            show=True,
         )
         if not ok:
             return

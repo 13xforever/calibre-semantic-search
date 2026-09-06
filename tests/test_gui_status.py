@@ -117,18 +117,20 @@ class TestStatusLines(unittest.TestCase):
         # Regression: status_lines once referenced `lines` before it was assigned.
         lines = _status_lines(FakeApi())
         self.assertTrue(lines, 'expected at least one line')
-        self.assertEqual(lines[0], 'Books indexed: 2/3')
-        self.assertTrue(lines[1].startswith('Total chunks:'))
-        # live "Extracting attributes" line must precede the "Attributes stored" total
+        # the live action line comes first
+        self.assertEqual(lines[0], 'Extracting attributes (7/19): book 5')
+        self.assertEqual(lines[1], 'Books indexed: 2/3')
+        self.assertTrue(lines[2].startswith('Total chunks:'))
+        # the "Attributes stored" total still comes after the live line
         extract = next(i for i, l in enumerate(lines) if l.startswith('Extracting attributes'))
         stored = next(i for i, l in enumerate(lines) if l.startswith('Attributes stored'))
         self.assertLess(extract, stored)
-        # pending count is the last line
-        self.assertTrue(lines[-1].startswith('Pending:'))
+        # no queue-length line: the done/total on the action line covers it
+        self.assertFalse(any(l.startswith('Pending:') for l in lines))
 
     def test_no_api_falls_back_to_indexed(self):
         lines = _status_lines(None)
-        self.assertEqual(lines[0], 'Indexed books: 2')
+        self.assertEqual(lines[1], 'Indexed books: 2')
 
 
 class _FakeIconSink:
