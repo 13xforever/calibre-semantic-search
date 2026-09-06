@@ -4,4 +4,5 @@
 ruff         # lint step: pyflakes + isort rules (config in ruff.toml)
 lancedb      # hard test dependency - the lancedb backend tests must run, not skip
 lxml==6.1.1  # exact version calibre 9.14 bundles; the chunker's HTML walk runs against it in tests too (keep in sync when calibre updates it)
+numpy        # optional at runtime (pure-Python fallback), but needed here to exercise the numpy paths in tests; calibre does not bundle it (the plugin auto-installs it on load)
 zstandard    # zstd text codec; without it every fresh store tries a pip install and falls back to zlib

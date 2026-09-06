@@ -1,6 +1,7 @@
 import importlib.util
 import os as _os
 import sys as _sys
+import threading
 import types
 import unittest
 
@@ -387,6 +388,208 @@ class TestBookDetailsMenuHook(unittest.TestCase):
         gui.SemanticSearchAction._unhook_book_details_menu(a)
         self.assertIs(bd.details_context_menu_event, orig)
         self.assertFalse(hasattr(bd, '_ss_hooked'))
+
+
+class _FakeIndexer:
+    def __init__(self):
+        self._p = False
+
+    @property
+    def paused(self):
+        return self._p
+
+    def pause(self):
+        self._p = True
+
+    def resume(self):
+        self._p = False
+
+
+class TestPausePersistence(unittest.TestCase):
+    def _action(self, meta=None, indexer=None):
+        a = object.__new__(gui.SemanticSearchAction)
+        stored = dict(meta or {})
+        calls = []
+
+        def get_meta(k, d=None):
+            return stored.get(k, d)
+
+        def set_meta(k, v):
+            calls.append((k, v))
+            stored[k] = v
+
+        a.store = types.SimpleNamespace(get_meta=get_meta, set_meta=set_meta)
+        a.indexer = indexer
+        seen = []
+        a._set_pause_label = lambda p: seen.append(p)
+        return a, calls, seen
+
+    def test_default_is_paused_when_key_absent(self):
+        # fresh DB or one migrated from an older version: no key -> paused
+        a, _, _ = self._action()
+        self.assertTrue(gui.SemanticSearchAction._paused_from_store(a))
+
+    def test_stored_state_respected(self):
+        a, _, _ = self._action(meta={'indexing_status': 'running'})
+        self.assertFalse(gui.SemanticSearchAction._paused_from_store(a))
+        b, _, _ = self._action(meta={'indexing_status': 'paused'})
+        self.assertTrue(gui.SemanticSearchAction._paused_from_store(b))
+
+    def test_resume_persists_running(self):
+        ix = _FakeIndexer()
+        ix.pause()
+        a, calls, seen = self._action(indexer=ix)
+        gui.SemanticSearchAction.toggle_pause(a)
+        self.assertFalse(ix.paused)
+        self.assertEqual(calls, [('indexing_status', 'running')])
+        self.assertEqual(seen, [False])
+
+    def test_pause_persists_paused(self):
+        ix = _FakeIndexer()
+        a, calls, seen = self._action(indexer=ix)
+        gui.SemanticSearchAction.toggle_pause(a)
+        self.assertTrue(ix.paused)
+        self.assertEqual(calls, [('indexing_status', 'paused')])
+        self.assertEqual(seen, [True])
+
+    def test_no_indexer_is_a_noop(self):
+        a, calls, seen = self._action(indexer=None)
+        gui.SemanticSearchAction.toggle_pause(a)
+        self.assertEqual(calls, [])
+        self.assertEqual(seen, [])
+
+
+class _FakeButton:
+    def __init__(self):
+        self.text = ''
+        self.icon = None
+        self.clicked = _FakeSignal()
+
+    def setText(self, t):
+        self.text = t
+
+    def setIcon(self, ic):
+        self.icon = ic
+
+
+class _FakeDialogAction:
+    def __init__(self, paused):
+        self.indexer = types.SimpleNamespace(paused=paused)
+        self.toggle_calls = 0
+
+    def toggle_pause(self):
+        self.toggle_calls += 1
+        self.indexer.paused = not self.indexer.paused
+
+    def _pause_icon(self, paused):
+        return f'icon-{paused}'
+
+
+class TestStatusDialogPauseButton(unittest.TestCase):
+    def _dialog(self, action):
+        d = object.__new__(gui.StatusDialog)
+        d.action = action
+        d.pause_btn = _FakeButton()
+        return d
+
+    def test_button_shows_pause_when_running(self):
+        d = self._dialog(_FakeDialogAction(paused=False))
+        gui.StatusDialog._update_pause_button(d)
+        self.assertEqual(d.pause_btn.text, 'Pause indexing')
+        self.assertEqual(d.pause_btn.icon, 'icon-False')
+
+    def test_button_shows_resume_when_paused(self):
+        d = self._dialog(_FakeDialogAction(paused=True))
+        gui.StatusDialog._update_pause_button(d)
+        self.assertEqual(d.pause_btn.text, 'Resume indexing')
+        self.assertEqual(d.pause_btn.icon, 'icon-True')
+
+    def test_no_indexer_treated_as_running(self):
+        action = _FakeDialogAction(paused=False)
+        action.indexer = None
+        d = self._dialog(action)
+        gui.StatusDialog._update_pause_button(d)
+        self.assertEqual(d.pause_btn.text, 'Pause indexing')
+
+    def test_toggle_delegates_and_updates(self):
+        action = _FakeDialogAction(paused=False)
+        d = self._dialog(action)
+        gui.StatusDialog.toggle_pause(d)
+        self.assertEqual(action.toggle_calls, 1)
+        self.assertTrue(action.indexer.paused)
+        self.assertEqual(d.pause_btn.text, 'Resume indexing')
+
+
+class TestNumpyEnsure(unittest.TestCase):
+    def _action(self):
+        a = object.__new__(gui.SemanticSearchAction)
+        a._numpy_thread = None
+        a.emitted = []
+        a._numpy_sig = types.SimpleNamespace(emit=a.emitted.append)
+        return a
+
+    def _patch(self, installed, install_result):
+        self._orig = (gui.numpy_status, gui.install_numpy)
+        gui.numpy_status = lambda: (installed, '2.3.0' if installed else 'no numpy')
+        calls = []
+        gui.install_numpy = lambda *a, **k: (calls.append(1), install_result)[1]
+        return calls
+
+    def _restore(self):
+        gui.numpy_status, gui.install_numpy = self._orig
+
+    def test_present_does_nothing(self):
+        calls = self._patch(True, None)
+        a = self._action()
+        try:
+            a._ensure_numpy()
+        finally:
+            self._restore()
+        self.assertEqual(calls, [])
+        self.assertIsNone(a._numpy_thread)
+
+    def test_missing_installs_in_background_and_reports(self):
+        calls = self._patch(False, (True, 'numpy installed.'))
+        a = self._action()
+        try:
+            a._ensure_numpy()
+            self.assertIsNotNone(a._numpy_thread)
+            a._numpy_thread.join(timeout=5)
+        finally:
+            self._restore()
+        self.assertEqual(calls, [1])
+        self.assertEqual(a.emitted, [(True, 'numpy installed.')])
+
+    def test_missing_install_failure_reported(self):
+        self._patch(False, (False, 'pip boom'))
+        a = self._action()
+        try:
+            a._ensure_numpy()
+            a._numpy_thread.join(timeout=5)
+        finally:
+            self._restore()
+        self.assertEqual(a.emitted, [(False, 'pip boom')])
+
+    def test_no_restart_while_running(self):
+        gate = threading.Event()
+        self._orig = (gui.numpy_status, gui.install_numpy)
+        gui.numpy_status = lambda: (False, 'no numpy')
+
+        def slow_install(*a, **k):
+            gate.wait(timeout=5)
+            return True, 'numpy installed.'
+
+        gui.install_numpy = slow_install
+        a = self._action()
+        try:
+            a._ensure_numpy()
+            first = a._numpy_thread
+            a._ensure_numpy()
+            self.assertIs(a._numpy_thread, first)
+        finally:
+            gate.set()
+            self._restore()
+            a._numpy_thread.join(timeout=5)
 
 
 if __name__ == '__main__':

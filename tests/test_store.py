@@ -3,6 +3,7 @@ import importlib.util
 import math
 import os
 import os as _os
+import random
 import sqlite3
 import sys as _sys
 import tempfile
@@ -476,6 +477,80 @@ class TestDefaultDictLoading(unittest.TestCase):
         with open(store.DEFAULT_DICT_PATH, 'rb') as f:
             expected = f.read()
         self.assertEqual(store._load_default_dict(), expected)
+
+
+class TestNumpyFallbackEquivalence(unittest.TestCase):
+    """The numpy paths and the pure-Python fallbacks must produce the same results
+    on the same data (store.np is patched to force each path; real dim 4096)."""
+
+    def setUp(self):
+        import numpy
+
+        self.np = numpy
+        self._saved_np = store.np
+
+    def tearDown(self):
+        store.np = self._saved_np
+
+    def _vectors(self, n, dim, seed=7):
+        rnd = random.Random(seed)
+        return [[rnd.random() for _ in range(dim)] for _ in range(n)]
+
+    def test_vec_to_blob_identical(self):
+        vecs = self._vectors(16, 4096)
+        store.np = self.np
+        blobs_np = [store.vec_to_blob(v) for v in vecs]
+        store.np = None
+        blobs_py = [store.vec_to_blob(v) for v in vecs]
+        self.assertEqual(blobs_np, blobs_py)
+
+    def test_blob_to_vec_identical(self):
+        vecs = self._vectors(8, 4096)
+        store.np = None
+        blobs = [store.vec_to_blob(v) for v in vecs]
+        store.np = self.np
+        got_np = [list(map(float, store.blob_to_vec(b))) for b in blobs]
+        store.np = None
+        got_py = [store.blob_to_vec(b) for b in blobs]
+        self.assertEqual(got_np, got_py)
+
+    def test_l2_normalize_equivalent(self):
+        vecs = self._vectors(8, 4096)
+        store.np = self.np
+        norm_np = [list(map(float, store.l2_normalize(v))) for v in vecs]
+        store.np = None
+        norm_py = [store.l2_normalize(v) for v in vecs]
+        for a, b in zip(norm_np, norm_py):
+            self.assertEqual(len(a), len(b))
+            for x, y in zip(a, b):
+                self.assertAlmostEqual(x, y, delta=1e-6)
+        for lst in norm_np + norm_py:
+            self.assertAlmostEqual(math.sqrt(sum(x * x for x in lst)), 1.0, places=5)
+
+    def test_l2_normalize_zero_vector(self):
+        store.np = self.np
+        z_np = list(map(float, store.l2_normalize([0.0] * 8)))
+        store.np = None
+        z_py = store.l2_normalize([0.0] * 8)
+        self.assertEqual(z_np, [0.0] * 8)
+        self.assertEqual(z_py, [0.0] * 8)
+
+    def test_score_rows_equivalent(self):
+        backend = object.__new__(store.SqliteVectorBackend)  # _score_rows does not use self
+        dim = 4096
+        vecs = self._vectors(256, dim)
+        qv_src = self._vectors(1, dim, seed=99)[0]
+        # stored vectors are unit-norm in production (normalized at insert time),
+        # so scores land in [-1, 1] and both paths agree to float32 precision
+        store.np = None
+        rows = [(i, store.vec_to_blob(store.l2_normalize(v))) for i, v in enumerate(vecs)]  # last column is the vector blob
+        store.np = self.np
+        scores_np = backend._score_rows(rows, store.l2_normalize(qv_src))
+        store.np = None
+        scores_py = backend._score_rows(rows, store.l2_normalize(qv_src))
+        self.assertEqual(len(scores_np), len(scores_py))
+        for a, b in zip(scores_np, scores_py):
+            self.assertAlmostEqual(a, b, delta=1e-5)
 
 
 if __name__ == '__main__':

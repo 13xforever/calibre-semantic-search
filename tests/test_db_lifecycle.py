@@ -153,6 +153,9 @@ class _LifecycleOps:
         self.assertIn(904, s.dirty_book_ids())
         s.remove_dirty(904)
         self.assertNotIn(904, s.dirty_book_ids())
+        # -- persisted indexing status --------------------------------------------------------
+        s.set_meta('indexing_status', 'running')
+        self.assertEqual(s.get_meta('indexing_status'), 'running')
         # -- file info -----------------------------------------------------------------------
         s.set_file_info(901, 'EPUB', 123456, 1788528000)
         fi = s.get_file_info(901)
@@ -185,6 +188,7 @@ class _LifecycleOps:
         self.assertEqual(s.get_attrs(903), {})
         self.assertNotIn(904, s.dirty_book_ids())
         self.assertNotIn(901, s.file_info_book_ids())
+        self.assertEqual(s.get_meta('indexing_status'), 'running')
 
 
 class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
@@ -253,6 +257,8 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
         self.assertEqual(s.meta_keys('fileinfo:'), [])
         self.assertEqual(sorted(s.dirty_book_ids()), [50, 51])
         self.assertEqual(s.get_attrs(1), {'title': 'Legacy Book One'})
+        # migrated DB has no stored pause state -> starts paused by default
+        self.assertEqual(s.get_meta('indexing_status', 'paused'), 'paused')
         reg = {b['id']: b for b in s.indexed_books()}
         self.assertEqual(set(reg), {1, 2, 3})
         self.assertEqual((reg[1]['fmt'], reg[1]['n_chunks'], reg[1]['model']), ('EPUB', 2, 'legacy_embedding_8b'))
@@ -315,6 +321,8 @@ class TestSqliteFresh(_LifecycleOps, unittest.TestCase):
         self.assertEqual(uv, store.SCHEMA_VERSION)
         self.assertEqual(av, 2)
         self.assertFalse(s.needs_finalize())
+        # fresh DB has no stored pause state -> starts paused by default
+        self.assertEqual(s.get_meta('indexing_status', 'paused'), 'paused')
 
         self._run_ops(s)
 
@@ -346,6 +354,8 @@ class TestLanceDb(_LifecycleOps, unittest.TestCase):
         self.s = s
         self.assertEqual(s.backend_name, 'lancedb')
         self.assertFalse(s.needs_finalize())
+        # lancedb keeps its meta in the same sqlite file -> same default
+        self.assertEqual(s.get_meta('indexing_status', 'paused'), 'paused')
 
         self._run_ops(s)
 

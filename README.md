@@ -126,13 +126,20 @@ What each dev dependency is for:
 - `lxml==6.1.1` — the exact version calibre 9.14 bundles; the chunker's HTML
   walk runs against it in tests just as it does inside calibre. Test-only:
   production gets lxml from calibre itself.
+- `numpy` — makes vector search in the sqlite backend ~36x faster. Optional at
+  runtime (a pure-Python fallback exists) but calibre does not bundle it, so the
+  plugin checks on load and installs it in the background when missing; in this
+  venv it is also needed to exercise the numpy code paths in tests (it arrives
+  via lancedb's own dependencies too).
 - `zstandard` — the zstd text codec; without it every fresh store attempts a pip
   install at runtime and falls back to zlib.
 
 The plugin itself needs none of these to *run* inside calibre: it ships exactly
-`src/` (no manifest) and uses the stdlib plus lxml, which calibre bundles.
-lancedb/zstandard are optional at runtime (the Settings dialog can install
-lancedb for you; zstandard is installed automatically when first needed).
+`src/` (no manifest) and uses the stdlib plus lxml (bundled by calibre). numpy
+is optional — checked on plugin load and installed in the background when
+missing; without it search falls back to a slower pure-Python path. lancedb/
+zstandard are optional at runtime too (the Settings dialog can install lancedb
+for you; zstandard is installed automatically when first needed).
 
 Individual steps (same venv interpreter):
 `.venv\Scripts\python dev.py compile | lint | test | build`.

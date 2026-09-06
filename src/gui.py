@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 
 from calibre.gui2.actions import InterfaceAction
@@ -18,7 +19,7 @@ from qt.core import (
 )
 
 from .store import VectorStore
-from .utils import load_settings, save_settings
+from .utils import install_numpy, load_settings, numpy_status, save_settings
 
 
 def _plugin_icon(name):
@@ -91,7 +92,7 @@ class StatusDialog(QDialog):
     def __init__(self, parent, action):
         super().__init__(parent)
         self.action = action
-        self.setWindowTitle(_('Semantic search status'))
+        self.setWindowTitle(_('Semantic search: indexing status'))
         self.resize(680, 440)
         lay = QVBoxLayout(self)
         self.text = QTextEdit()
@@ -100,14 +101,31 @@ class StatusDialog(QDialog):
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.accepted.connect(self.close)
         bb.rejected.connect(self.close)
+        # pause/resume lives in the dialog too, so it can be toggled without the menu;
+        # its label is kept current on every refresh (the state can change from the menu)
+        self.pause_btn = bb.addButton(_('Pause indexing'), QDialogButtonBox.ButtonRole.ActionRole)
+        self.pause_btn.clicked.connect(self.toggle_pause)
         lay.addWidget(bb)
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self.refresh)
+        self._update_pause_button()
         self.refresh()
         self.timer.start()
 
+    def toggle_pause(self):
+        self.action.toggle_pause()
+        self._update_pause_button()
+
+    def _update_pause_button(self):
+        paused = self.action.indexer is not None and self.action.indexer.paused
+        self.pause_btn.setText(_('Resume indexing') if paused else _('Pause indexing'))
+        icon = self.action._pause_icon(paused)
+        if icon is not None:
+            self.pause_btn.setIcon(icon)
+
     def refresh(self):
+        self._update_pause_button()
         try:
             text = '\n'.join(self.action.status_lines())
         except Exception as e:
@@ -134,6 +152,7 @@ class SemanticSearchAction(InterfaceAction):
     _status_sig = pyqtSignal(object)
     _db_sig = pyqtSignal(object)  # (method, args, kwargs, threading.Event)
     _finalize_sig = pyqtSignal(object, object)  # (store, error-or-None)
+    _numpy_sig = pyqtSignal(object)  # (ok, message) from the background numpy install
 
     def __init__(self, parent, site_customization):
         super().__init__(parent, site_customization)
@@ -142,11 +161,13 @@ class SemanticSearchAction(InterfaceAction):
         self.search_action = None
         self._reconcile_thread = None
         self._finalize_thread = None
+        self._numpy_thread = None
         self._last_status = None
         self._status_dialog = None
         self._status_sig.connect(self._on_status)
         self._db_sig.connect(self._on_db_write)
         self._finalize_sig.connect(self._on_finalize_done)
+        self._numpy_sig.connect(self._on_numpy_done)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -221,6 +242,7 @@ class SemanticSearchAction(InterfaceAction):
     def initialization_complete(self):
         # called once at GUI startup; library_changed only fires on library switches
         # gui.search does not exist yet during genesis, so the search-bar icon goes here
+        self._ensure_numpy()
         try:
             sb = getattr(self.gui, 'search', None)
             if sb is not None and hasattr(sb, 'add_action'):
@@ -236,6 +258,45 @@ class SemanticSearchAction(InterfaceAction):
         self._apply_theme_icon()
         self._hook_palette_changes()
         self._start_for_library()
+
+    def _ensure_numpy(self):
+        # numpy is required for fast sqlite search but calibre does not bundle it;
+        # install it in the background on load when missing. store.py caches its
+        # import, so a calibre restart is needed to pick up a fresh install.
+        if self._numpy_thread is not None and self._numpy_thread.is_alive():
+            return
+        ok, _ver = numpy_status()
+        if ok:
+            return
+        t = threading.Thread(target=self._install_numpy_safe, name='SSNumpyInstall', daemon=True)
+        self._numpy_thread = t
+        t.start()
+
+    def _install_numpy_safe(self):
+        try:
+            ok, msg = install_numpy()
+        except Exception as e:
+            ok, msg = False, repr(e)
+        self._numpy_sig.emit((ok, msg))
+
+    def _on_numpy_done(self, payload):
+        ok, msg = payload
+        if ok:
+            from calibre.gui2 import info_dialog
+
+            info_dialog(self.gui, 'Semantic search', 'numpy was installed for fast vector search.\n\nRestart calibre to enable it.', show=True)
+        else:
+            from calibre.gui2 import error_dialog
+
+            error_dialog(
+                self.gui,
+                'Semantic search',
+                'numpy could not be installed automatically (sqlite search will be slow until it is available):\n\n'
+                + msg
+                + "\n\nInstall manually with calibre's own Python:\n    "
+                + f'{sys.executable} -m pip install numpy',
+                show=True,
+            )
 
     def _ensure_started(self) -> bool:
         if self.store is None:
@@ -294,9 +355,12 @@ class SemanticSearchAction(InterfaceAction):
             status_cb=self._status_sig.emit,
             attr_writer=_GuiDbProxy(self, get_api),
         )
+        # the pause state is persisted per database; a DB without the key (fresh, or
+        # migrated from an older version) starts paused so indexing never begins uninvited
+        if self._paused_from_store():
+            self.indexer.pause()
         self.indexer.start()
-        # a fresh indexer is never paused; make sure the menu label reflects that
-        self._set_pause_label(False)
+        self._set_pause_label(self.indexer.paused)
         # reconcile in a background thread so startup stays snappy
         t = threading.Thread(target=self._reconcile_safe, name='SSReconcile', daemon=True)
         self._reconcile_thread = t
@@ -524,6 +588,11 @@ class SemanticSearchAction(InterfaceAction):
         self._status_dialog = d
         d.show()
 
+    def _paused_from_store(self) -> bool:
+        """Persisted indexing status for this database. A missing key (fresh DB, or one
+        migrated from an older version that never stored it) means paused."""
+        return self.store.get_meta('indexing_status', 'paused') == 'paused'
+
     def toggle_pause(self):
         """Pause or resume the indexing/attribute-extraction worker."""
         if self.indexer is None:
@@ -532,6 +601,8 @@ class SemanticSearchAction(InterfaceAction):
             self.indexer.resume()
         else:
             self.indexer.pause()
+        # persist per database so a restart keeps the same state
+        self.store.set_meta('indexing_status', 'paused' if self.indexer.paused else 'running')
         self._set_pause_label(self.indexer.paused)
 
     def _set_pause_label(self, paused):

@@ -133,7 +133,7 @@ def _missing_dev_deps(python):
     if subprocess.run([python, '-m', 'ruff', '--version'],
                       stdout=subprocess.DEVNULL).returncode != 0:
         missing.append('ruff')
-    for mod in ('lancedb', 'lxml', 'zstandard'):
+    for mod in ('lancedb', 'lxml', 'numpy', 'zstandard'):
         if subprocess.run([python, '-c', f'import {mod}']).returncode != 0:
             missing.append(mod)
     return missing

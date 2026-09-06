@@ -123,5 +123,69 @@ class TestLanceInstall(unittest.TestCase):
         self.assertIsInstance(info, str)
 
 
+class TestNumpyInstall(unittest.TestCase):
+    def _fake_popen(self, results):
+        calls = []
+
+        class FakeProc:
+            def __init__(self, rc, lines):
+                self._rc = rc
+                self.stdout = iter(lines)
+
+            def wait(self):
+                return self._rc
+
+        def popen(cmd, **kw):
+            calls.append(list(cmd))
+            rc, lines = results.pop(0)
+            return FakeProc(rc, lines)
+
+        return popen, calls
+
+    def test_pip_command(self):
+        cmd = utils.pip_install_command('numpy')
+        self.assertEqual(cmd[:4], [sys.executable, '-m', 'pip', 'install'])
+        self.assertEqual(cmd[-1], 'numpy')
+
+    def test_retry_with_user_then_success(self):
+        popen, calls = self._fake_popen([(1, ['error: permission denied']), (0, ['Successfully installed numpy'])])
+        ok, msg = utils.install_numpy(_popen=popen)
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('--user', calls[0])
+        self.assertIn('--user', calls[1])
+
+    def test_both_attempts_fail(self):
+        popen, calls = self._fake_popen([(1, ['first error']), (2, ['still boom'])])
+        ok, msg = utils.install_numpy(_popen=popen)
+        self.assertFalse(ok)
+        self.assertIn('still boom', msg)
+
+    def test_no_output_reports_command(self):
+        # pip exits non-zero but prints nothing (seen with calibre's bundled Python);
+        # the message must say so and include the exact command for manual repro
+        popen, calls = self._fake_popen([(2, []), (2, [])])
+        ok, msg = utils.install_numpy(_popen=popen)
+        self.assertFalse(ok)
+        self.assertIn('no output', msg)
+        self.assertIn('-m pip install', msg)
+
+    def test_numpy_status_shape(self):
+        installed, info = utils.numpy_status()
+        self.assertIsInstance(installed, bool)
+        self.assertIsInstance(info, str)
+
+
+class TestInterpreterNote(unittest.TestCase):
+    def test_reports_interpreter_and_pip_state(self):
+        note = utils._interpreter_note()
+        self.assertIsInstance(note, str)
+        self.assertIn('interpreter:', note)
+        self.assertIn(sys.executable, note)
+        # pip is installed in the test env, so it must report presence (not absence)
+        self.assertNotIn('NOT importable', note)
+        self.assertIn('pip', note)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -149,6 +149,31 @@ def pip_install_command(package: str = 'lancedb', extra_args=()) -> list[str]:
     return [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', *extra_args, package]
 
 
+def _interpreter_note() -> str:
+    """Read-only, in-process diagnostics about this interpreter and pip.
+
+    Appended to install-failure messages so a silent or odd pip failure is
+    self-explanatory (e.g. 'pip not importable' points at a bundled Python that
+    ships without pip). Uses find_spec/metadata only -- never imports or runs pip.
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec('pip')
+    except Exception as e:
+        return f'interpreter: {sys.executable}\npip check failed: {type(e).__name__}: {e}'
+    if spec is None:
+        return f'interpreter: {sys.executable}\npip is NOT importable in this Python (not installed)'
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        pip_ver = _pkg_version('pip')
+    except Exception:
+        pip_ver = 'unknown version'
+    origin = getattr(spec, 'origin', None) or 'unknown location'
+    return f'interpreter: {sys.executable}\npip {pip_ver} present at {origin}'
+
+
 def _pip_install(package: str, progress=None, _popen=None) -> tuple[bool, str]:
     """Shared pip installer. Tries a normal install first, then falls back to
     --user (for permission errors). progress(line) receives pip output lines as
@@ -157,10 +182,12 @@ def _pip_install(package: str, progress=None, _popen=None) -> tuple[bool, str]:
     attempts = (pip_install_command(package), pip_install_command(package, ('--user',)))
     last_err = 'no install attempt was made'
     for cmd in attempts:
+        # errors='replace': calibre's bundled Python may emit bytes the locale
+        # codec can't decode; never let that mask the real pip error
         try:
-            proc = popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            proc = popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
         except Exception as e:
-            last_err = f'{type(e).__name__}: {e}'
+            last_err = f'{type(e).__name__}: {e}\ncommand: {" ".join(cmd)}'
             continue
         tail: list[str] = []
         for line in proc.stdout:
@@ -169,13 +196,18 @@ def _pip_install(package: str, progress=None, _popen=None) -> tuple[bool, str]:
                 progress(line)
             if line:
                 tail.append(line)
-                if len(tail) > 5:
+                if len(tail) > 12:
                     tail.pop(0)
         rc = proc.wait()
         if rc == 0:
             return True, f'{package} installed.'
-        last_err = '\n'.join(tail) or f'pip exited with code {rc}'
-    return False, last_err
+        if tail:
+            last_err = '\n'.join(tail)
+        else:
+            # pip gave no output at all (seen with embedded/calibre Pythons); show the
+            # exact command so the error can be reproduced by running it manually
+            last_err = f'pip exited with code {rc} and produced no output\ncommand: {" ".join(cmd)}'
+    return False, f'{last_err}\n\n{_interpreter_note()}'
 
 
 def install_lancedb(progress=None, _popen=None) -> tuple[bool, str]:
@@ -196,3 +228,18 @@ def zstandard_status() -> tuple[bool, str]:
 def install_zstandard(progress=None, _popen=None) -> tuple[bool, str]:
     """Install zstandard into calibre's own Python via pip (see _pip_install)."""
     return _pip_install('zstandard', progress, _popen)
+
+
+def numpy_status() -> tuple[bool, str]:
+    """Return (installed, version_or_error_message)."""
+    try:
+        import numpy
+
+        return True, getattr(numpy, '__version__', 'unknown')
+    except ImportError as e:
+        return False, str(e)
+
+
+def install_numpy(progress=None, _popen=None) -> tuple[bool, str]:
+    """Install numpy into calibre's own Python via pip (see _pip_install)."""
+    return _pip_install('numpy', progress, _popen)
