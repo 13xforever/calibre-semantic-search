@@ -70,24 +70,105 @@ class TestEstimateTokens(unittest.TestCase):
 
     def test_cyrillic_is_denser_than_latin(self):
         self.assertGreater(chunker.estimate_tokens('а' * 350), chunker.estimate_tokens('x' * 350))
-        self.assertEqual(chunker.estimate_tokens('а' * 1000), 400)
+        self.assertEqual(chunker.estimate_tokens('а' * 1000), 667)
 
     def test_cjk_is_denser_than_cyrillic(self):
         self.assertGreater(chunker.estimate_tokens('中' * 100), chunker.estimate_tokens('x' * 100))
         self.assertEqual(chunker.estimate_tokens('中' * 1000), 1200)
 
     def test_mixed_scripts(self):
-        # 350 latin (100 tokens) + 1000 cyrillic (400 tokens)
-        self.assertEqual(chunker.estimate_tokens('x' * 350 + 'а' * 1000), 500)
+        # 350 latin (100 tokens) + 1000 cyrillic (667 tokens)
+        self.assertEqual(chunker.estimate_tokens('x' * 350 + 'а' * 1000), 767)
 
 
 class TestTokenCap(unittest.TestCase):
     def test_cyrillic_chunks_respect_token_cap(self):
-        paras = ['б' * 500 for _ in range(12)]  # 500 cyrillic chars = 200 tokens each
+        paras = ['б' * 500 for _ in range(12)]  # 500 cyrillic chars = 333 tokens each
         chunks = chunker.group_paragraphs(paras, [[] for _ in paras], 100000, 0, max_tokens=450)
         self.assertGreater(len(chunks), 1)
         for c in chunks:
             self.assertLessEqual(chunker.estimate_tokens(c.text), 450 + 2)
+
+
+class TestOversizedParagraph(unittest.TestCase):
+    """A single extracted 'paragraph' longer than the model's context (whole
+    chapters between blank lines, HTML blocks without <p>) must be split, not
+    sent as one request."""
+
+    def _big_para(self):
+        return ('тестовое слово для проверки разбиения текста на части в русской книге ' * 130).strip()
+
+    def _big_cjk_para(self):
+        # CJK text has no word boundaries: the whole paragraph is one unbreakable run,
+        # so it must go through the hard-cut path, not word packing
+        return '这是一段用于测试超长段落切分行为的中文文本，包含标点符号。' * 175
+
+    def _big_mixed_para(self):
+        # Cyrillic and Latin words interleaved (names, loanwords) — mixed per-char costs
+        return ('тестовое слово levinson english word ' * 300).strip()
+
+    def test_giant_paragraph_is_split_and_capped(self):
+        para = self._big_para()
+        self.assertGreater(chunker.estimate_tokens(para), 4032)
+        chunks = chunker.group_paragraphs([para], [['Ch 1']], 1000, 150, max_tokens=4032)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(chunker.estimate_tokens(c.text), 4032)
+
+    def test_giant_paragraph_chunks_stay_near_target_chars(self):
+        para = self._big_para()
+        chunks = chunker.group_paragraphs([para], [['Ch 1']], 1000, 150, max_tokens=4032)
+        for c in chunks:
+            # target + overlap tail (+ join separators)
+            self.assertLessEqual(len(c.text), 1000 + 150 + 2)
+
+    def test_unbreakable_run_is_hard_cut(self):
+        chunks = chunker.group_paragraphs(['а' * 9500], [[]], 1000, 150, max_tokens=4032)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(chunker.estimate_tokens(c.text), 4032)
+
+    def test_chapter_path_preserved_across_pieces(self):
+        para = self._big_para()
+        chunks = chunker.group_paragraphs([para], [['Ch 1']], 1000, 150, max_tokens=4032)
+        self.assertTrue(all(c.chapter_path == ['Ch 1'] for c in chunks))
+
+    def test_no_words_lost_end_to_end(self):
+        # chunk boundaries may drop the separating space (pieces are stripped and
+        # joined with blank lines), but every word must survive, in order
+        para = self._big_para()
+        chunks = chunker.group_paragraphs([para], [[]], 1000, 0, max_tokens=4032)
+        joined = ' '.join(c.text for c in chunks)
+        self.assertEqual(' '.join(joined.split()), ' '.join(para.split()))
+
+    def test_splitter_preserves_text_exactly(self):
+        para = self._big_para()
+        pieces = chunker._split_to_budget(para, 4032 - 150 * 1.2, 1000)
+        self.assertEqual(''.join(pieces), para)
+
+    def test_giant_cjk_paragraph_is_split_and_capped(self):
+        # a single CJK paragraph has no word boundaries -> hard-cut path
+        para = self._big_cjk_para()
+        self.assertGreater(chunker.estimate_tokens(para), 4032)
+        chunks = chunker.group_paragraphs([para], [['第一章']], 1000, 150, max_tokens=4032)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(chunker.estimate_tokens(c.text), 4032)
+            self.assertEqual(c.chapter_path, ['第一章'])
+
+    def test_giant_cjk_paragraph_preserved(self):
+        # hard cuts must cover the run exactly: no character lost or duplicated
+        para = self._big_cjk_para()
+        chunks = chunker.group_paragraphs([para], [[]], 1000, 0, max_tokens=4032)
+        self.assertEqual(''.join(c.text for c in chunks), para)
+
+    def test_giant_mixed_script_paragraph_is_split_and_capped(self):
+        para = self._big_mixed_para()
+        self.assertGreater(chunker.estimate_tokens(para), 4032)
+        chunks = chunker.group_paragraphs([para], [['Ch 1']], 1000, 150, max_tokens=4032)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(chunker.estimate_tokens(c.text), 4032)
 
     def test_cjk_chunks_respect_token_cap(self):
         paras = ['中' * 800 for _ in range(6)]  # 800 CJK chars = 960 tokens each

@@ -29,11 +29,13 @@ class Chunk:
         return ' > '.join(self.chapter_path)
 
 
-# Chars-per-token by script class. Deliberately conservative: under-estimating
-# capacity keeps chunks inside the model's context window for foreign-language
-# text, at the cost of a few extra chunks.
+# Chars-per-token by script class. Deliberately conservative: over-estimating
+# tokens keeps chunks inside the model's context window for foreign-language
+# text, at the cost of a few extra chunks. The non-Latin value is calibrated
+# against real BPE tokenizers (llama.cpp embeddings on Russian: ~1.4 chars per
+# token) — BPE handles Cyrillic far worse than Latin, not just a little.
 CHARS_PER_TOKEN = 3.5            # Latin text (and fallback)
-NONLATIN_CHARS_PER_TOKEN = 2.5   # Cyrillic, Greek, Arabic, Hebrew, Devanagari, Thai, ...
+NONLATIN_CHARS_PER_TOKEN = 1.5   # Cyrillic, Greek, Arabic, Hebrew, Devanagari, Thai, ...
 DENSE_TOKENS_PER_CHAR = 1.2      # CJK ideographs, kana, hangul: roughly one token per char
 CONTEXT_OVERHEAD_TOKENS = 64     # reserved for the model's own wrapper tokens
 
@@ -63,8 +65,8 @@ _NONLATIN_RANGES = (
 )
 
 
-def estimate_tokens(text: str) -> int:
-    """Script-aware token estimate for `text` (conservative; see constants above)."""
+def _script_counts(text: str) -> tuple[int, int]:
+    """Count (dense, non-latin) chars in `text` per the ranges above."""
     dense = nonlatin = 0
     for ch in text:
         cp = ord(ch)
@@ -79,9 +81,45 @@ def estimate_tokens(text: str) -> int:
                 if lo <= cp <= hi:
                     nonlatin += 1
                     break
+    return dense, nonlatin
+
+
+def estimate_tokens(text: str) -> int:
+    """Script-aware token estimate for `text` (conservative; see constants above)."""
+    dense, nonlatin = _script_counts(text)
     latin = len(text) - dense - nonlatin
     total = dense * DENSE_TOKENS_PER_CHAR + nonlatin / NONLATIN_CHARS_PER_TOKEN + latin / CHARS_PER_TOKEN
     return max(1, int(total + 0.5))
+
+
+def _split_to_budget(text: str, max_tokens: float, max_chars: int) -> list[str]:
+    """Split `text` into pieces within both a token and a char budget.
+
+    Greedy word packing on whitespace (word boundaries kept); an unbroken run
+    longer than either whole budget is hard-cut at a length that fits even the
+    densest script. Text is preserved exactly (''.join(pieces) == text).
+    """
+    if len(text) <= max_chars and estimate_tokens(text) <= max_tokens:
+        return [text]
+    pieces: list[str] = []
+    cur = ''
+    cur_tok = 0.0
+    hard_cut = max(1, min(int(max_tokens / DENSE_TOKENS_PER_CHAR), max_chars))
+    for w in re.findall(r'\S+\s*', text):
+        d, nl = _script_counts(w)
+        w_tok = d * DENSE_TOKENS_PER_CHAR + nl / NONLATIN_CHARS_PER_TOKEN + (len(w) - d - nl) / CHARS_PER_TOKEN
+        if cur and (len(cur) + len(w) > max_chars or cur_tok + w_tok > max_tokens):
+            pieces.append(cur)
+            cur, cur_tok = '', 0.0
+        if not cur and (len(w) > max_chars or w_tok > max_tokens):
+            for j in range(0, len(w), hard_cut):
+                pieces.append(w[j:j + hard_cut])
+            continue
+        cur += w
+        cur_tok += w_tok
+    if cur.strip():
+        pieces.append(cur)
+    return pieces or [text]
 
 
 MIN_CHUNK_CHARS = 200
@@ -104,7 +142,9 @@ def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], targ
     When max_tokens is given, a chunk is also closed once its script-aware token
     estimate (estimate_tokens) exceeds it, so dense scripts such as CJK cannot
     overflow the embedding model's context even when the char target allows more.
-    A single paragraph longer than the cap still gets its own chunk.
+    A single paragraph longer than the cap (whole chapters between blank lines,
+    or HTML blocks without <p> tags) is first split at word boundaries into
+    pieces that fit the cap, so no chunk can exceed it.
     """
     chunks: list[Chunk] = []
     n = len(paragraphs)
@@ -116,6 +156,23 @@ def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], targ
         overlap_chars = 0
     if overlap_chars >= target_chars // 2:
         overlap_chars = target_chars // 5
+
+    if max_tokens is not None:
+        # Piece budgets: the token one reserves room for the overlap tail
+        # (worst case: all dense chars) that prefixes the chunk a piece opens;
+        # the char one keeps pieces small enough that grouping can still pack
+        # them into ~target_chars chunks.
+        budget = max(1.0, float(max_tokens) - overlap_chars * DENSE_TOKENS_PER_CHAR)
+        expanded: list[str] = []
+        expanded_paths: list[list[str]] = []
+        for para, path in zip(paragraphs, chapter_paths):
+            p = para.strip()
+            if not p:
+                continue
+            for piece in _split_to_budget(p, budget, target_chars):
+                expanded.append(piece)
+                expanded_paths.append(path)
+        paragraphs, chapter_paths = expanded, expanded_paths
 
     para_toks = [estimate_tokens(p) for p in paragraphs] if max_tokens is not None else None
 
