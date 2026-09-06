@@ -889,37 +889,31 @@ class LanceVectorBackend:
         out = []
         for t in self._all_tables():
             try:
-                df = t.search().where(f'book_id = {int(book_id)}').limit(10_000_000).to_pandas()
+                rows = t.search().where(f'book_id = {int(book_id)}').limit(10_000_000).to_list()
             except Exception:
                 continue
-            if df is None or len(df) == 0:
+            if not rows:
                 continue
-            df = df.sort_values('chunk_no')
-            out.extend(str(x) for x in df['text'])
+            rows.sort(key=lambda r: r['chunk_no'])
+            out.extend(str(r['text']) for r in rows)
         return out
 
     def search(self, query_vec, limit: int, min_score: float, model: str | None = None) -> list[SearchResult]:
         qv = l2_normalize(query_vec)
         vec = qv.tolist() if np is not None else list(qv)
-        candidates = []
+        rows = []
         tables = [self._open_table(model)] if model is not None else self._all_tables()
         tables = [t for t in tables if t is not None]
         for t in tables:
             try:
-                df = t.search(vec).metric('cosine').limit(limit * 3).to_pandas()
+                rows.extend(t.search(vec).metric('cosine').limit(limit * 3).to_list())
             except Exception:
                 continue
-            if df is None or len(df) == 0:
-                continue
-            candidates.append(df)
-        if not candidates:
+        if not rows:
             return []
-        import pandas as pd
-
-        df = pd.concat(candidates, ignore_index=True)
         fmt_map = {i['id']: i['fmt'] for i in self.meta.indexed_books()}
         out = []
-        for _, r in df.iterrows():
+        for r in rows:
             s = float(r['_distance'])
             # cosine distance = 1 - similarity; stored vectors are normalized, so this is the
             # same cosine-similarity scale as the sqlite backend (dot product of unit vectors)

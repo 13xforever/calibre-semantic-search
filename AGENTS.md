@@ -1,9 +1,17 @@
 # AGENTS.md
 
-calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extracted book attributes. No build system, no package manifest, no typechecker — verification is ruff (pyflakes rules only) + `py_compile` + the stdlib unittest suite.
+calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extracted book attributes. No build system, no package manifest (the ZIP ships exactly `src/`; dev dependencies live in `requirements-dev.txt` and are never shipped), no typechecker — verification is ruff (pyflakes + isort rules) + `py_compile` + the stdlib unittest suite.
 
-## Commands (run from repo root)
+## Environment (new system)
 
+- Dev environment is a project-local **`.venv`**: `python dev.py setup` creates it from the closest installed Python to what calibre ships — highest version in **3.12..3.14** (found via the `py` launcher; calibre 9.14's Windows build runs CPython 3.14.7, and staying at or below that is the safe direction) — then pip-installs any missing dev dependencies into it. Re-running reuses the existing venv and installs only what's missing (a no-op when complete). Nothing is installed system-wide; setup does NOT run the gate.
+- Dev dependencies (`requirements-dev.txt`): `ruff` (lint step), `lancedb` (hard test dependency), `lxml==6.1.1` (the exact version calibre 9.14 bundles — the chunker's HTML walk runs against it in tests too; keep the pin in sync when calibre updates it), `zstandard` (zstd codec — without it every fresh store attempts a pip install and falls back to zlib). The store reads lancedb results via `.to_list()`, never pandas: calibre ships no pandas, so any pandas use would break the lancedb backend at runtime.
+- Run the gate through the venv interpreter: `.venv\Scripts\python dev.py` (or activate `.venv`). The code uses nothing newer than Python 3.9, so any of 3.12..3.14 works.
+- The plugin's only hard non-stdlib dependency is lxml, which calibre bundles — none of the dev deps are shipped or required at runtime (lancedb/zstandard are optional there too).
+
+## Commands (run from repo root, via the venv interpreter — `.venv\Scripts\python dev.py ...`)
+
+- Provision a new system (create/refresh .venv, install missing dev deps — no tests): `python dev.py setup`
 - Full gate — compile + lint + test + build, stop on first failure: `python dev.py`
 - Compile check (byte-compiles `src/` + `tests/`): `python dev.py compile`
 - Lint (ruff, pyflakes + isort rules — real bugs and consistent import order, nothing else; config in `ruff.toml`; needs `pip install ruff`, a missing tool fails the gate loudly like lancedb): `python dev.py lint`
@@ -37,4 +45,4 @@ calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extrac
 - The store opens SQLite with `journal_mode=WAL` (`store.py`). Inspecting `semantic-search.db` directly can show **stale/empty tables** (rows live in `-wal` until a checkpoint). Don't "debug" persistence by eyeballing the raw file — verify via the store API or the *Index status* dialog's `Attributes stored: X/Y books` line.
 - In WAL mode `PRAGMA auto_vacuum=INCREMENTAL` only takes effect **through a finished `VACUUM`** — setting it on its own does not persist (it reads back 0). That's why new DBs and migrations end with the pair `PRAGMA auto_vacuum=INCREMENTAL; VACUUM;`, and why `needs_finalize()` treats `auto_vacuum != 2` on an otherwise-v2 DB as "previous VACUUM never completed" and re-runs it.
 - **File mtimes are truncated to integer seconds, never rounded** (migration `migrations/v1.py`, runtime `indexer._mtime_to_int`). Rounding up would store a mtime later than the file's real one, so change detection would see every book as modified.
-- The plugin targets calibre 8.x dev and uses `calibre.ai` structured-output + newAPI internals. A local checkout of the calibre source tree is useful for reading those APIs (plugin loading in `calibre/customize/zipplugin.py`, action plumbing in `calibre/gui2/actions/__init__.py`); the plugin itself ships only what `src/` contains — that's exactly what `dev.py build` stages into the ZIP.
+- The plugin targets calibre 9.x dev and uses `calibre.ai` structured-output + newAPI internals. A local checkout of the calibre source tree is useful for reading those APIs (plugin loading in `calibre/customize/zipplugin.py`, action plumbing in `calibre/gui2/actions/__init__.py`); the plugin itself ships only what `src/` contains — that's exactly what `dev.py build` stages into the ZIP.

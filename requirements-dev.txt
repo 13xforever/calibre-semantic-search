@@ -1,0 +1,7 @@
+# Dev/test dependencies for running `python dev.py` (the full gate) on a new system.
+# NOT shipped: the plugin ZIP contains only src/ and runs on calibre's Python with
+# the stdlib alone (lancedb/zstandard are optional at runtime there too).
+ruff         # lint step: pyflakes + isort rules (config in ruff.toml)
+lancedb      # hard test dependency - the lancedb backend tests must run, not skip
+lxml==6.1.1  # exact version calibre 9.14 bundles; the chunker's HTML walk runs against it in tests too (keep in sync when calibre updates it)
+zstandard    # zstd text codec; without it every fresh store tries a pip install and falls back to zlib

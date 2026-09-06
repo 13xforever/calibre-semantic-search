@@ -1,15 +1,18 @@
 '''Dev gate for the semantic_search plugin: compile, lint, test, build.
 
 Usage:
-    python dev.py            # compile + lint + test + build, stop on first failure
-    python dev.py compile    # byte-compile src/ and tests/
-    python dev.py lint       # ruff check (pyflakes rules, see ruff.toml)
-    python dev.py test       # run the unittest suite (tests/)
-    python dev.py build      # write semantic_search.zip mirroring src/
+  python dev.py            run compile + lint + test + build, stop on first failure
+  python dev.py setup      create/refresh the project-local .venv and install the
+                           dev dependencies (requirements-dev.txt) into it
+  python dev.py compile    byte-compile src/ and tests/
+  python dev.py lint       ruff over src/, tests/, dev.py (pyflakes + isort rules)
+  python dev.py test       run the unittest suite
+  python dev.py build      write semantic_search.zip mirroring src/
 '''
 
 import os
 import py_compile
+import re
 import subprocess
 import sys
 import unittest
@@ -86,10 +89,91 @@ def cmd_build():
     return True
 
 
+GATE = {'compile': cmd_compile, 'lint': cmd_lint, 'test': cmd_test, 'build': cmd_build}
+
+
+VENV_DIR = os.path.join(ROOT, '.venv')
+
+
+def _venv_python():
+    if os.name == 'nt':
+        return os.path.join(VENV_DIR, 'Scripts', 'python.exe')
+    return os.path.join(VENV_DIR, 'bin', 'python')
+
+
+def _pick_interpreter():
+    '''Closest installed Python to what calibre ships (3.14), never newer: the highest in 3.12..3.14.'''
+    seen = {}
+    try:
+        out = subprocess.run(['py', '-0p'], capture_output=True, text=True).stdout
+    except OSError:
+        out = ''
+    for line in out.splitlines():
+        m = re.match(r'\s*-V:(\d+\.\d+)', line)
+        if not m:
+            continue
+        ver = tuple(int(x) for x in m.group(1).split('.'))
+        rest = line[m.end():].lstrip()
+        if rest.startswith('*'):
+            rest = rest[1:].lstrip()
+        seen.setdefault(ver, rest.strip())
+    in_range = {v: p for v, p in seen.items() if (3, 12) <= v <= (3, 14)}
+    if in_range:
+        return in_range[max(in_range)]
+    if (3, 12) <= sys.version_info[:2] <= (3, 14):
+        return sys.executable
+    print(f'no suitable Python found via the py launcher: need an installed '
+          f'interpreter between 3.12 and 3.14 (calibre ships 3.14); '
+          f'found {sorted(seen) or "none"}')
+    return None
+
+
+def _missing_dev_deps(python):
+    missing = []
+    if subprocess.run([python, '-m', 'ruff', '--version'],
+                      stdout=subprocess.DEVNULL).returncode != 0:
+        missing.append('ruff')
+    for mod in ('lancedb', 'lxml', 'zstandard'):
+        if subprocess.run([python, '-c', f'import {mod}']).returncode != 0:
+            missing.append(mod)
+    return missing
+
+
+def cmd_setup():
+    '''Create/refresh the project-local .venv and install dev dependencies into it.'''
+    venv_py = _venv_python()
+    if os.path.exists(venv_py):
+        print(f'reusing existing {os.path.basename(VENV_DIR)}')
+    else:
+        interpreter = _pick_interpreter()
+        if interpreter is None:
+            return False
+        print(f'creating {os.path.basename(VENV_DIR)} from {interpreter}')
+        proc = subprocess.run([interpreter, '-m', 'venv', VENV_DIR])
+        if proc.returncode != 0 or not os.path.exists(venv_py):
+            print('venv creation failed')
+            return False
+    missing = _missing_dev_deps(venv_py)
+    if not missing:
+        print('all dev dependencies present in venv')
+    else:
+        print(f'installing into venv: {", ".join(missing)}')
+        proc = subprocess.run([venv_py, '-m', 'pip', 'install',
+                               '--disable-pip-version-check', *missing])
+        if proc.returncode != 0 or _missing_dev_deps(venv_py):
+            print('dependency install failed (network problem?) - re-run when online')
+            return False
+    version = subprocess.run([venv_py, '--version'], capture_output=True, text=True).stdout.strip()
+    print(f'environment ready: {os.path.basename(VENV_DIR)} ({version})')
+    print(f'run the gate with: {os.path.relpath(venv_py, ROOT)} dev.py')
+    return True
+
+
 def main(argv):
-    steps = {'compile': cmd_compile, 'lint': cmd_lint, 'test': cmd_test, 'build': cmd_build}
+    steps = dict(GATE)
+    steps['setup'] = cmd_setup
     if not argv:
-        plan = list(steps.items())
+        plan = list(GATE.items())
     elif len(argv) == 1 and argv[0] in steps:
         plan = [(argv[0], steps[argv[0]])]
     else:

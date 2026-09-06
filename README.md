@@ -15,7 +15,7 @@ attributes in custom columns.
 
 ## Requirements
 
-- calibre **8.x dev** (this plugin targets the current development tree; it
+- calibre **9.x dev** (this plugin targets the current development tree; it
   uses `calibre.customize` base classes and the AI structured-output API).
 - A local OpenAI-compatible embedding server, e.g. Ollama:
   - `ollama pull nomic-embed-text` (or any model you like)
@@ -90,14 +90,64 @@ attributes in custom columns.
 - Attributes are also written to calibre custom columns, so they survive even
   if the store file is deleted.
 
+## Development environment
+
+To run the test suite / build from a checkout on a new system:
+
+1. A Python between **3.12 and 3.14** installed (check with `py --list`).
+   Setup picks the one closest to what calibre ships — the highest version at or
+   below 3.14 (calibre's current build runs CPython 3.14; staying at or below it
+   is the safe direction). The code itself uses nothing newer than Python 3.9.
+2. One command to provision a project-local virtual environment:
+
+    ```powershell
+    python dev.py setup
+    ```
+
+   It creates `.venv/` from that interpreter (reusing it if already present) and
+   pip-installs any missing dev dependencies from `requirements-dev.txt` into the
+   venv — and only those, so re-running on a complete machine does nothing.
+   Nothing is installed system-wide.
+
+3. Run everything through the venv's interpreter:
+
+    ```powershell
+    .\.venv\Scripts\python dev.py
+    ```
+
+   (or activate `.venv` first and use `python dev.py` as usual)
+
+What each dev dependency is for:
+
+- `ruff` — the lint step of the gate (pyflakes + isort rules; config in
+  `ruff.toml`).
+- `lancedb` — hard **test** dependency: the lancedb backend tests must run, not
+  skip.
+- `lxml==6.1.1` — the exact version calibre 9.14 bundles; the chunker's HTML
+  walk runs against it in tests just as it does inside calibre. Test-only:
+  production gets lxml from calibre itself.
+- `zstandard` — the zstd text codec; without it every fresh store attempts a pip
+  install at runtime and falls back to zlib.
+
+The plugin itself needs none of these to *run* inside calibre: it ships exactly
+`src/` (no manifest) and uses the stdlib plus lxml, which calibre bundles.
+lancedb/zstandard are optional at runtime (the Settings dialog can install
+lancedb for you; zstandard is installed automatically when first needed).
+
+Individual steps (same venv interpreter):
+`.venv\Scripts\python dev.py compile | lint | test | build`.
+
 ## Tests
 
 ```powershell
-python -m unittest discover -s tests
+.venv\Scripts\python -m unittest discover -s tests
 ```
 
-(or `python dev.py test`; `python dev.py` runs compile + tests + ZIP build.)
+(or `.venv\Scripts\python dev.py test`; `dev.py` with no arguments runs compile
++ lint + test + ZIP build.)
 
-(138 tests: chunker, store roundtrip/search/per-model tables/dirty queue,
-embed client against a mock HTTP server, indexer phases/reconcile, settings
-persistence, attribute extraction with a fake LLM, dialog behavior.)
+(144 tests: chunker, store roundtrip/search/per-model tables/dirty queue, embed
+client against a mock HTTP server, indexer phases/reconcile, settings
+persistence, attribute extraction with a fake LLM, dialog behavior, plus full
+store-lifecycle suites on three reproducible databases — legacy v0 migrated to
+latest, fresh sqlite at latest, and lancedb.)

@@ -1,14 +1,16 @@
 '''Chunk book text into paragraph groups with chapter context.
 
-Pure Python: no calibre or Qt imports, so it is unit-testable standalone.
-The HTML walking helpers here are written against lxml (bundled with calibre)
-but degrade gracefully to a regex-free plain-text path when given str input.
+No calibre or Qt imports, so it is unit-testable standalone. The only
+non-stdlib dependency is lxml, which calibre bundles (requirements-dev.txt
+pins the exact version calibre ships, so tests exercise the same parser).
 '''
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+
+from lxml import html as lhtml
 
 HEADING_RE = re.compile(r'^h([1-6])$', re.I)
 BLOCK_TAGS = {'p', 'div', 'blockquote', 'li', 'pre', 'table', 'section', 'article'}
@@ -200,94 +202,37 @@ def html_to_units(html: str):
     """Walk an HTML page and yield (kind, payload) units.
 
     kind is 'heading' (payload: (level, text)) or 'para' (payload: text).
-    Uses lxml when available; falls back to a lightweight regex walk otherwise
-    (good enough for tests and for simple HTML).
     """
-    try:
-        from lxml import html as lhtml
+    root = lhtml.fromstring(html)
+    if root.tag == 'html':
+        body = root.find('.//body')
+        root = body if body is not None else root
+    out = []
 
-        root = lhtml.fromstring(html)
-        if root.tag == 'html':
-            body = root.find('.//body')
-            root = body if body is not None else root
-        out = []
-
-        def walk(el):
-            tag = el.tag.lower() if isinstance(el.tag, str) else ''
-            m = HEADING_RE.match(tag)
-            if m:
-                text = (el.text_content() or '').strip()
-                if text:
-                    out.append(('heading', (int(m.group(1)), text)))
-                for child in el:
-                    walk(child)
-                return
-            if tag in BLOCK_TAGS:
-                text = (el.text_content() or '').strip()
-                # don't double count nested blocks: only treat as a paragraph
-                # unit if it has no block-level children of interest
-                has_block_child = any(
-                    isinstance(c.tag, str) and c.tag.lower() in BLOCK_TAGS | {t for t in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')}
-                    for c in el
-                )
-                if text and not has_block_child:
-                    out.append(('para', re.sub(r'\s+', ' ', text)))
+    def walk(el):
+        tag = el.tag.lower() if isinstance(el.tag, str) else ''
+        m = HEADING_RE.match(tag)
+        if m:
+            text = (el.text_content() or '').strip()
+            if text:
+                out.append(('heading', (int(m.group(1)), text)))
             for child in el:
                 walk(child)
+            return
+        if tag in BLOCK_TAGS:
+            text = (el.text_content() or '').strip()
+            # don't double count nested blocks: only treat as a paragraph
+            # unit if it has no block-level children of interest
+            has_block_child = any(
+                isinstance(c.tag, str) and c.tag.lower() in BLOCK_TAGS | {t for t in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')}
+                for c in el
+            )
+            if text and not has_block_child:
+                out.append(('para', re.sub(r'\s+', ' ', text)))
+        for child in el:
+            walk(child)
 
-        walk(root)
-        return out
-    except ImportError:
-        return _regex_html_units(html)
-
-
-def _regex_html_units(html: str):
-    """Very small fallback parser for when lxml is unavailable (tests)."""
-    out = []
-    pos = 0
-    tag_re = re.compile(r'<(/?)([a-zA-Z][a-zA-Z0-9]*)[^>]*>', re.S)
-    heading_re = re.compile(r'^h([1-6])$', re.I)
-    in_heading = 0
-    heading_buf = ''
-    para_buf = []
-    skip_depth = 0
-
-    def flush_para():
-        text = re.sub(r'\s+', ' ', ' '.join(para_buf)).strip()
-        if text:
-            out.append(('para', text))
-        para_buf.clear()
-
-    for m in tag_re.finditer(html):
-        closing, tag = m.group(1) == '/', m.group(2).lower()
-        between = html[pos : m.start()]
-        pos = m.end()
-        if tag in ('script', 'style'):
-            if not closing:
-                skip_depth += 1
-            elif skip_depth:
-                skip_depth -= 1
-            continue
-        if skip_depth:
-            continue
-        hm = heading_re.match(tag)
-        if hm and not closing:
-            flush_para()
-            in_heading = int(hm.group(1))
-            heading_buf = ''
-        elif hm and closing and in_heading == int(hm.group(1)):
-            text = re.sub(r'\s+', ' ', heading_buf).strip()
-            if text:
-                out.append(('heading', (in_heading, text)))
-            in_heading = 0
-        elif in_heading:
-            heading_buf += between
-        else:
-            if tag in BLOCK_TAGS and closing:
-                flush_para()
-            else:
-                para_buf.append(between)
-    flush_para()
+    walk(root)
     return out
 
 
