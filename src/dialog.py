@@ -165,12 +165,7 @@ class SemanticSearchDialog(QDialog):
         self._sort_col = 3  # the store returns score-descending; reflect that in the header
         self._sort_asc = False
         self._render_table()
-        if len(self.results) >= MAX_RESULTS:
-            self.status_label.setText(
-                _('{n} matches — showing the top {max}; raise "Minimum match score" in settings to narrow the list').format(n=len(self.results), max=MAX_RESULTS)
-            )
-        else:
-            self.status_label.setText(f'{len(self.results)} matches')
+        self.status_label.setText(f'{len(self.results)} matches')
 
     def _book_meta(self, book_id, api):
         if book_id not in self._meta_cache:

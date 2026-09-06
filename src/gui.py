@@ -883,9 +883,6 @@ class SemanticSearchAction(InterfaceAction):
             error_dialog(self.gui, _('Semantic search'), f'No usable format for {self._book_label(book_id)}.', show=True)
             return
         self.store.add_dirty(book_id, 'reindex')
-        from calibre.gui2 import info_dialog
-
-        info_dialog(self.gui, _('Semantic search'), f'Queued {self._book_label(book_id)} for re-embedding.', show=True)
 
     def reextract_attributes_book(self, book_id):
         """Force LLM attribute extraction for one book (Book Details context menu)."""

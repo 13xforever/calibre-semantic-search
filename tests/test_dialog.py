@@ -303,12 +303,11 @@ class TestOnResults(unittest.TestCase):
         self.assertEqual(book_item.data, 7)
 
     def test_capped_status(self):
+        # hitting the row cap looks like any other count: no special-casing
         d = _make_dialog()
         results = [_result(i) for i in range(dialog.MAX_RESULTS)]
         dialog.SemanticSearchDialog._on_results(d, results)
-        self.assertEqual(
-            d.status_label.text, f'{dialog.MAX_RESULTS} matches — showing the top {dialog.MAX_RESULTS}; raise "Minimum match score" in settings to narrow the list'
-        )
+        self.assertEqual(d.status_label.text, f'{dialog.MAX_RESULTS} matches')
 
 
 class TestHeaderSort(unittest.TestCase):
