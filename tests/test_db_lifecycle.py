@@ -502,6 +502,7 @@ class TestBackendMigration(_MigrateOps, unittest.TestCase):
         # the settings dialog flips the per-library meta; the migration runs on open
         s.set_meta(store.BACKEND_KEY, 'lancedb')
         s.close()
+        size_before = os.path.getsize(self.path)  # close checkpointed the WAL into the main file
 
         s = store.VectorStore(self.path)
         self.s = s
@@ -519,6 +520,12 @@ class TestBackendMigration(_MigrateOps, unittest.TestCase):
         self.assertTrue(s._lancedb_has_data())
         self.assertFalse(s.needs_finalize())
         self._check(s)
+        # dropping the chunk tables must actually reclaim their pages: finalize ends with
+        # a full VACUUM, so no freelist bloat and the physical file has shrunk
+        with s.meta._lock:
+            free = s.meta.conn.execute('PRAGMA freelist_count').fetchone()[0]
+        self.assertEqual(free, 0)
+        self.assertLess(os.path.getsize(self.path), size_before)
 
         # reopen: stable, no stages
         s.close()

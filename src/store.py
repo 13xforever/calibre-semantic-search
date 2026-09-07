@@ -1040,9 +1040,11 @@ class VectorStore:
             prev_ac = self.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
             self.meta.conn.execute('PRAGMA wal_autocheckpoint=0')
             try:
-                if av != 2:  # 2 == INCREMENTAL
-                    self.meta.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
-                    self.meta.conn.execute('VACUUM')
+                # A full VACUUM whenever work ran (or the setting was lost): freed pages
+                # (e.g. dropped chunk tables after a backend switch) sit in the freelist
+                # until then, and the VACUUM persists auto_vacuum=INCREMENTAL.
+                self.meta.conn.execute('PRAGMA auto_vacuum=INCREMENTAL')
+                self.meta.conn.execute('VACUUM')
                 # VACUUM in WAL mode leaves the rebuilt DB in the WAL; drain it into
                 # the main file now (the store stays open, so no close-time checkpoint).
                 self.meta.wal_checkpoint_truncate()
