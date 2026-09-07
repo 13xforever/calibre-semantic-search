@@ -1,6 +1,8 @@
 import os as _os
+import shutil
 import sys
 import sys as _sys
+import tempfile
 import unittest
 
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
@@ -76,181 +78,223 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertEqual(len(en), len(s.attributes) - 1)
 
 
-class TestLanceInstall(unittest.TestCase):
-    def test_pip_command(self):
-        cmd = utils.pip_install_command()
-        self.assertEqual(cmd[:4], [sys.executable, '-m', 'pip', 'install'])
-        self.assertEqual(cmd[-1], 'lancedb')
+class _WheelBuilder:
+    """Craft a minimal but valid .whl so install/uninstall can run fully offline."""
 
-    def _fake_popen(self, results):
-        calls = []
+    @staticmethod
+    def make(path, dist, version, pkg_files):
+        import zipfile as _zf
 
-        class FakeProc:
-            def __init__(self, rc, lines):
-                self._rc = rc
-                self.stdout = iter(lines)
+        entries = {}
+        for rel, content in pkg_files.items():
+            entries[rel] = content.encode() if isinstance(content, str) else content
+        di = f'{dist}-{version}.dist-info'
+        entries[f'{di}/METADATA'] = f'Metadata-Version: 2.1\nName: {dist}\nVersion: {version}\n'.encode()
+        record = [f'{rel},,' for rel in sorted(entries)] + [f'{di}/RECORD,,']
+        entries[f'{di}/RECORD'] = ('\n'.join(record) + '\n').encode()
+        with _zf.ZipFile(path, 'w', _zf.ZIP_DEFLATED) as zf:
+            for arc, data in entries.items():
+                zf.writestr(arc, data)
 
-            def wait(self):
-                return self._rc
 
-        def popen(cmd, **kw):
-            calls.append(list(cmd))
-            rc, lines = results.pop(0)
-            return FakeProc(rc, lines)
+class _FakeProc:
+    """Doubles subprocess.Popen for both the communicate() and stdout-iteration paths."""
 
-        return popen, calls
+    def __init__(self, rc, lines):
+        self._rc = rc
+        self.stdout = iter(lines)
+        self.returncode = rc
 
-    def test_retry_with_user_then_success(self):
-        popen, calls = self._fake_popen([(1, ['error: permission denied']), (0, ['Successfully installed lancedb'])])
+    def wait(self):
+        return self._rc
+
+    def communicate(self, timeout=None):
+        rest = '\n'.join(self.stdout)
+        return (rest + '\n' if rest else ''), ''
+
+
+def _offline_popen():
+    """popen fake: passes the pip --version probe and, for `download`, writes a real
+    wheel for the requested dist into the -d dir. Returns (popen, calls)."""
+    calls = []
+
+    def popen(cmd, **kw):
+        cmd = list(cmd)
+        calls.append(cmd)
+        if '--version' in cmd:
+            return _FakeProc(0, ['pip 24.0 from /x/lib (python 3.14)'])
+        spec = next(a for a in cmd if '==' in a and not a.startswith('-'))
+        dist, ver = spec.split('==', 1)
+        outdir = cmd[cmd.index('-d') + 1]
+        _WheelBuilder.make(_os.path.join(outdir, f'{dist}-{ver}-py3-none-any.whl'), dist, ver, {f'{dist}/__init__.py': f'pkg = "{dist}"\n'})
+        return _FakeProc(0, [f'Saved {dist}.whl', 'Successfully downloaded 1 package'])
+
+    return popen, calls
+
+
+class TestExternalRoot(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='ss-deptest-')
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_root_name_is_version_keyed(self):
+        root = utils.external_deps_root(_base=self._tmp)
+        tag = f'{sys.version_info.major}{sys.version_info.minor}'
+        self.assertEqual(_os.path.basename(root), f'semantic-search-libs-py{tag}')
+        self.assertTrue(root.startswith(self._tmp))
+
+    def test_dep_in_root_false_when_missing(self):
+        self.assertFalse(utils.dep_in_root('numpy', _base=self._tmp))
+
+
+class TestExternalInstall(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='ss-deptest-')
+
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_install_lancedb_offline(self):
+        popen, calls = _offline_popen()
+        ok, msg = utils.install_dep('lancedb', _popen=popen, _base=self._tmp)
+        self.assertTrue(ok, msg)
+        root = utils.external_deps_root(_base=self._tmp)
+        self.assertTrue(utils.dep_in_root('lancedb', _base=self._tmp))
+        self.assertTrue(_os.path.isfile(_os.path.join(root, 'lancedb', '__init__.py')))
+        dl = next(c for c in calls if 'download' in c)
+        self.assertIn('lancedb==0.38.0', dl)
+        self.assertIn('--only-binary=:all:', dl)
+        self.assertIn('-c', dl)  # a constraints file pins the transitive numpy
+
+    def test_extract_skips_already_present_dists(self):
+        # numpy is already installed (and, on Windows, its .pyd would be mapped/locked)
+        popen, _calls = _offline_popen()
+        ok, msg = utils.install_dep('numpy', _popen=popen, _base=self._tmp)
+        self.assertTrue(ok, msg)
+        root = utils.external_deps_root(_base=self._tmp)
+
+        # sentinel: re-extracting numpy would clobber this
+        np_init = _os.path.join(root, 'numpy', '__init__.py')
+        with open(np_init, 'w', encoding='utf-8') as fh:
+            fh.write('SENTINEL\n')
+
+        wheels = tempfile.mkdtemp(prefix='ss-wheels-')
+        self.addCleanup(shutil.rmtree, wheels, ignore_errors=True)
+        _WheelBuilder.make(_os.path.join(wheels, 'numpy-2.5.3-py3-none-any.whl'), 'numpy', '2.5.3', {'numpy/__init__.py': 'pkg = "numpy"\n'})
+        _WheelBuilder.make(_os.path.join(wheels, 'lancedb-0.38.0-py3-none-any.whl'), 'lancedb', '0.38.0', {'lancedb/__init__.py': 'pkg = "lancedb"\n'})
+
+        n = utils._extract_wheels(wheels, root)
+        self.assertEqual(n, 1)  # only lancedb extracted; numpy (already present) skipped
+        with open(np_init, encoding='utf-8') as fh:
+            self.assertEqual(fh.read(), 'SENTINEL\n')  # not clobbered
+        self.assertTrue(_os.path.isfile(_os.path.join(root, 'lancedb', '__init__.py')))
+
+    def test_install_streams_progress(self):
+        popen, _calls = _offline_popen()
         seen = []
-        ok, msg = utils.install_lancedb(progress=seen.append, _popen=popen)
+        ok, _msg = utils.install_dep('zstandard', progress=seen.append, _popen=popen, _base=self._tmp)
         self.assertTrue(ok)
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn('--user', calls[0])
-        self.assertIn('--user', calls[1])
-        self.assertTrue(any('Successfully installed' in l for l in seen))
+        self.assertTrue(any('Downloading zstandard' in l for l in seen))
 
-    def test_both_attempts_fail(self):
-        popen, calls = self._fake_popen([(1, ['first error']), (2, ['still boom'])])
-        ok, msg = utils.install_lancedb(_popen=popen)
+    def test_install_requires_system_python(self):
+        def no_popen(cmd, **kw):
+            return _FakeProc(127, ['py: command not found'])
+
+        ok, msg = utils.install_dep('numpy', _popen=no_popen, _base=self._tmp)
         self.assertFalse(ok)
-        self.assertEqual(len(calls), 2)
-        self.assertIn('still boom', msg)
+        self.assertIn('No usable system Python', msg)
 
-    def test_lancedb_status_shape(self):
-        installed, info = utils.lancedb_status()
-        self.assertIsInstance(installed, bool)
-        self.assertIsInstance(info, str)
-
-
-class TestNumpyInstall(unittest.TestCase):
-    def _fake_popen(self, results):
-        calls = []
-
-        class FakeProc:
-            def __init__(self, rc, lines):
-                self._rc = rc
-                self.stdout = iter(lines)
-
-            def wait(self):
-                return self._rc
-
-        def popen(cmd, **kw):
-            calls.append(list(cmd))
-            rc, lines = results.pop(0)
-            return FakeProc(rc, lines)
-
-        return popen, calls
-
-    def test_pip_command(self):
-        cmd = utils.pip_install_command('numpy')
-        self.assertEqual(cmd[:4], [sys.executable, '-m', 'pip', 'install'])
-        self.assertEqual(cmd[-1], 'numpy')
-
-    def test_retry_with_user_then_success(self):
-        popen, calls = self._fake_popen([(1, ['error: permission denied']), (0, ['Successfully installed numpy'])])
-        ok, msg = utils.install_numpy(_popen=popen)
-        self.assertTrue(ok)
-        self.assertEqual(len(calls), 2)
-        self.assertNotIn('--user', calls[0])
-        self.assertIn('--user', calls[1])
-
-    def test_both_attempts_fail(self):
-        popen, calls = self._fake_popen([(1, ['first error']), (2, ['still boom'])])
-        ok, msg = utils.install_numpy(_popen=popen)
+    def test_install_unknown_dep(self):
+        ok, msg = utils.install_dep('pandas', _base=self._tmp)
         self.assertFalse(ok)
-        self.assertIn('still boom', msg)
+        self.assertIn('unknown dependency', msg)
 
-    def test_no_output_reports_command(self):
-        # pip exits non-zero but prints nothing (seen with calibre's bundled Python);
-        # the message must say so and include the exact command for manual repro
-        popen, calls = self._fake_popen([(2, []), (2, [])])
-        ok, msg = utils.install_numpy(_popen=popen)
+    def test_install_refused_when_external_deps_disabled(self):
+        from unittest import mock
+
+        with mock.patch.object(utils, 'external_deps_disabled', return_value=True):
+            ok, msg = utils.install_dep('numpy', _base=self._tmp)
         self.assertFalse(ok)
-        self.assertIn('no output', msg)
-        self.assertIn('-m pip install', msg)
-
-    def test_numpy_status_shape(self):
-        installed, info = utils.numpy_status()
-        self.assertIsInstance(installed, bool)
-        self.assertIsInstance(info, str)
+        self.assertIn('not available on macOS', msg)
 
 
-class TestUninstall(unittest.TestCase):
-    def _fake_popen(self, results):
-        calls = []
+class TestExternalUninstall(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='ss-deptest-')
+        popen, _calls = _offline_popen()
+        for dep in ('numpy', 'lancedb'):
+            ok, msg = utils.install_dep(dep, _popen=popen, _base=self._tmp)
+            self.assertTrue(ok, msg)
 
-        class FakeProc:
-            def __init__(self, rc, lines):
-                self._rc = rc
-                self.stdout = iter(lines)
+    def tearDown(self):
+        shutil.rmtree(self._tmp, ignore_errors=True)
 
-            def wait(self):
-                return self._rc
+    def test_uninstall_lancedb_keeps_numpy(self):
+        root = utils.external_deps_root(_base=self._tmp)
+        ok, msg = utils.uninstall_dep('lancedb', _base=self._tmp)
+        self.assertTrue(ok, msg)
+        utils.process_pending_removals(_base=self._tmp)  # no-op on POSIX; completes the Windows deferral
+        self.assertFalse(utils.dep_in_root('lancedb', _base=self._tmp))
+        self.assertTrue(utils.dep_in_root('numpy', _base=self._tmp))  # coupling: numpy survives
+        self.assertTrue(_os.path.isfile(_os.path.join(root, 'numpy', '__init__.py')))
+        self.assertFalse(_os.path.exists(_os.path.join(root, 'lancedb')))  # no empty dir left
 
-        def popen(cmd, **kw):
-            calls.append(list(cmd))
-            rc, lines = results.pop(0)
-            return FakeProc(rc, lines)
+    def test_uninstall_last_dep_wipes_root(self):
+        root = utils.external_deps_root(_base=self._tmp)
+        utils.uninstall_dep('lancedb', _base=self._tmp)
+        ok, msg = utils.uninstall_dep('numpy', _base=self._tmp)
+        self.assertTrue(ok, msg)
+        utils.process_pending_removals(_base=self._tmp)  # no-op on POSIX; completes the Windows deferral
+        self.assertFalse(_os.path.exists(root))  # empty folder removed
 
-        return popen, calls
+    def test_uninstall_absent_is_noop(self):
+        ok, msg = utils.uninstall_dep('zstandard', _base=self._tmp)
+        self.assertIn('nothing to remove', msg)
 
-    def test_pip_uninstall_command(self):
-        cmd = utils.pip_uninstall_command('zstandard')
-        self.assertEqual(cmd[:4], [sys.executable, '-m', 'pip', 'uninstall'])
-        self.assertIn('-y', cmd)
-        self.assertEqual(cmd[-1], 'zstandard')
+    def test_uninstall_refused_when_external_deps_disabled(self):
+        from unittest import mock
 
-    def test_success_reports_uninstalled(self):
-        popen, calls = self._fake_popen([(0, ['Found existing installation: numpy 2.3.0', 'Successfully uninstalled numpy-2.3.0'])])
-        seen = []
-        ok, msg = utils.uninstall_numpy(progress=seen.append, _popen=popen)
-        self.assertTrue(ok)
-        self.assertEqual(msg, 'numpy uninstalled.')
-        self.assertEqual(len(calls), 1)
-        self.assertIn('uninstall', calls[0])
-        self.assertTrue(any('Successfully uninstalled' in l for l in seen))
-
-    def test_single_attempt_no_user_fallback(self):
-        # unlike install, uninstall must not retry with --user
-        popen, calls = self._fake_popen([(1, ['boom'])])
-        ok, msg = utils.uninstall_lancedb(_popen=popen)
+        with mock.patch.object(utils, 'external_deps_disabled', return_value=True):
+            ok, msg = utils.uninstall_dep('numpy', _base=self._tmp)
         self.assertFalse(ok)
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn('--user', calls[0])
+        self.assertIn('not available on macOS', msg)
 
-    def test_failure_reports_tail(self):
-        popen, _ = self._fake_popen([(1, ['first error'])])
-        ok, msg = utils.uninstall_zstandard(_popen=popen)
-        self.assertFalse(ok)
-        self.assertIn('first error', msg)
+    @unittest.skipUnless(_os.name == 'nt', 'deferred uninstall is Windows-specific')
+    def test_uninstall_defers_to_restart_on_windows(self):
+        tmp = tempfile.mkdtemp(prefix='ss-deptest-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        popen, _calls = _offline_popen()
+        ok, msg = utils.install_dep('numpy', _popen=popen, _base=tmp)
+        self.assertTrue(ok, msg)
+        root = utils.external_deps_root(_base=tmp)
 
-    def test_no_output_reports_command(self):
-        popen, _ = self._fake_popen([(2, [])])
-        ok, msg = utils.uninstall_numpy(_popen=popen)
-        self.assertFalse(ok)
-        self.assertIn('no output', msg)
-        self.assertIn('-m pip uninstall', msg)
+        ok, msg = utils.uninstall_dep('numpy', _base=tmp)
+        self.assertTrue(ok, msg)
+        self.assertIn('restart', msg)  # deferred to next start, not removed in-session
+        self.assertFalse(utils.dep_in_root('numpy', _base=tmp))  # dist-info dropped now -> UI flips
+        self.assertTrue(_os.path.isfile(_os.path.join(root, 'numpy', '__init__.py')))  # files remain
+        self.assertTrue(_os.path.isfile(_os.path.join(root, '.pending_removal.json')))
 
-    def test_popen_exception_reported(self):
-        def popen(cmd, **kw):
-            raise OSError('spawn failed')
-
-        ok, msg = utils.uninstall_numpy(_popen=popen)
-        self.assertFalse(ok)
-        self.assertIn('OSError', msg)
-        self.assertIn('spawn failed', msg)
+        # next calibre start: nothing is imported yet, so the deferred files can go
+        utils.process_pending_removals(_base=tmp)
+        self.assertFalse(_os.path.exists(root))  # last dep fully removed -> root wiped
 
 
-class TestInterpreterNote(unittest.TestCase):
-    def test_reports_interpreter_and_pip_state(self):
-        note = utils._interpreter_note()
-        self.assertIsInstance(note, str)
-        self.assertIn('interpreter:', note)
-        self.assertIn(sys.executable, note)
-        # pip is installed in the test env, so it must report presence (not absence)
-        self.assertNotIn('NOT importable', note)
-        self.assertIn('pip', note)
+class TestDepStatus(unittest.TestCase):
+    def test_status_shape(self):
+        for fn in (utils.numpy_status, utils.zstandard_status, utils.lancedb_status):
+            installed, info = fn()
+            self.assertIsInstance(installed, bool)
+            self.assertIsInstance(info, str)
+
+    def test_known_deps_importable_in_test_env(self):
+        # the dev venv has all three pinned, so each must report present with a version
+        for dep in ('numpy', 'zstandard', 'lancedb'):
+            installed, info = utils._dep_status(dep)
+            self.assertTrue(installed, f'{dep} should be importable in the test env')
+            self.assertNotEqual(info, 'unknown')
 
 
 if __name__ == '__main__':

@@ -109,14 +109,13 @@ def _pick_interpreter():
     except OSError:
         out = ''
     for line in out.splitlines():
-        m = re.match(r'\s*-V:(\d+\.\d+)', line)
+        # py -0p lines look like "-V:3.14[-64] *  C:\...\python.exe": version, an
+        # optional [arch] marker, an optional default-marker '*', then the path
+        m = re.match(r'\s*-V:(\d+\.\d+)(?:\[[^\]]*\])?\s*(?:\*)?\s*(\S.*)$', line)
         if not m:
             continue
         ver = tuple(int(x) for x in m.group(1).split('.'))
-        rest = line[m.end():].lstrip()
-        if rest.startswith('*'):
-            rest = rest[1:].lstrip()
-        seen.setdefault(ver, rest.strip())
+        seen.setdefault(ver, m.group(2).strip())
     in_range = {v: p for v, p in seen.items() if (3, 12) <= v <= (3, 14)}
     if in_range:
         return in_range[max(in_range)]
@@ -128,15 +127,32 @@ def _pick_interpreter():
     return None
 
 
+def _dev_requirements():
+    """Parsed requirements-dev.txt as requirement strings (comments/blank lines removed)."""
+    reqs = []
+    with open(os.path.join(ROOT, 'requirements-dev.txt'), encoding='utf-8') as fh:
+        for line in fh:
+            line = line.split('#', 1)[0].strip()
+            if line:
+                reqs.append(line)
+    return reqs
+
+
+def _req_satisfied(python, req):
+    """True when the venv already provides `req` (exact version match when pinned)."""
+    if '==' in req:
+        name, want = [x.strip() for x in req.split('==', 1)]
+        code = "import importlib.metadata as m; raise SystemExit(0 if m.version(%r)==%r else 1)" % (name, want)
+        return subprocess.run([python, '-c', code], stdout=subprocess.DEVNULL).returncode == 0
+    if req == 'ruff':
+        return subprocess.run([python, '-m', 'ruff', '--version'], stdout=subprocess.DEVNULL).returncode == 0
+    mod = req.replace('-', '_')
+    return subprocess.run([python, '-c', f'import {mod}'], stdout=subprocess.DEVNULL).returncode == 0
+
+
 def _missing_dev_deps(python):
-    missing = []
-    if subprocess.run([python, '-m', 'ruff', '--version'],
-                      stdout=subprocess.DEVNULL).returncode != 0:
-        missing.append('ruff')
-    for mod in ('lancedb', 'lxml', 'numpy', 'zstandard'):
-        if subprocess.run([python, '-c', f'import {mod}']).returncode != 0:
-            missing.append(mod)
-    return missing
+    """Requirement strings from requirements-dev.txt that the venv does not yet satisfy."""
+    return [req for req in _dev_requirements() if not _req_satisfied(python, req)]
 
 
 def cmd_setup():

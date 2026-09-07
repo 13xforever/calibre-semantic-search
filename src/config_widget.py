@@ -35,14 +35,13 @@ from qt.core import (
 from .utils import (
     AttrField,
     Settings,
-    install_lancedb,
-    install_numpy,
-    install_zstandard,
+    bootstrap_external_deps,
+    dep_in_root,
+    external_deps_disabled,
+    install_dep,
     lancedb_status,
     numpy_status,
-    uninstall_lancedb,
-    uninstall_numpy,
-    uninstall_zstandard,
+    uninstall_dep,
     zstandard_status,
 )
 
@@ -73,7 +72,10 @@ class _DepWorker(QThread):
         self._func = func
 
     def run(self):
-        ok, msg = self._func(progress=self.line.emit)
+        try:
+            ok, msg = self._func(progress=self.line.emit)
+        except Exception as e:  # never let a worker die silently: recover the UI
+            ok, msg = False, f'{type(e).__name__}: {e}'
         self.finished_ok.emit(ok, msg)
 
 
@@ -124,14 +126,15 @@ HELP_BACKEND = _(
 )
 
 HELP_DEPS = _(
-    'Packages the plugin can install into calibre\'s own Python (via pip). Installing or uninstalling '
-    'does not restart anything automatically: a running session keeps using what it already loaded, and '
-    'the change fully takes effect after restarting calibre.\n\n'
+    "Optional packages the plugin can download from PyPI into a private library folder it imports directly. "
+    "They are NOT installed into calibre's own Python, and nothing is restarted.\n\n"
+    'Installing uses your system Python (the "py" launcher on Windows; python3/python elsewhere) only to fetch '
+    'the packages; the plugin then reads them from its own folder.\n\n'
     '- numpy: speeds up SQLite vector search (~36x); without it the plugin still works, just slower\n'
     '- zstandard: compresses chunk text in the SQLite backend (smaller database, faster reads)\n'
-    "- lancedb: the optional LanceDB storage backend\n\n"
-    'Uninstalling a package that a library currently needs blocks that library until the package is '
-    "reinstalled (see the block message in the plugin's status)."
+    "- lancedb: the optional LanceDB storage backend (depends on numpy)\n\n"
+    'A change takes effect for a running session where possible; see each package\'s note after an operation. '
+    "Uninstalling a package a library currently needs blocks that library until it is reinstalled."
 )
 
 HELP_FORMATS = _(
@@ -353,9 +356,9 @@ class SettingsWidget(QDialog):
         grid.setColumnStretch(2, 1)
         # (key, status_fn, install_fn, uninstall_fn, purpose)
         self._dep_funcs = {
-            'numpy': (numpy_status, install_numpy, uninstall_numpy, _('Speeds up SQLite vector search (~36x faster).')),
-            'zstandard': (zstandard_status, install_zstandard, uninstall_zstandard, _('Compresses chunk text in the SQLite backend (smaller database, faster reads).')),
-            'lancedb': (lancedb_status, install_lancedb, uninstall_lancedb, _('The optional LanceDB storage backend.')),
+            'numpy': (numpy_status, lambda progress=None: install_dep('numpy', progress), lambda progress=None: uninstall_dep('numpy', progress), _('Speeds up SQLite vector search (~36x faster).')),
+            'zstandard': (zstandard_status, lambda progress=None: install_dep('zstandard', progress), lambda progress=None: uninstall_dep('zstandard', progress), _('Compresses chunk text in the SQLite backend (smaller database, faster reads).')),
+            'lancedb': (lancedb_status, lambda progress=None: install_dep('lancedb', progress), lambda progress=None: uninstall_dep('lancedb', progress), _('The optional LanceDB storage backend. Depends on NumPy.')),
         }
         self._dep_rows = {}
         r = 0
@@ -458,17 +461,32 @@ class SettingsWidget(QDialog):
             self.backend_note.setText('')
 
     def _update_dep_row(self, dep):
-        status_fn = self._dep_funcs[dep][0]
-        ok, _info = status_fn()
         row = self._dep_rows[dep]
-        row['button'].setText(_('Uninstall...') if ok else _('Install...'))
+        button = row['button']
+        if external_deps_disabled():
+            # macOS is basics-only: no external dependency installs or uninstalls.
+            button.setEnabled(False)
+            button.setText(_('N/A'))
+            row['note'].setText(self._dep_funcs[dep][3] + _('\n\nExternal dependencies are not available on macOS.'))
+            return
+        # The button reflects what is present in the external folder, not whether the
+        # package happens to be importable right now -- a just-uninstalled package may
+        # still be mapped into this process until calibre restarts.
+        ok = dep_in_root(dep)
+        button.setText(_('Uninstall...') if ok else _('Install...'))
+        # NumPy cannot be removed while LanceDB (which needs it) is present in the folder.
+        if dep == 'numpy' and ok and dep_in_root('lancedb'):
+            button.setEnabled(False)
+            row['note'].setText(self._dep_funcs[dep][3] + _('\n\nUninstall is disabled because LanceDB depends on NumPy.'))
+            return
+        button.setEnabled(True)
         row['note'].setText(self._dep_funcs[dep][3])
 
     def _toggle_dep(self, dep):
-        if self._worker is not None:
+        if external_deps_disabled() or self._worker is not None:
             return
-        status_fn, install_fn, uninstall_fn = self._dep_funcs[dep][:3]
-        ok, _info = status_fn()
+        install_fn, uninstall_fn = self._dep_funcs[dep][1], self._dep_funcs[dep][2]
+        ok = dep_in_root(dep)
         fn, verb = (uninstall_fn, _('Uninstalling')) if ok else (install_fn, _('Installing'))
         self._worker = _DepWorker(fn)
         self._worker.line.connect(lambda l, d=dep: self._dep_rows[d]['note'].setText(l[-140:]))
@@ -476,29 +494,33 @@ class SettingsWidget(QDialog):
         for r in self._dep_rows.values():
             r['button'].setEnabled(False)
         self._dep_rows[dep]['note'].setText(
-            _('{verb} {pkg} into calibre\'s Python — this can take a few minutes...').format(verb=verb, pkg=dep)
+            _('{verb} {pkg} into the external library folder — this can take a few minutes...').format(verb=verb, pkg=dep)
         )
         self._worker.start()
 
     def _dep_done(self, dep, ok, msg):
         self._worker = None
         for r in self._dep_rows.values():
-            r['button'].setEnabled(True)
+            r['button'].setEnabled(not external_deps_disabled())
         if not ok:
             self._update_dep_row(dep)
             QMessageBox.critical(
                 self,
                 _('Semantic search'),
-                _('{pkg} operation failed.\n\n{msg}\n\nIf this was a permissions error, run calibre as '
-                  'administrator and try again, or do it manually into calibre\'s Python:  pip {verb} {pkg}').format(
-                      pkg=dep, msg=msg, verb='uninstall' if self._dep_funcs[dep][0]()[0] else 'install'
-                  ),
+                _('{pkg} operation failed.\n\n{msg}\n\nCheck that a 64-bit CPython with pip is available on PATH '
+                  '("py" on Windows, python3/python elsewhere) and that you can reach PyPI.').format(pkg=dep, msg=msg),
             )
             return
         import importlib
 
+        # Make the now-existing external folder importable in this process so the
+        # status check below (find_spec) reflects the fresh install/uninstall.
+        bootstrap_external_deps()
         importlib.invalidate_caches()
         self._update_dep_row(dep)
+        if dep in ('lancedb', 'numpy'):
+            # the NumPy row's uninstall button depends on whether LanceDB is present
+            self._update_dep_row('numpy')
         self._update_backend_note()
         if self.action is not None:
             # let the plugin react (e.g. convert an open SQLite library's codec)
@@ -506,26 +528,29 @@ class SettingsWidget(QDialog):
         QMessageBox.information(self, _('Semantic search'), self._dep_done_message(dep))
 
     def _dep_done_message(self, dep):
-        installed = self._dep_funcs[dep][0]()[0]
+        installed = dep_in_root(dep)
         if dep == 'numpy':
             return (
-                _('numpy was installed successfully.\n\nRestart calibre to enable fast SQLite search.')
+                _('numpy was added to the external library folder.\n\nFast SQLite search is now active in this session.')
                 if installed
-                else _("numpy was uninstalled from calibre's Python.\n\nThis session is unaffected; after a restart, "
-                      'SQLite search falls back to the slower pure-Python path until it is reinstalled.')
+                else _("numpy was removed from the external library folder.\n\nThis session keeps using it until calibre "
+                      'restarts; afterwards, SQLite search falls back to the slower pure-Python path.')
             )
         if dep == 'zstandard':
             return (
-                _('zstandard was installed successfully.\n\nOpen SQLite libraries using zlib compression will be '
-                  'converted to zstd automatically (a short migration runs before indexing).')
+                _('zstandard was added to the external library folder.\n\nOpen SQLite libraries that use zlib compression are '
+                  'converted to zstd in the background (indexing pauses for the duration). The conversion rewrites every stored '
+                  'chunk, so on a large library it can take several minutes; it resumes automatically if interrupted.')
                 if installed
-                else _("zstandard was uninstalled from calibre's Python.\n\nThe open library (if any) is being "
-                      'converted to zlib compression so it stays readable after a restart.')
+                else _("zstandard was removed from the external library folder.\n\nThe open library (if any) is converted to zlib "
+                      'compression in the background (indexing pauses for the duration) so it stays readable after a restart; on a '
+                      'large library this can take a while.')
             )
         return (
-            _('lancedb was installed successfully.\n\nRestart calibre to use the LanceDB backend.')
+            _('lancedb was added to the external library folder.\n\nYou can now pick the LanceDB backend for new libraries, '
+              'or switch an existing one in the Storage tab.')
             if installed
-            else _("lancedb was uninstalled from calibre's Python.\n\nLibraries that store their data in LanceDB "
+            else _("lancedb was removed from the external library folder.\n\nLibraries that store their data in LanceDB "
                    'will be blocked until it is reinstalled.')
         )
 

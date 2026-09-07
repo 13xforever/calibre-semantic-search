@@ -446,7 +446,23 @@ class SemanticSearchAction(InterfaceAction):
         """Called from the settings dialog after a package was installed/uninstalled."""
         import importlib
 
+        from .utils import bootstrap_external_deps
+
+        # The external folder may not have existed at plugin load (bootstrap was then a
+        # no-op), so make it importable now that a package may just have landed in it.
+        bootstrap_external_deps()
         importlib.invalidate_caches()
+        if dep == 'numpy':
+            # store.py captured numpy into a module global at import time; rebind it so
+            # this session uses a fresh install (or drops it) without a calibre restart.
+            from . import store as _store_mod
+
+            try:
+                import numpy as _np
+
+                _store_mod.np = _np
+            except ImportError:
+                _store_mod.np = None
         # A zstandard change affects an open sqlite library's text codec: convert it
         # in place now (the in-process module still works on uninstall, and the DB
         # must be readable without the package after a restart). Pause indexing for
