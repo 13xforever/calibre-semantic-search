@@ -363,6 +363,18 @@ class TestLanceDb(_LifecycleOps, unittest.TestCase):
         self.s = store.VectorStore(self.path, backend='lancedb')
         self._assert_persisted(self.s)
 
+    def test_lancedb_dir_is_hidden(self):
+        s = store.VectorStore(self.path, backend='lancedb')
+        self.s = s
+        d = s._lancedb_dir()
+        self.assertEqual(os.path.basename(d), '.semantic-search.lancedb')
+        if os.name == 'nt':
+            import ctypes
+
+            attr = ctypes.windll.kernel32.GetFileAttributesW(d)
+            self.assertNotEqual(attr, -1)
+            self.assertTrue(attr & 0x2)
+
 
 class _MigrateOps:
     """Shared helpers for the backend/codec migration scenarios."""

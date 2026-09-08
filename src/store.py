@@ -205,6 +205,31 @@ MIGRATE_KEY = 'backend_migrate'  # JSON progress of an in-flight cross-backend t
 RECOMPRESS_KEY = 'recompress'  # JSON progress of a pending/in-flight sqlite codec conversion (written when the user confirms a compression switch)
 
 
+def _set_hidden(path):
+    if os.name != 'nt':
+        return
+    import ctypes
+
+    try:
+        k32 = ctypes.windll.kernel32
+        attr = k32.GetFileAttributesW(path)
+        if attr != -1:
+            k32.SetFileAttributesW(path, attr | 0x2)
+    except Exception:
+        pass
+
+
+def lancedb_dir_for(db_path):
+    """The library's hidden LanceDB directory next to the SQLite file.
+
+    The dot prefix hides it on unix; on Windows FILE_ATTRIBUTE_HIDDEN is set as
+    well."""
+    base = os.path.splitext(os.path.basename(db_path))[0]
+    d = os.path.join(os.path.dirname(db_path), '.' + base + '.lancedb')
+    _set_hidden(d)
+    return d
+
+
 def _load_default_dict() -> bytes:
     # Installed plugins load from the ZIP via calibre's custom loader (virtual
     # __file__), so filesystem lookups never work there; get_resources is
@@ -791,7 +816,7 @@ class LanceVectorBackend:
         import lancedb  # lazy: optional dependency
 
         self.meta = meta
-        db_path = os.path.splitext(meta.db_path)[0] + '-lancedb'
+        db_path = lancedb_dir_for(meta.db_path)
         self._db = lancedb.connect(db_path)
         self._tables: dict[str, object] = {}
 
@@ -1101,7 +1126,7 @@ class VectorStore:
     # -- backend/codec state -------------------------------------------------------
 
     def _lancedb_dir(self) -> str:
-        return os.path.splitext(self.db_path)[0] + '-lancedb'
+        return lancedb_dir_for(self.db_path)
 
     def _lancedb_has_data(self) -> bool:
         try:

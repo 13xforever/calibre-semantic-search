@@ -83,9 +83,10 @@ attributes in custom columns.
   is closed mid-way. While it runs, intermediate data is flushed to the main
   file at phase boundaries, so the temporary WAL growth stays bounded even on
   slow disks.
-- The **lancedb** backend keeps vectors in a sibling LanceDB directory
-  (`semantic-search-lancedb/`), one table per embedding model; bookkeeping
-  stays in SQLite either way.
+- The **lancedb** backend keeps vectors in a hidden sibling LanceDB directory
+  (`.semantic-search.lancedb`, also marked with the hidden attribute on
+  Windows), one table per embedding model; bookkeeping stays in SQLite either
+  way.
 - Chunk tables left over from an old embedding model are dropped automatically
   once no indexed book uses that model anymore (after re-indexing / removal).
 - Attributes are also written to calibre custom columns, so they survive even
