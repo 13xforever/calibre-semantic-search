@@ -21,9 +21,12 @@ MetaStore always exists, for both backends). The `backend` argument is only a
 default for libraries that have no data yet; a library with existing data keeps
 it where the data lives until the user picks another backend in settings, which
 VectorStore.finalize_schema() then carries out as a resumable cross-backend
-transfer. Likewise the sqlite text codec (meta['text_codec']) is converted in
-place when zstandard appears/disappears. Opening a store whose data cannot be
-read with the currently installed packages raises MissingDependencyError.
+transfer. Chunk-text compression works the same way: meta['text_codec'] records
+the codec the chunks are actually stored with (zstd+dict or zlib), and a switch
+confirmed in settings is recorded as a meta['recompress'] marker that
+finalize_schema() executes as an in-place, resumable conversion — the marker is
+deleted when it finishes. Opening a store whose data cannot be read with the
+currently installed packages raises MissingDependencyError.
 
 Schema versioning: the meta tables (books/dirty/attrs_raw plus the models/formats/
 file_info registries) are versioned with PRAGMA user_version and migrated
@@ -199,7 +202,7 @@ DEFAULT_DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'as
 # Per-library choices and in-flight migration progress, all in the meta table:
 BACKEND_KEY = 'vector_backend'  # 'sqlite' | 'lancedb' — where this library's chunks should live
 MIGRATE_KEY = 'backend_migrate'  # JSON progress of an in-flight cross-backend transfer
-RECOMPRESS_KEY = 'recompress'  # JSON progress of an in-flight sqlite codec conversion
+RECOMPRESS_KEY = 'recompress'  # JSON progress of a pending/in-flight sqlite codec conversion (written when the user confirms a compression switch)
 
 
 def _load_default_dict() -> bytes:
@@ -220,6 +223,30 @@ def build_codec_spec(zstandard_ok: bool) -> dict:
     if zstandard_ok:
         return {'name': 'zstd', 'dictionary': base64.b64encode(_load_default_dict()).decode('ascii')}
     return {'name': 'zlib'}
+
+
+def codec_spec_json(name: str) -> str:
+    """The meta['text_codec'] JSON for a codec name ('zstd' | 'zlib')."""
+    return json.dumps(build_codec_spec(name == 'zstd'))
+
+
+def recompress_marker(target: str) -> str:
+    """A fresh meta['recompress'] marker asking the sqlite backend to convert to `target`."""
+    return json.dumps({'target': target, 'done': [], 'cur_table': None, 'last_id': 0})
+
+
+def write_codec_choice(meta: 'MetaStore', codec: str):
+    """Record a confirmed compression switch in `meta`.
+
+    With sqlite chunk data present this is a pending in-place conversion (the
+    recompress marker, executed by finalize_schema); without it the codec spec
+    itself is updated so data that will arrive uses the chosen codec."""
+    with meta._lock:
+        rows = meta.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'chunks_%'").fetchall()
+    if any(not n[0].endswith('__new') for n in rows):
+        meta.set_meta(RECOMPRESS_KEY, recompress_marker(codec))
+    else:
+        meta.set_meta(TEXT_CODEC_KEY, codec_spec_json(codec))
 
 
 class TextCodec:
@@ -255,18 +282,25 @@ class TextCodec:
 
 
 def ensure_codec_setup(meta: 'MetaStore'):
-    """Record the text codec in meta (once per DB).
+    """Make sure the recorded text codec is usable in THIS session (once per open).
 
-    Runs at migration / new-DB init only — never on the write path. Uses zstd when
-    zstandard is importable, else zlib; it never installs anything (that is the
-    user's choice in the settings dialog). An existing DB whose recorded codec no
-    longer matches the installed packages is converted by
-    VectorStore._recompress_chunks during finalize_schema().
+    Runs at migration / new-DB init and on every open — never on the write path.
+    The stored codec (meta[TEXT_CODEC_KEY]) is the source of truth; it is kept as
+    long as its package is installed. A missing or unusable record is healed to a
+    usable codec: zstd when zstandard is available, zlib otherwise. Healing is only
+    reachable for dataless libraries — a library whose chunks are stored with zstd
+    but lacks the package is blocked in VectorStore.__init__ before this runs.
     """
-    if meta.get_meta(TEXT_CODEC_KEY) is not None:
+    spec = None
+    try:
+        spec = json.loads(meta.get_meta(TEXT_CODEC_KEY))
+    except (TypeError, ValueError):
+        spec = None
+    if spec is not None and spec.get('name') == 'zlib':
         return
-    spec = build_codec_spec(_module_available('zstandard'))
-    meta.set_meta(TEXT_CODEC_KEY, json.dumps(spec))
+    if spec is not None and spec.get('name') == 'zstd' and _module_available('zstandard'):
+        return
+    meta.set_meta(TEXT_CODEC_KEY, codec_spec_json('zstd' if _module_available('zstandard') else 'zlib'))
 
 
 # -- DDL ------------------------------------------------------------------------
@@ -979,8 +1013,21 @@ class VectorStore:
         w = self.meta.get_meta(BACKEND_KEY)
         return w if w in ('sqlite', 'lancedb') else self.want_backend
 
+    def stored_codec(self):
+        """The codec this library's chunks are actually stored with ('zstd'/'zlib'),
+        or None when there is no sqlite chunk data to speak of."""
+        if self.backend_name != 'sqlite' or not self._sqlite_has_chunks():
+            return None
+        return self._recorded_codec_name()
+
     def pending_stages(self) -> list[str]:
-        """Ordered migration stages still to run: 'schema', 'backend', 'codec'."""
+        """Ordered migration stages still to run: 'schema', 'backend', 'codec'.
+
+        The 'codec' stage is pending while a meta[RECOMPRESS_KEY] marker asks for a
+        conversion (written when the user confirms a compression switch); it is
+        deleted when the conversion finishes. A marker whose target package is
+        missing blocks the open in __init__, so here it always means the work can
+        actually run."""
         want = self._wanted_backend()
         stages = []
         if self.backend.pending_work():
@@ -989,7 +1036,7 @@ class VectorStore:
         # (MIGRATE_KEY is set from the first inserted row until completion)
         if self.backend_name != want or self.meta.get_meta(MIGRATE_KEY) is not None:
             stages.append('backend')
-        if self.backend_name == 'sqlite' and (self._codec_mismatch() or self.meta.get_meta(RECOMPRESS_KEY) is not None):
+        if self.backend_name == 'sqlite' and self.meta.get_meta(RECOMPRESS_KEY) is not None:
             stages.append('codec')
         return stages
 
@@ -1028,7 +1075,7 @@ class VectorStore:
             say('backend', f'moving data to the {dst} backend')
             self._migrate_backend(src, dst)
             did = True
-        if self.backend_name == 'sqlite' and (self._codec_mismatch() or self.meta.get_meta(RECOMPRESS_KEY) is not None):
+        if self.backend_name == 'sqlite' and self.meta.get_meta(RECOMPRESS_KEY) is not None:
             say('codec', 'recompressing chunk text')
             self._recompress_chunks(say)
             did = True
@@ -1092,10 +1139,18 @@ class VectorStore:
         return name
 
     def _missing_dependency(self, backend_name):
-        """Package missing for `backend_name` to be usable (its data readable), or None."""
+        """Package missing for `backend_name` to be usable (its data readable), or None.
+
+        Only stored data blocks: a dataless library never does, because its codec
+        record is healed to a usable one in ensure_codec_setup() instead."""
         if backend_name == 'lancedb' and not _module_available('lancedb'):
             return 'lancedb'
-        if backend_name == 'sqlite' and self._recorded_codec_name() == 'zstd' and not _module_available('zstandard'):
+        if (
+            backend_name == 'sqlite'
+            and self._sqlite_has_chunks()
+            and self._recorded_codec_name() == 'zstd'
+            and not _module_available('zstandard')
+        ):
             return 'zstandard'
         return None
 
@@ -1249,26 +1304,23 @@ class VectorStore:
             return None
         return p if isinstance(p, dict) else None
 
-    def _codec_mismatch(self) -> bool:
-        cur = self._recorded_codec_name()
-        if cur is None:
-            return False  # created on demand with whatever is available
-        target = 'zstd' if _module_available('zstandard') else 'zlib'
-        return cur != target
-
     def _recompress_chunks(self, say):
-        """Convert every sqlite chunk row from the recorded codec to the target one.
+        """Convert every sqlite chunk row to the codec named in meta[RECOMPRESS_KEY].
 
         In place and resumable: rows are updated in keyset batches, each batch
         committed together with its progress marker (meta[RECOMPRESS_KEY]); a row
         already in the target format is recognized by magic bytes and skipped, so
         a restart never double-converts. The codec meta flips only after every
-        table has been fully converted."""
-        cur_spec = json.loads(self.meta.get_meta(TEXT_CODEC_KEY))
+        table has been fully converted, then the marker is deleted."""
         prog = self._recompress_progress()
         if prog is None or prog.get('target') not in ('zstd', 'zlib'):
-            prog = {'target': 'zstd' if _module_available('zstandard') else 'zlib', 'done': [], 'cur_table': None, 'last_id': 0}
-        target_spec = build_codec_spec(_module_available('zstandard'))
+            return  # no valid marker: nothing to do (pending_stages gates on it)
+        want = prog['target']
+        if want == 'zstd' and not _module_available('zstandard'):
+            # defensive: __init__ blocks the open in this state — name the package anyway
+            raise MissingDependencyError('zstandard', self._sqlite_has_chunks(), self.want_backend)
+        cur_spec = json.loads(self.meta.get_meta(TEXT_CODEC_KEY))
+        target_spec = build_codec_spec(want == 'zstd')
         src = TextCodec(cur_spec)
         dstc = TextCodec(target_spec)
         tables = self.backend._chunk_tables()

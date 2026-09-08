@@ -20,9 +20,11 @@ from qt.core import (
 from .store import (
     BACKEND_KEY,
     MIGRATE_KEY,
+    RECOMPRESS_KEY,
     MetaStore,
     MissingDependencyError,
     VectorStore,
+    write_codec_choice,
 )
 from .utils import load_settings, save_settings
 
@@ -160,7 +162,6 @@ class SemanticSearchAction(InterfaceAction):
     _status_sig = pyqtSignal(object)
     _db_sig = pyqtSignal(object)  # (method, args, kwargs, threading.Event)
     _finalize_sig = pyqtSignal(object, object)  # (store, error-or-None)
-    _inplace_sig = pyqtSignal(object)  # (store, error-or-None, resume_after) from an in-session finalize
     _finalize_prog_sig = pyqtSignal(object)  # (stage, detail) migration progress lines
 
     def __init__(self, parent, site_customization):
@@ -182,7 +183,6 @@ class SemanticSearchAction(InterfaceAction):
         self._status_sig.connect(self._on_status)
         self._db_sig.connect(self._on_db_write)
         self._finalize_sig.connect(self._on_finalize_done)
-        self._inplace_sig.connect(self._on_inplace_done)
         self._finalize_prog_sig.connect(self._on_finalize_progress)
 
     # -- lifecycle -----------------------------------------------------------
@@ -352,7 +352,7 @@ class SemanticSearchAction(InterfaceAction):
         if self._blocked_dep == 'zstandard':
             return (
                 "This library's chunk text is zstd-compressed, but the 'zstandard' package is not installed.\n\n"
-                "Re-install it from the Semantic search settings (Dependencies tab), or switch this library to a state that does not need it there."
+                "Install it from the Semantic search settings (Dependencies tab) to make this library readable again."
             )
         return f'The {self._blocked_dep} package is required for this library but is not installed.'
 
@@ -420,28 +420,6 @@ class SemanticSearchAction(InterfaceAction):
         self._begin_indexing()
         self._update_action_availability()
 
-    def _inplace_finalize_safe(self, store, resume_after):
-        # dependency install/uninstall changed what the sqlite codec can be: convert
-        # in place. Indexing was paused by the caller if it was running.
-        try:
-            store.finalize_schema(progress=self._emit_finalize_progress)
-            self._inplace_sig.emit((store, None, resume_after))
-        except Exception as e:
-            self._inplace_sig.emit((store, e, resume_after))
-
-    def _on_inplace_done(self, payload):
-        store, error, resume_after = payload
-        if store is not self.store:
-            return  # library switched mid-way; the new startup owns things now
-        if resume_after and self.indexer is not None and self.indexer.paused:
-            self.indexer.resume()
-        if error is not None:
-            from calibre.gui2 import error_dialog
-
-            error_dialog(self.gui, 'Semantic search', f'Updating the search database failed:\n{error!r}', show=True)
-            return
-        self._update_action_availability()
-
     def on_dependency_changed(self, dep):
         """Called from the settings dialog after a package was installed/uninstalled."""
         import importlib
@@ -463,18 +441,10 @@ class SemanticSearchAction(InterfaceAction):
                 _store_mod.np = _np
             except ImportError:
                 _store_mod.np = None
-        # A zstandard change affects an open sqlite library's text codec: convert it
-        # in place now (the in-process module still works on uninstall, and the DB
-        # must be readable without the package after a restart). Pause indexing for
-        # the duration so no insert races the codec swap.
-        if dep == 'zstandard' and self.store is not None and self.store.backend_name == 'sqlite':
-            idx = self.indexer
-            resume_after = idx is not None and not idx.paused
-            if resume_after:
-                idx.pause()
-            t = threading.Thread(target=self._inplace_finalize_safe, args=(self.store, resume_after), name='SSFinalize', daemon=True)
-            self._finalize_thread = t
-            t.start()
+        # zstandard needs no in-session reaction: a library whose stored chunks are
+        # zstd was blocked (not open) while the package was missing, and it reopens
+        # normally once the package is back; an open library's codec only changes
+        # when the user confirms a switch in settings.
 
     def library_changed(self, db):
         self._start_for_library()
@@ -558,36 +528,53 @@ class SemanticSearchAction(InterfaceAction):
 
         from .config_widget import SettingsWidget
 
-        # per-library backend context for the dialog: where this library's data
+        # per-library storage context for the dialog: where this library's data
         # lives (or would live), even when the store is currently blocked
         lib_backend = None
+        lib_codec = None
         if self.store is not None:
             lib_backend = self.store.want_backend
+            lib_codec = self.store.stored_codec()
         elif self._blocked_dep is not None:
             lib_backend = self._blocked_want
+            # a zstandard block only happens when the chunks (or a pending conversion)
+            # are zstd, so that is what the dialog shows
+            if self._blocked_dep == 'zstandard':
+                lib_codec = 'zstd'
         w = SettingsWidget(
             self.get_settings(),
             action=self,
             library_backend=lib_backend,
+            library_codec=lib_codec,
             blocked_dep=self._blocked_dep,
             blocked_has_data=self._blocked_has_data,
         )
         if w.exec() == 1:
             save_settings(gprefs, w.settings())
-            self._apply_library_backend(w)
+            self._apply_library_storage(w)
+            if self.store is None and self._blocked_dep is not None:
+                # a package may have been (re)installed in the dialog: retry the open
+                # so a blocked library comes back without switching libraries first
+                self._start_for_library()
 
-    def _apply_library_backend(self, w):
-        """Apply the backend chosen in settings to the current library.
+    def _apply_library_storage(self, w):
+        """Apply the backend/compression chosen in settings to the current library.
 
-        The choice is written per-library (meta key) and takes effect on the next
-        open; if data must move, the migration runs in the background before
-        indexing starts.
+        The choices are written per-library (meta keys) and take effect on the next
+        open; if data must move or be re-compressed, that runs in the background
+        before indexing starts.
         """
         choice = w.backend_choice()
         if choice is None:
-            return  # no library context: only the global default changed
-        cur = self.store.want_backend if self.store is not None else self._blocked_want
-        if choice == cur:
+            return  # no library context: only the global defaults changed
+        cur_backend = self.store.want_backend if self.store is not None else self._blocked_want
+        codec = w.codec_choice()
+        cur_codec = self.store.stored_codec() if self.store is not None else ('zstd' if self._blocked_dep == 'zstandard' else None)
+        backend_changed = choice != cur_backend
+        # compression only applies to the sqlite backend; the combo shows the codec
+        # the chunks are stored with, so a different value means a conversion
+        codec_changed = choice == 'sqlite' and codec is not None and codec != cur_codec
+        if not backend_changed and not codec_changed:
             return
         ft = getattr(self, '_finalize_thread', None)
         if ft is not None and ft.is_alive():
@@ -596,15 +583,19 @@ class SemanticSearchAction(InterfaceAction):
             info_dialog(
                 self.gui,
                 'Semantic search',
-                'A database migration is already running. The backend change will apply after it finishes (or on the next restart).',
+                'A database migration is already running. The storage change will apply after it finishes (or on the next restart).',
                 show=True,
             )
             return
         try:
             if self.store is not None:
-                self.store.set_meta(BACKEND_KEY, choice)
-                # abandon any in-flight transfer/recompress: the data moves as-is
-                self.store.delete_meta(MIGRATE_KEY)
+                if backend_changed:
+                    self.store.set_meta(BACKEND_KEY, choice)
+                    # abandon any in-flight transfer/recompress: the data moves as-is
+                    self.store.delete_meta(MIGRATE_KEY)
+                    self.store.delete_meta(RECOMPRESS_KEY)
+                if codec_changed:
+                    write_codec_choice(self.store.meta, codec)
             else:
                 # blocked without an open store: write the meta directly so the
                 # next open can proceed (only reachable when no data is involved)
@@ -612,14 +603,18 @@ class SemanticSearchAction(InterfaceAction):
                 libdir = os.path.dirname(db.backend.dbpath)
                 ms = MetaStore(os.path.join(libdir, 'semantic-search.db'))
                 try:
-                    ms.set_meta(BACKEND_KEY, choice)
-                    ms.delete_meta(MIGRATE_KEY)
+                    if backend_changed:
+                        ms.set_meta(BACKEND_KEY, choice)
+                        ms.delete_meta(MIGRATE_KEY)
+                        ms.delete_meta(RECOMPRESS_KEY)
+                    if codec_changed:
+                        write_codec_choice(ms, codec)
                 finally:
                     ms.close()
         except Exception as e:
             from calibre.gui2 import error_dialog
 
-            error_dialog(self.gui, 'Semantic search', f'Could not change this library\'s backend:\n{e}', show=True)
+            error_dialog(self.gui, 'Semantic search', f'Could not change this library\'s storage settings:\n{e}', show=True)
             return
         self._start_for_library()  # reopens and runs the migration in the background
 

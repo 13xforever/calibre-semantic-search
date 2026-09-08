@@ -397,9 +397,11 @@ class _MigrateOps:
 
 
 class TestCodecRecompress(_MigrateOps, unittest.TestCase):
-    """The sqlite text codec converts in place when zstandard availability changes.
+    """The sqlite text codec follows the stored codec (meta['text_codec']).
 
-    The test env has zstandard installed; unavailability is simulated by patching
+    A compression switch confirmed in settings is recorded as a meta['recompress']
+    marker that finalize_schema() executes as an in-place conversion. The test env
+    has zstandard installed; unavailability is simulated by patching
     store._module_available (the real module stays importable, which mirrors an
     in-session uninstall where the already-loaded module still works)."""
 
@@ -419,16 +421,17 @@ class TestCodecRecompress(_MigrateOps, unittest.TestCase):
         real = self._orig_avail
         store._module_available = lambda name: False if (name == 'zstandard' and not zstandard_ok) else real(name)
 
-    def test_zstd_to_zlib_and_back(self):
+    def test_switch_zstd_to_zlib_and_back(self):
         s = store.VectorStore(self.path, backend='sqlite')
         self.s = s
         for bid, fmt, n in self.BOOKS:
             self._index(s, bid, fmt, n)
         self.assertEqual(self._codec_name(s), 'zstd')  # zstandard is installed in the test env
+        self.assertEqual(s.stored_codec(), 'zstd')
         self._check(s)
 
-        # "uninstall" zstandard (in-session): the open store converts on finalize
-        self._avail(False)
+        # confirm a switch to zlib in settings: a marker appears and the conversion runs
+        s.set_meta(store.RECOMPRESS_KEY, store.recompress_marker('zlib'))
         self.assertEqual(s.pending_stages(), ['codec'])
         stages = []
         s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
@@ -438,15 +441,16 @@ class TestCodecRecompress(_MigrateOps, unittest.TestCase):
         self.assertFalse(s.needs_finalize())
         self._check(s)
 
-        # reopen without zstandard: the zlib DB is readable, nothing pending
+        # reopen: the stored codec sticks — no conversion back to zstd
         s.close()
         self.s = store.VectorStore(self.path, backend='sqlite')
+        self.assertEqual(self.s.stored_codec(), 'zlib')
         self.assertEqual(self.s.pending_stages(), [])
         self.assertFalse(self.s.needs_finalize())
         self._check(self.s)
 
-        # "install" zstandard again: converts back to zstd in place
-        self._avail(True)
+        # confirm a switch back to zstd: converts back in place
+        self.s.set_meta(store.RECOMPRESS_KEY, store.recompress_marker('zstd'))
         self.assertEqual(self.s.pending_stages(), ['codec'])
         self.s.finalize_schema()
         self.assertEqual(self._codec_name(self.s), 'zstd')
@@ -469,6 +473,28 @@ class TestCodecRecompress(_MigrateOps, unittest.TestCase):
         finally:
             self._avail(True)
 
+    def test_inflight_zstd_marker_without_zstandard_blocks(self):
+        # stored as zlib with a pending conversion to zstd: the open store is fine...
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        s.set_meta(store.RECOMPRESS_KEY, store.recompress_marker('zlib'))
+        s.finalize_schema()
+        self.assertEqual(self._codec_name(s), 'zlib')
+        # ...and so is a fresh open while the marker still targets zstd
+        s.set_meta(store.RECOMPRESS_KEY, store.recompress_marker('zstd'))
+        s.close()
+        self.s = None
+        self._avail(False)
+        try:
+            with self.assertRaises(store.MissingDependencyError) as cm:
+                store.VectorStore(self.path, backend='sqlite')
+            self.assertEqual(cm.exception.dep, 'zstandard')
+            self.assertTrue(cm.exception.has_data)
+        finally:
+            self._avail(True)
+
     def test_fresh_library_never_blocks_on_codec(self):
         # no data yet: the codec is created on demand with whatever is available
         self._avail(False)
@@ -478,6 +504,45 @@ class TestCodecRecompress(_MigrateOps, unittest.TestCase):
             self._index(s, bid, fmt, n)
         self.assertEqual(self._codec_name(s), 'zlib')
         self._check(s)
+
+    def test_dataless_codec_choice_persists(self):
+        # a dataless library's pick becomes the codec its data will be stored with
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        self.assertEqual(self._codec_name(s), 'zstd')  # zstandard is installed in the test env
+        s.close()
+        self.s = None
+        ms = store.MetaStore(self.path)
+        try:
+            store.write_codec_choice(ms, 'zlib')  # what the settings dialog does for a dataless library
+        finally:
+            ms.close()
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        self.assertEqual(self._codec_name(s), 'zlib')
+        self.assertIsNone(s.stored_codec())  # no chunk data yet
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        self.assertEqual(self._codec_name(s), 'zlib')  # no forced conversion to zstd
+        self.assertEqual(s.pending_stages(), [])
+        self._check(s)
+
+    def test_dataless_zstd_record_survives_uninstall(self):
+        # a dataless library whose record says zstd is healed to zlib when the package
+        # is gone — it never blocks, because there is no stored data to protect
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        self.assertEqual(self._codec_name(s), 'zstd')
+        s.close()
+        self.s = None
+        self._avail(False)
+        try:
+            s = store.VectorStore(self.path, backend='sqlite')
+            self.s = s
+            self.assertIsNone(s.stored_codec())
+            self.assertEqual(self._codec_name(s), 'zlib')  # healed on open
+        finally:
+            self._avail(True)
 
 
 class TestBackendMigration(_MigrateOps, unittest.TestCase):

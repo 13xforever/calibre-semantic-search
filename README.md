@@ -70,9 +70,10 @@ attributes in custom columns.
 - Per-library SQLite file `semantic-search.db` next to `metadata.db` holds
   book registry, dirty queue, metadata, raw attribute JSON, and (for the
   sqlite backend) chunk text + vectors — one table per embedding model, so
-  different models never mix. Chunk text is stored compressed (zstd with a
-  bundled compression dictionary when available, zlib otherwise), which keeps
-  the file noticeably smaller than the raw text would be. Search reads vectors
+   different models never mix. Chunk text in the sqlite backend is stored
+   compressed — zstd (with a bundled compression dictionary) or zlib, chosen per
+   library in Settings and converted in the background when changed — which keeps
+   the file noticeably smaller than the raw text would be. Search reads vectors
   in RAM-budgeted batches (half of the free RAM) instead of loading the whole
   index.
 - Databases created by older versions migrate automatically on first start
@@ -127,19 +128,18 @@ What each dev dependency is for:
   walk runs against it in tests just as it does inside calibre. Test-only:
   production gets lxml from calibre itself.
 - `numpy` — makes vector search in the sqlite backend ~36x faster. Optional at
-  runtime (a pure-Python fallback exists) but calibre does not bundle it, so the
-  plugin checks on load and installs it in the background when missing; in this
+  runtime (a pure-Python fallback exists) but calibre does not bundle it, so it
+  is installed on demand from the Settings dialog (Dependencies tab); in this
   venv it is also needed to exercise the numpy code paths in tests (it arrives
   via lancedb's own dependencies too).
-- `zstandard` — the zstd text codec; without it every fresh store attempts a pip
-  install at runtime and falls back to zlib.
+- `zstandard` — the zstd text codec; without it new stores fall back to zlib
+  (a library can be converted to zstd later from Settings).
 
 The plugin itself needs none of these to *run* inside calibre: it ships exactly
 `src/` (no manifest) and uses the stdlib plus lxml (bundled by calibre). numpy
-is optional — checked on plugin load and installed in the background when
-missing; without it search falls back to a slower pure-Python path. lancedb/
-zstandard are optional at runtime too (the Settings dialog can install lancedb
-for you; zstandard is installed automatically when first needed).
+is optional — without it search falls back to a slower pure-Python path. lancedb
+and zstandard are optional at runtime too; the Settings dialog's Dependencies tab
+can install or uninstall them on demand.
 
 Individual steps (same venv interpreter):
 `.venv\Scripts\python dev.py compile | lint | test | build`.

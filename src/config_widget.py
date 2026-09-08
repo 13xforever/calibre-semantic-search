@@ -125,6 +125,16 @@ HELP_BACKEND = _(
     "New libraries use your last choice as their default."
 )
 
+HELP_COMPRESS = _(
+    "How this library's chunk text is compressed in the SQLite backend (the LanceDB backend stores plain text).\n"
+    "- zstd: smaller database and faster reads; needs the 'zstandard' package (Dependencies tab)\n"
+    "- zlib: always available, slightly larger\n\n"
+    "This shows the codec the library's chunks are actually stored with. Changing it re-compresses every stored "
+    "chunk — the conversion runs in the background before indexing starts. zstd is only selectable while the "
+    "'zstandard' package is installed; a library whose chunks are zstd-stored is locked to zstd (and its "
+    "indexing paused) until the package is reinstalled."
+)
+
 HELP_DEPS = _(
     "Optional packages the plugin can download from PyPI into a private library folder it imports directly. "
     "They are NOT installed into calibre's own Python, and nothing is restarted.\n\n"
@@ -216,12 +226,13 @@ HELP_CONTEXT = _(
 
 
 class SettingsWidget(QDialog):
-    def __init__(self, settings: Settings, action=None, library_backend=None, blocked_dep=None, blocked_has_data=False):
+    def __init__(self, settings: Settings, action=None, library_backend=None, library_codec=None, blocked_dep=None, blocked_has_data=False):
         super().__init__()
         self.s = settings
         self.action = action  # the plugin action (for on_dependency_changed), or None in tests
         self._worker = None
         self._lib_backend = library_backend  # where this library's data lives; None = no library context
+        self._lib_codec = library_codec  # codec the chunks are stored with ('zstd'/'zlib'); None = no sqlite chunk data
         self._blocked_dep = blocked_dep
         self._blocked_has_data = blocked_has_data
         self.setWindowTitle(_('Semantic search settings'))
@@ -268,6 +279,13 @@ class SettingsWidget(QDialog):
             # data exists but is unreadable without a missing package: switching now
             # would orphan it, so the choice is locked until it is readable again
             self.i_backend.setEnabled(False)
+        # with chunk data this shows the stored codec; without it, what a fresh
+        # library would use (zstd while its package is importable, zlib otherwise)
+        cur_compress = self._lib_codec if self._lib_codec is not None else ('zstd' if zstandard_status()[0] else 'zlib')
+        self.i_compress = QComboBox()
+        self.i_compress.addItems(['zstd', 'zlib'])
+        self.i_compress.setCurrentText(cur_compress)
+        self.i_compress.setEnabled(self._compress_editable())
         self.backend_note = QLabel()
         self.backend_note.setWordWrap(True)
         self.i_formats = QPlainTextEdit('\n'.join(self.s.format_priority))
@@ -296,7 +314,9 @@ class SettingsWidget(QDialog):
         self.i_attrmode.setCurrentText(self.s.attr_mode)
         f2.addRow(_('Vector backend (this library):'), self.i_backend)
         f2.addRow('', self.backend_note)
-        self.i_backend.currentTextChanged.connect(self._on_backend_changed)
+        f2.addRow(_('Chunk compression (this library):'), self.i_compress)
+        self.i_backend.currentTextChanged.connect(self._on_storage_changed)
+        self.i_compress.currentTextChanged.connect(self._on_storage_changed)
         f2.addRow(_('Format priority:'), self.i_formats)
         f2.addRow(_('Target chunk size (chars):'), self.i_target)
         f2.addRow(_('Overlap (chars):'), self.i_overlap)
@@ -392,6 +412,7 @@ class SettingsWidget(QDialog):
         B(HELP_CONCURRENCY, self.e_conc, f.labelForField(self.e_conc))
         B(HELP_TIMEOUT, self.e_timeout, f.labelForField(self.e_timeout))
         B(HELP_BACKEND, self.i_backend, f2.labelForField(self.i_backend))
+        B(HELP_COMPRESS, self.i_compress, f2.labelForField(self.i_compress))
         B(HELP_FORMATS, self.i_formats, f2.labelForField(self.i_formats))
         B(HELP_TARGET, self.i_target, f2.labelForField(self.i_target))
         B(HELP_OVERLAP, self.i_overlap, f2.labelForField(self.i_overlap))
@@ -415,7 +436,7 @@ class SettingsWidget(QDialog):
         box.rejected.connect(self.reject)
         v.addWidget(box)
 
-        self._update_backend_note()
+        self._on_storage_changed()
         for dep in self._dep_funcs:
             self._update_dep_row(dep)
 
@@ -448,10 +469,25 @@ class SettingsWidget(QDialog):
 
     # -- dependencies -------------------------------------------------------------
 
-    def _on_backend_changed(self, _t):
+    def _compress_editable(self) -> bool:
+        # The combo edits this library's stored codec, so it needs a library context;
+        # compression only applies to the sqlite backend; zstd is only selectable while
+        # its package is importable in this session; and a blocked-with-data library
+        # cannot be converted until it is readable again.
+        if self._lib_backend is None:
+            return False
+        if self.i_backend.currentText() != 'sqlite':
+            return False
+        if self._blocked_dep == 'zstandard' and self._blocked_has_data:
+            return False
+        return zstandard_status()[0]
+
+    def _on_storage_changed(self, *_t):
         self._update_backend_note()
-        # the LanceDB uninstall button depends on which backend is selected
+        self.i_compress.setEnabled(self._compress_editable())
+        # the uninstall buttons depend on what this library's storage needs
         self._update_dep_row('lancedb')
+        self._update_dep_row('zstandard')
 
     def _update_backend_note(self):
         cur = self.i_backend.currentText()
@@ -489,6 +525,12 @@ class SettingsWidget(QDialog):
         if dep == 'lancedb' and ok and self.i_backend.currentText() == 'lancedb':
             button.setEnabled(False)
             row['note'].setText(self._dep_funcs[dep][3] + _('\n\nUninstall is disabled while LanceDB is selected as the vector backend. Switch to SQLite first.'))
+            return
+        # zstandard cannot be removed while this library stores its chunks as zstd — that
+        # would block it until the package is reinstalled. Switch to zlib (and confirm) first.
+        if dep == 'zstandard' and ok and self._lib_codec == 'zstd':
+            button.setEnabled(False)
+            row['note'].setText(self._dep_funcs[dep][3] + _('\n\nUninstall is disabled while this library stores its chunks as zstd. Switch to zlib first.'))
             return
         button.setEnabled(True)
         row['note'].setText(self._dep_funcs[dep][3])
@@ -528,11 +570,15 @@ class SettingsWidget(QDialog):
         # status check below (find_spec) reflects the fresh install/uninstall.
         bootstrap_external_deps()
         importlib.invalidate_caches()
-        self._update_dep_row(dep)
-        if dep in ('lancedb', 'numpy'):
-            # the NumPy row's uninstall button depends on whether LanceDB is present
-            self._update_dep_row('numpy')
-        self._update_backend_note()
+        if dep == 'zstandard':
+            # zstd selectability and the compression combo depend on availability now
+            self._on_storage_changed()
+        else:
+            self._update_dep_row(dep)
+            if dep in ('lancedb', 'numpy'):
+                # the NumPy row's uninstall button depends on whether LanceDB is present
+                self._update_dep_row('numpy')
+            self._update_backend_note()
         if self.action is not None:
             # let the plugin react (e.g. convert an open SQLite library's codec)
             self.action.on_dependency_changed(dep)
@@ -549,13 +595,13 @@ class SettingsWidget(QDialog):
             )
         if dep == 'zstandard':
             return (
-                _('zstandard was added to the external library folder.\n\nOpen SQLite libraries that use zlib compression are '
-                  'converted to zstd in the background (indexing pauses for the duration). The conversion rewrites every stored '
-                  'chunk, so on a large library it can take several minutes; it resumes automatically if interrupted.')
+                _('zstandard was added to the external library folder.\n\nLibraries whose chunks are stored with zstd can be opened '
+                  'again now — confirm these settings to make it take effect. To store data with zstd, pick it under Chunk '
+                  'compression in the Indexing tab; the conversion of existing chunks runs in the background before indexing starts.')
                 if installed
-                else _("zstandard was removed from the external library folder.\n\nThe open library (if any) is converted to zlib "
-                      'compression in the background (indexing pauses for the duration) so it stays readable after a restart; on a '
-                      'large library this can take a while.')
+                else _("zstandard was removed from the external library folder.\n\nThis session keeps using the already-loaded copy "
+                      'until calibre restarts; afterwards, new SQLite libraries fall back to zlib compression. Libraries whose stored '
+                      'chunks are zstd-compressed stay blocked until it is reinstalled.')
             )
         return (
             _('lancedb was added to the external library folder.\n\nYou can now pick the LanceDB backend for new libraries, '
@@ -630,3 +676,12 @@ class SettingsWidget(QDialog):
         if self._lib_backend is None:
             return None
         return self.i_backend.currentText()
+
+    def codec_choice(self):
+        """Compression selected for the current library, or None when there was no library context.
+
+        Valid even for a dataless library (the pick then becomes the codec its data
+        will be stored with), so it keys on the library context, not on _lib_codec."""
+        if self._lib_backend is None:
+            return None
+        return self.i_compress.currentText()

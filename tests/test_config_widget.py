@@ -72,6 +72,7 @@ def _install_stubs():
     class QComboBox(_W):
         def __init__(self):
             self._current = ''
+            self.enabled = True
             self.currentTextChanged = _Sig()
 
         def addItems(self, items):
@@ -82,6 +83,9 @@ def _install_stubs():
 
         def currentText(self):
             return self._current
+
+        def setEnabled(self, v):
+            self.enabled = bool(v)
 
         def set_current(self, t):
             """Test helper: change the selection and fire the signal like Qt does."""
@@ -259,6 +263,114 @@ class TestLancedbUninstallGate(unittest.TestCase):
         w = self._widget({'numpy', 'lancedb'}, lib_backend='sqlite')
         self.assertFalse(w._dep_rows['numpy']['button'].enabled)
         self.assertTrue(self._lancedb_row(w)['button'].enabled)
+
+
+class TestZstandardUninstallGate(unittest.TestCase):
+    """The compression combo and zstandard's uninstall button follow what the library
+    actually stores: the combo edits the stored codec (disabled without a library
+    context, on lancedb, while zstandard is missing, or while a zstd library is
+    blocked), and uninstall is disabled while the chunks are stored as zstd."""
+
+    def setUp(self):
+        self._saved = (cfgw.dep_in_root, cfgw.external_deps_disabled, cfgw.zstandard_status)
+        cfgw.external_deps_disabled = lambda: False
+        cfgw.zstandard_status = lambda: (True, 'stub')
+
+    def tearDown(self):
+        cfgw.dep_in_root, cfgw.external_deps_disabled, cfgw.zstandard_status = self._saved
+
+    def _widget(self, present, lib_backend=None, lib_codec=None, zstd_ok=True, **kw):
+        cfgw.dep_in_root = lambda dep: dep in present
+        cfgw.zstandard_status = lambda: (zstd_ok, 'stub')
+        s = utils.Settings()
+        return cfgw.SettingsWidget(s, library_backend=lib_backend, library_codec=lib_codec, **kw)
+
+    def _zstd_row(self, w):
+        return w._dep_rows['zstandard']
+
+    # -- uninstall gate ----------------------------------------------------------
+
+    def test_uninstall_disabled_when_library_stores_zstd(self):
+        w = self._widget({'zstandard'}, lib_backend='sqlite', lib_codec='zstd')
+        row = self._zstd_row(w)
+        self.assertEqual(row['button'].text, 'Uninstall...')
+        self.assertFalse(row['button'].enabled)
+        self.assertIn('zstd', row['note'].text)
+
+    def test_uninstall_enabled_when_library_stores_zlib(self):
+        w = self._widget({'zstandard'}, lib_backend='sqlite', lib_codec='zlib')
+        row = self._zstd_row(w)
+        self.assertEqual(row['button'].text, 'Uninstall...')
+        self.assertTrue(row['button'].enabled)
+
+    def test_uninstall_enabled_when_library_uses_lancedb(self):
+        # no sqlite chunk data: uninstalling cannot block this library
+        w = self._widget({'zstandard'}, lib_backend='lancedb', lib_codec=None)
+        row = self._zstd_row(w)
+        self.assertTrue(row['button'].enabled)
+
+    def test_install_stays_available_when_missing(self):
+        w = self._widget(set(), lib_backend='sqlite', lib_codec='zstd')
+        row = self._zstd_row(w)
+        self.assertEqual(row['button'].text, 'Install...')
+        self.assertTrue(row['button'].enabled)
+
+    def test_blocked_zstd_library_offers_install(self):
+        # zstd data exists but the package is missing: nothing to uninstall yet
+        w = self._widget(set(), lib_backend='sqlite', lib_codec='zstd', blocked_dep='zstandard', blocked_has_data=True)
+        row = self._zstd_row(w)
+        self.assertEqual(row['button'].text, 'Install...')
+        self.assertTrue(row['button'].enabled)
+
+    # -- compression combo ---------------------------------------------------------
+
+    def test_combo_disabled_without_library_context(self):
+        w = self._widget({'zstandard'}, lib_backend=None)
+        self.assertFalse(w.i_compress.enabled)
+        self.assertIsNone(w.codec_choice())
+
+    def test_combo_shows_availability_default_without_data(self):
+        w = self._widget({'zstandard'}, lib_backend='sqlite', lib_codec=None)
+        self.assertEqual(w.i_compress.currentText(), 'zstd')  # the package is available here
+        self.assertTrue(w.i_compress.enabled)
+        w2 = self._widget({'zstandard'}, lib_backend='sqlite', lib_codec=None, zstd_ok=False)
+        self.assertEqual(w2.i_compress.currentText(), 'zlib')
+        self.assertFalse(w2.i_compress.enabled)
+
+    def test_combo_shows_stored_codec(self):
+        w = self._widget({'zstandard'}, lib_backend='sqlite', lib_codec='zlib')
+        self.assertEqual(w.i_compress.currentText(), 'zlib')
+        self.assertTrue(w.i_compress.enabled)
+        self.assertEqual(w.codec_choice(), 'zlib')
+
+    def test_combo_disabled_for_lancedb(self):
+        w = self._widget({'zstandard'}, lib_backend='lancedb', lib_codec=None)
+        self.assertFalse(w.i_compress.enabled)
+
+    def test_combo_live_follows_backend_combo(self):
+        w = self._widget({'zstandard'}, lib_backend='sqlite', lib_codec='zlib')
+        self.assertTrue(w.i_compress.enabled)
+        w.i_backend.set_current('lancedb')
+        self.assertFalse(w.i_compress.enabled)
+        w.i_backend.set_current('sqlite')
+        self.assertTrue(w.i_compress.enabled)
+
+    def test_combo_disabled_when_package_missing(self):
+        # stored as zlib and the package is gone: zstd is not selectable, so there is nothing to change
+        w = self._widget({'zstandard'}, lib_backend='sqlite', lib_codec='zlib', zstd_ok=False)
+        self.assertFalse(w.i_compress.enabled)
+
+    def test_combo_locked_for_blocked_zstd_library(self):
+        # blocked with data: the combo shows zstd and cannot be changed until readable
+        w = self._widget(set(), lib_backend='sqlite', lib_codec='zstd', blocked_dep='zstandard', blocked_has_data=True)
+        self.assertEqual(w.i_compress.currentText(), 'zstd')
+        self.assertFalse(w.i_compress.enabled)
+
+    def test_lancedb_gate_still_applies(self):
+        # regression: the two gates are independent — lancedb selected locks only lancedb
+        w = self._widget({'zstandard', 'lancedb'}, lib_backend='lancedb', lib_codec=None)
+        self.assertFalse(w._dep_rows['lancedb']['button'].enabled)
+        self.assertTrue(self._zstd_row(w)['button'].enabled)
 
 
 if __name__ == '__main__':
