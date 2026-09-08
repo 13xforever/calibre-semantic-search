@@ -296,7 +296,7 @@ class SettingsWidget(QDialog):
         self.i_attrmode.setCurrentText(self.s.attr_mode)
         f2.addRow(_('Vector backend (this library):'), self.i_backend)
         f2.addRow('', self.backend_note)
-        self.i_backend.currentTextChanged.connect(lambda _t: self._update_backend_note())
+        self.i_backend.currentTextChanged.connect(self._on_backend_changed)
         f2.addRow(_('Format priority:'), self.i_formats)
         f2.addRow(_('Target chunk size (chars):'), self.i_target)
         f2.addRow(_('Overlap (chars):'), self.i_overlap)
@@ -448,6 +448,11 @@ class SettingsWidget(QDialog):
 
     # -- dependencies -------------------------------------------------------------
 
+    def _on_backend_changed(self, _t):
+        self._update_backend_note()
+        # the LanceDB uninstall button depends on which backend is selected
+        self._update_dep_row('lancedb')
+
     def _update_backend_note(self):
         cur = self.i_backend.currentText()
         if self._blocked_dep is not None and self._blocked_has_data:
@@ -478,6 +483,12 @@ class SettingsWidget(QDialog):
         if dep == 'numpy' and ok and dep_in_root('lancedb'):
             button.setEnabled(False)
             row['note'].setText(self._dep_funcs[dep][3] + _('\n\nUninstall is disabled because LanceDB depends on NumPy.'))
+            return
+        # LanceDB cannot be removed while it is selected as the vector backend — that would
+        # block this library until it is reinstalled. Switch to SQLite first.
+        if dep == 'lancedb' and ok and self.i_backend.currentText() == 'lancedb':
+            button.setEnabled(False)
+            row['note'].setText(self._dep_funcs[dep][3] + _('\n\nUninstall is disabled while LanceDB is selected as the vector backend. Switch to SQLite first.'))
             return
         button.setEnabled(True)
         row['note'].setText(self._dep_funcs[dep][3])
