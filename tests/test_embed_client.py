@@ -140,8 +140,11 @@ class TestEmbedClient(unittest.TestCase):
         _Handler.fail_times = 99
         try:
             c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
-            with self.assertRaises(embed_client.EmbedError):
+            with self.assertRaises(embed_client.EmbedError) as cm:
                 c.embed(['x'])
+            # the server's error body (read on each retried 5xx) must survive into the final message
+            self.assertIn('server said', str(cm.exception))
+            self.assertIn('boom', str(cm.exception))
         finally:
             _Handler.fail_times = 0
 

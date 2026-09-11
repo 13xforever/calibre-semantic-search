@@ -51,6 +51,7 @@ class EmbedClient:
         url = self.base_url + path
         body = json.dumps(payload).encode('utf-8')
         last_err = None
+        last_detail = ''
         for attempt in range(self.max_retries):
             try:
                 req = urllib.request.Request(url, data=body, headers=self._headers(), method='POST')
@@ -69,6 +70,8 @@ class EmbedClient:
                 except Exception:
                     pass
                 last_err = e
+                if detail:
+                    last_detail = detail
                 if e.code == 429 or 500 <= e.code < 600:
                     time.sleep(min(2 ** attempt, 30))
                     continue
@@ -79,7 +82,10 @@ class EmbedClient:
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
                 last_err = e
                 time.sleep(min(2 ** attempt, 30))
-        raise EmbedError(f'embeddings request failed after {self.max_retries} attempts to {url}: {last_err}')
+        msg = f'embeddings request failed after {self.max_retries} attempts to {url}: {last_err}'
+        if last_detail:
+            msg += f'; server said: {last_detail[:300]}'
+        raise EmbedError(msg)
 
     # A 200 with a bad body (null/short/malformed vectors) is usually transient
     # server state; retry this many times, without delay, before failing the batch.
