@@ -19,7 +19,7 @@ calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extrac
 ## Testing gotchas (easy to get wrong)
 
 - `tests/` is **not** a package — always use `discover -s tests [-p file]`, never `unittest tests.test_x`.
-- Self-contained modules load via `tests/util.py:load(name)` (by filename, no package). Modules with relative imports (`store`, `indexer`, `gui`, `dialog`, `config_widget`) must be loaded as a synthetic package with the `_loadpkg` pattern — see `tests/test_indexer.py`.
+- Self-contained modules load via `tests/util.py:load(name)` (by filename, no package). Modules with relative imports (`store`, `indexer`, `gui`, `dialog`, `config_widget`, `attributes`) must be loaded as a synthetic package with the `_loadpkg` pattern — see `tests/test_indexer.py`.
 - `calibre.*` is unavailable in the test interpreter: any `calibre.ai` / `calibre.db` import must stay **inside functions**, never at module top level.
 - The lancedb backend tests are **not skipped** — `lancedb` is a hard test dependency; without it the suite fails loudly on purpose. Don't wrap them in `skipUnless`.
 - Simulating a *missing* optional package means patching `store._module_available` (the real module stays importable, mirroring an in-session uninstall where the loaded module still works while fresh opens must block). See `test_db_lifecycle.TestBlockedStates` / `TestCodecRecompress`.

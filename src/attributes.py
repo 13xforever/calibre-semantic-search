@@ -9,59 +9,11 @@ from __future__ import annotations
 import re
 from typing import Annotated, Any, Optional
 
+from .chunker import CHARS_PER_TOKEN, estimate_tokens
+
 DEFAULT_CONTEXT_TOKENS = 8192
 OVERHEAD_TOKENS = 1024  # reserved for prompt + field schema + output + safety margin
 MIN_TEXT_CHARS = 2000  # floor so a tiny context limit still yields a usable sample
-
-# Script-aware token estimation (kept in sync with chunker.py; this module is
-# loaded standalone in tests and cannot import from the plugin package).
-CHARS_PER_TOKEN = 3.5            # Latin text (and fallback)
-NONLATIN_CHARS_PER_TOKEN = 2.5   # Cyrillic, Greek, Arabic, Hebrew, Devanagari, Thai, ...
-DENSE_TOKENS_PER_CHAR = 1.2      # CJK ideographs, kana, hangul: roughly one token per char
-
-_DENSE_RANGES = (
-    (0x3000, 0x30FF),   # CJK punctuation + Japanese kana
-    (0x3400, 0x4DBF),   # CJK extension A
-    (0x4E00, 0x9FFF),   # CJK unified ideographs
-    (0xAC00, 0xD7AF),   # Hangul syllables
-    (0xF900, 0xFAFF),   # CJK compatibility
-    (0xFF00, 0xFFEF),   # fullwidth forms
-    (0x20000, 0x2EBEF),  # CJK extension B+
-)
-_NONLATIN_RANGES = (
-    (0x0370, 0x03FF),   # Greek
-    (0x0400, 0x052F),   # Cyrillic
-    (0x0530, 0x058F),   # Armenian
-    (0x0590, 0x05FF),   # Hebrew
-    (0x0600, 0x06FF),   # Arabic
-    (0x0750, 0x077F),   # Arabic supplement
-    (0x0900, 0x097F),   # Devanagari
-    (0x0E00, 0x0E7F),   # Thai
-    (0x10A0, 0x10FF),   # Georgian
-    (0xFB50, 0xFDFF),   # Arabic presentation forms A
-    (0xFE70, 0xFEFF),   # Arabic presentation forms B
-)
-
-
-def estimate_tokens(text: str) -> int:
-    """Script-aware token estimate for `text` (conservative; see constants above)."""
-    dense = nonlatin = 0
-    for ch in text:
-        cp = ord(ch)
-        if cp < 0x370:
-            continue
-        for lo, hi in _DENSE_RANGES:
-            if lo <= cp <= hi:
-                dense += 1
-                break
-        else:
-            for lo, hi in _NONLATIN_RANGES:
-                if lo <= cp <= hi:
-                    nonlatin += 1
-                    break
-    latin = len(text) - dense - nonlatin
-    total = dense * DENSE_TOKENS_PER_CHAR + nonlatin / NONLATIN_CHARS_PER_TOKEN + latin / CHARS_PER_TOKEN
-    return max(1, int(total + 0.5))
 
 
 def text_budget_chars(context_tokens: int) -> int:

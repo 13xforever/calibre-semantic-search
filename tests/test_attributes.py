@@ -1,11 +1,35 @@
+import importlib.util
 import os as _os
 import sys as _sys
+import types
 import unittest
 
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from util import load
 
-attributes = load('attributes')
+SRC = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'src')
+
+# attributes does a relative `from .chunker import ...`, so it must be loaded as a
+# synthetic package (like indexer). A distinct package name keeps this file's module
+# instances isolated from other tests' copies.
+_pkg = types.ModuleType('ssattrpkg')
+_pkg.__path__ = [SRC]
+_sys.modules['ssattrpkg'] = _pkg
+
+
+def _loadpkg(name):
+    key = 'ssattrpkg.' + name
+    if key in _sys.modules:
+        return _sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, _os.path.join(SRC, name + '.py'))
+    mod = importlib.util.module_from_spec(spec)
+    mod.__package__ = 'ssattrpkg'
+    _sys.modules[key] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+attributes = _loadpkg('attributes')
 utils = load('utils')
 
 
@@ -173,7 +197,7 @@ class TestTokenBudget(unittest.TestCase):
         self.assertEqual(attributes.estimate_tokens('x' * 350), 100)
 
     def test_cyrillic_estimate(self):
-        self.assertEqual(attributes.estimate_tokens('ж' * 1000), 400)
+        self.assertEqual(attributes.estimate_tokens('ж' * 1000), 667)
 
     def test_sample_all_fits(self):
         chunks = ['ж' * 100 for _ in range(3)]  # 40 tokens each
@@ -181,13 +205,13 @@ class TestTokenBudget(unittest.TestCase):
         self.assertEqual(out, '\n\n'.join(chunks))
 
     def test_sample_cyrillic_respects_token_budget(self):
-        chunks = ['ж' * 2000 for _ in range(10)]  # 800 tokens each
+        chunks = ['ж' * 1200 for _ in range(10)]  # 800 tokens each
         out = attributes.sample_text(chunks, max_tokens=1700)
         self.assertIn('ж', out)
         self.assertLessEqual(attributes.estimate_tokens(out), 1700 + 5)
 
     def test_map_split_token_budget(self):
-        chunks = ['ж' * 2000 for _ in range(4)]  # 800 tokens each
+        chunks = ['ж' * 1200 for _ in range(4)]  # 800 tokens each
         groups = attributes._split_for_map(chunks, group_tokens=1700)
         self.assertEqual(len(groups), 2)
         for g in groups:
