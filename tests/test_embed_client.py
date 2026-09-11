@@ -18,6 +18,8 @@ class _Handler(BaseHTTPRequestHandler):
     echo = False
     fixed_status = 0  # if non-zero, always answer with this status + fixed_body
     fixed_body = b''
+    bad_times = 0  # if >0, answer 200 with a bad body (per bad_kind) this many times
+    bad_kind = 'null'  # one of: null, short, empty_vec, nan, bool
     request_count = 0
 
     def do_POST(self):
@@ -37,6 +39,27 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             self.wfile.write(b'{"error": "boom"}')
+            return
+        n = len(body['input'])
+        if type(self).bad_times > 0:
+            type(self).bad_times -= 1
+            kind = type(self).bad_kind
+            if kind == 'null':
+                data = [{'object': 'embedding', 'index': i, 'embedding': (None if i == 0 else [1.0])} for i in range(n)]
+            elif kind == 'short':
+                data = [{'object': 'embedding', 'index': i, 'embedding': [1.0]} for i in range(max(0, n - 1))]
+            elif kind == 'empty_vec':
+                data = [{'object': 'embedding', 'index': i, 'embedding': []} for i in range(n)]
+            elif kind == 'nan':
+                data = [{'object': 'embedding', 'index': i, 'embedding': [float('nan')]} for i in range(n)]
+            else:  # bool
+                data = [{'object': 'embedding', 'index': i, 'embedding': [True, 1.0]} for i in range(n)]
+            resp = json.dumps({'object': 'list', 'data': data}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
             return
         if type(self).echo:
             # vector derived from the text itself so order can be verified
@@ -147,6 +170,80 @@ class TestEmbedClient(unittest.TestCase):
         # simulate by checking length validation logic via a bad batch size is enough coverage.
         c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
         self.assertEqual(c.embed([]), [])
+
+    def test_bad_response_retried_then_success(self):
+        _Handler.bad_times = 1
+        _Handler.bad_kind = 'null'
+        before = _Handler.request_count
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=5)
+            out = c.embed(['x'])
+            self.assertEqual(len(out), 1)
+            self.assertEqual(_Handler.request_count - before, 2)
+        finally:
+            _Handler.bad_times = 0
+
+    def test_bad_response_gives_up_after_two_retries(self):
+        _Handler.bad_times = 99
+        _Handler.bad_kind = 'null'
+        before = _Handler.request_count
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=9)
+            with self.assertRaises(embed_client.EmbedError) as cm:
+                c.embed(['x'])
+            self.assertEqual(_Handler.request_count - before, 3)
+            msg = str(cm.exception)
+            self.assertIn('after 3 attempts', msg)
+            self.assertIn('item 0: embedding is null', msg)
+        finally:
+            _Handler.bad_times = 0
+
+    def test_short_response_retried_then_success(self):
+        _Handler.bad_times = 1
+        _Handler.bad_kind = 'short'
+        before = _Handler.request_count
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=5)
+            out = c.embed(['x', 'y'])
+            self.assertEqual(len(out), 2)
+            self.assertEqual(_Handler.request_count - before, 2)
+        finally:
+            _Handler.bad_times = 0
+
+    def test_empty_vector_rejected(self):
+        _Handler.bad_times = 99
+        _Handler.bad_kind = 'empty_vec'
+        before = _Handler.request_count
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
+            with self.assertRaises(embed_client.EmbedError) as cm:
+                c.embed(['x'])
+            self.assertEqual(_Handler.request_count - before, 3)
+            self.assertIn('empty list', str(cm.exception))
+        finally:
+            _Handler.bad_times = 0
+
+    def test_nan_vector_rejected(self):
+        _Handler.bad_times = 99
+        _Handler.bad_kind = 'nan'
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
+            with self.assertRaises(embed_client.EmbedError) as cm:
+                c.embed(['x'])
+            self.assertIn('not finite', str(cm.exception))
+        finally:
+            _Handler.bad_times = 0
+
+    def test_bool_element_rejected(self):
+        _Handler.bad_times = 99
+        _Handler.bad_kind = 'bool'
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
+            with self.assertRaises(embed_client.EmbedError) as cm:
+                c.embed(['x'])
+            self.assertIn('not a number', str(cm.exception))
+        finally:
+            _Handler.bad_times = 0
 
 
 if __name__ == '__main__':
