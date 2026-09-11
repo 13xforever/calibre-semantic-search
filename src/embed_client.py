@@ -1,4 +1,14 @@
-'''OpenAI-compatible /v1/embeddings client (urllib only, no external deps).'''
+'''OpenAI-compatible /v1/embeddings client (urllib only, no external deps).
+
+Note: some local llama.cpp-based servers can answer HTTP 200 with unusable
+vectors — full-length embeddings of JSON nulls (non-finite values serialized
+as null). Observed with the f16 Qwen3-Embedding-8B GGUF served by unsloth
+Studio's bundled llama-server (its --kv-unified / slot-reuse configuration);
+a Q4_K_M build of the same model did not exhibit it. The defect is server-side,
+so we validate every vector and retry bad batches (BAD_RESPONSE_RETRIES)
+instead of trusting the 200; a batch that keeps failing raises an error that
+suggests trying another model/quantization or embedding server.
+'''
 
 from __future__ import annotations
 
@@ -87,7 +97,9 @@ class EmbedClient:
                 return self._parse(data, raw, len(texts))
             except _BadResponse as e:
                 last_err = e
-        raise EmbedError(f'embeddings response invalid after {1 + self.BAD_RESPONSE_RETRIES} attempts: {last_err}')
+        raise EmbedError(
+            f'embeddings response invalid after {1 + self.BAD_RESPONSE_RETRIES} attempts '
+            f'(server keeps returning unusable vectors; try another model/quantization or embedding server): {last_err}')
 
     def _parse(self, data, raw: bytes, expected: int) -> list[list[float]]:
         items = data.get('data') if isinstance(data, dict) else None
@@ -114,11 +126,14 @@ class EmbedClient:
             return f'item {i}: embedding is {type(v).__name__}, not a list: {repr(v)[:120]}'
         if not v:
             return f'item {i}: embedding is an empty list'
-        for j, x in enumerate(v):
-            if isinstance(x, bool) or not isinstance(x, (int, float)):
-                return f'item {i}: element {j} is {type(x).__name__}, not a number: {repr(x)[:60]}'
-            if not math.isfinite(x):
-                return f'item {i}: element {j} is not finite: {x!r}'
+        bad = [(j, x) for j, x in enumerate(v)
+               if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)]
+        if bad:
+            idxs = ', '.join(str(j) for j, _ in bad[:10])
+            extra = f' (+{len(bad) - 10} more)' if len(bad) > 10 else ''
+            j0, x0 = bad[0]
+            return (f'item {i}: {len(bad)} of {len(v)} elements bad at [{idxs}{extra}]; '
+                    f'first: element {j0} is {type(x0).__name__}: {x0!r}')
         return None
 
     def embed_batched(self, texts: list[str], batch_size: int = 64, progress=None, concurrency: int = 1) -> list[list[float]]:

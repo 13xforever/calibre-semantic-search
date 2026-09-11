@@ -19,7 +19,7 @@ class _Handler(BaseHTTPRequestHandler):
     fixed_status = 0  # if non-zero, always answer with this status + fixed_body
     fixed_body = b''
     bad_times = 0  # if >0, answer 200 with a bad body (per bad_kind) this many times
-    bad_kind = 'null'  # one of: null, short, empty_vec, nan, bool
+    bad_kind = 'null'  # one of: null, short, empty_vec, nan, bool, sparse_null
     request_count = 0
 
     def do_POST(self):
@@ -52,6 +52,8 @@ class _Handler(BaseHTTPRequestHandler):
                 data = [{'object': 'embedding', 'index': i, 'embedding': []} for i in range(n)]
             elif kind == 'nan':
                 data = [{'object': 'embedding', 'index': i, 'embedding': [float('nan')]} for i in range(n)]
+            elif kind == 'sparse_null':
+                data = [{'object': 'embedding', 'index': i, 'embedding': [None, 1.0, None]} for i in range(n)]
             else:  # bool
                 data = [{'object': 'embedding', 'index': i, 'embedding': [True, 1.0]} for i in range(n)]
             resp = json.dumps({'object': 'list', 'data': data}).encode()
@@ -230,7 +232,7 @@ class TestEmbedClient(unittest.TestCase):
             c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
             with self.assertRaises(embed_client.EmbedError) as cm:
                 c.embed(['x'])
-            self.assertIn('not finite', str(cm.exception))
+            self.assertIn('element 0 is float: nan', str(cm.exception))
         finally:
             _Handler.bad_times = 0
 
@@ -241,7 +243,19 @@ class TestEmbedClient(unittest.TestCase):
             c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
             with self.assertRaises(embed_client.EmbedError) as cm:
                 c.embed(['x'])
-            self.assertIn('not a number', str(cm.exception))
+            self.assertIn('element 0 is bool: True', str(cm.exception))
+        finally:
+            _Handler.bad_times = 0
+
+    def test_sparse_null_reports_all_bad_indices(self):
+        _Handler.bad_times = 99
+        _Handler.bad_kind = 'sparse_null'
+        try:
+            c = embed_client.EmbedClient(f'http://127.0.0.1:{self.port}', model='m', max_retries=2)
+            with self.assertRaises(embed_client.EmbedError) as cm:
+                c.embed(['x'])
+            msg = str(cm.exception)
+            self.assertIn('2 of 3 elements bad at [0, 2]', msg)
         finally:
             _Handler.bad_times = 0
 
