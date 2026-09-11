@@ -234,7 +234,7 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
                 conn.execute(
                     'INSERT INTO chunks(book_id, chunk_no, text, chapter_path, para_start, para_end, char_offset, model, dim, vector) '
                     'VALUES(?,?,?,?,?,?,?,?,?,?)',
-                    (bid, cn, text, f'Chapter {cn + 1}', cn * 3, cn * 3 + 2, cn * 400, m, self.LEGACY_DIM, store.vec_to_blob(vec)))
+                    (bid, cn, text, f'Chapter {cn + 1}', cn * 3, cn * 3 + 2, cn * 400, m, self.LEGACY_DIM, store.vec_to_blob(vec, f32=True)))
         conn.commit()
         conn.close()
 
@@ -268,18 +268,21 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
         self.assertEqual(s.backend._chunk_tables(), [])
         self.assertTrue(s.needs_finalize())
 
-        # stage 2: finalize splits + slims the chunk tables to v2
+        # stage 2: finalize splits + slims the chunk tables (v2) and converts the
+        # vectors to half floats (v3) in the same pass
         s.finalize_schema()
         with s.meta._lock:
             uv = c.execute('PRAGMA user_version').fetchone()[0]
             av = c.execute('PRAGMA auto_vacuum').fetchone()[0]
             tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             slim_cols = {r[1] for r in c.execute('PRAGMA table_info(chunks_legacy_embedding_8b)')}
-        self.assertEqual(uv, 2)
+            blob_len = c.execute('SELECT LENGTH(vector) FROM chunks_legacy_embedding_8b LIMIT 1').fetchone()[0]
+        self.assertEqual(uv, store.SCHEMA_VERSION)
         self.assertEqual(av, 2)
         self.assertNotIn('chunks', tables)
         self.assertIn('chunks_legacy_embedding_8b', tables)
         self.assertEqual(slim_cols, {'id', 'book_id', 'chunk_no', 'text_z', 'chapter_path', 'vector'})
+        self.assertEqual(blob_len, 2 * self.LEGACY_DIM)  # f32 -> f16: two bytes per component
         self.assertFalse(s.needs_finalize())
         res = s.search([1.0] * self.LEGACY_DIM, limit=5)
         self.assertEqual((res[0].book_id, res[0].chunk_no), (1, 0))
@@ -294,7 +297,7 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
         self.s = store.VectorStore(self.path, backend='sqlite')
         with self.s.meta._lock:
             uv = self.s.meta.conn.execute('PRAGMA user_version').fetchone()[0]
-        self.assertEqual(uv, 2)
+        self.assertEqual(uv, store.SCHEMA_VERSION)
         self.assertFalse(self.s.needs_finalize())
         self._assert_persisted(self.s)
 
@@ -359,9 +362,46 @@ class TestLanceDb(_LifecycleOps, unittest.TestCase):
 
         self._run_ops(s)
 
+        # data now exists -> the ANN index is a pending finalize stage
+        self.assertEqual(s.pending_stages(), ['index'])
+        stages = []
+        s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        self.assertTrue(any(st == 'index' for st, _ in stages))
+        cfg = s.backend._our_index(s.backend._open_table(self.MODEL))
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg.index_type, store.LanceVectorBackend.INDEX_TYPE)
+        self.assertEqual(s.pending_stages(), [])
+        self.assertFalse(s.needs_finalize())
+
         s.close()
         self.s = store.VectorStore(self.path, backend='lancedb')
         self._assert_persisted(self.s)
+
+    def test_lancedb_index_merge_tail(self):
+        s = store.VectorStore(self.path, backend='lancedb')
+        self.s = s
+        for i in range(4):
+            s.insert_chunk(1, _C(i, f'chunk {i}', ['Ch', f'S{i}'], i, i + 1, i * 10), self.MODEL, store.l2_normalize([1.0] * self.DIM))
+        s.commit(1)
+        s.upsert_book(1, 'EPUB', 4, self.MODEL)
+        s.finalize_schema()
+        self.assertEqual(s.pending_stages(), [])
+        orig = store.LanceVectorBackend.MERGE_TAIL_ROWS
+        store.LanceVectorBackend.MERGE_TAIL_ROWS = 3
+        try:
+            for i in range(4, 7):
+                s.insert_chunk(1, _C(i, f'chunk {i}', ['Ch', f'S{i}'], i, i + 1, i * 10), self.MODEL, store.l2_normalize([1.0] * self.DIM))
+            s.commit(1)
+            # three unindexed rows reach the (shrunk) threshold -> a merge is pending
+            self.assertEqual(s.pending_stages(), ['index'])
+            stages = []
+            s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+            self.assertTrue(any('updating' in d for _, d in stages))
+            self.assertEqual(s.pending_stages(), [])
+        finally:
+            store.LanceVectorBackend.MERGE_TAIL_ROWS = orig
+        res = s.search([1.0] * self.DIM, limit=10, min_score=-1.0)
+        self.assertEqual(len(res), 7)
 
     def test_lancedb_dir_is_hidden(self):
         s = store.VectorStore(self.path, backend='lancedb')
@@ -589,7 +629,9 @@ class TestBackendMigration(_MigrateOps, unittest.TestCase):
         self.assertTrue(s.needs_finalize())
         stages = []
         s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
-        self.assertEqual(stages, [('backend', 'moving data to the lancedb backend')])
+        self.assertEqual(stages[0], ('backend', 'moving data to the lancedb backend'))
+        # the freshly transferred data is indexed in the same pass (live-evaluated stage)
+        self.assertTrue(any(st == 'index' for st, _ in stages))
         self.assertEqual(s.backend_name, 'lancedb')
         self.assertEqual(s.get_meta(store.BACKEND_KEY), 'lancedb')
         self.assertIsNone(s.get_meta(store.MIGRATE_KEY))
@@ -648,7 +690,8 @@ class TestBackendMigration(_MigrateOps, unittest.TestCase):
         self.assertEqual(s.backend_name, 'lancedb')
         self.assertEqual(s.want_backend, 'lancedb')
         self.assertTrue(s._sqlite_has_chunks())  # not swept while in flight
-        self.assertEqual(s.pending_stages(), ['backend'])
+        # the partial lancedb data also lacks its vector index -> both stages pending
+        self.assertEqual(s.pending_stages(), ['backend', 'index'])
         s.finalize_schema()
         self.assertEqual(s.backend_name, 'lancedb')
         self.assertIsNone(s.get_meta(store.MIGRATE_KEY))

@@ -191,6 +191,12 @@ Flat baselines re-measured this round: lance f16 flat **1.67 s** (10/10), lance 
 
 ## Recommendations / decisions
 
+**Status — implemented**: f16 is now the storage format for both backends. sqlite: schema v3
+(`migrations/v3.py`, runs chained after v2 in the `'schema'` finalize stage; resumable via the
+`vec_migrate` marker, invalid vectors dropped with their books queued for re-indexing). lancedb: tables
+store halffloat directly and the new `'index'` finalize stage builds/maintains the IVF_HNSW_SQ cosine
+index (merge tail threshold 1000 rows) with `refine_factor(1)` search, as recommended below.
+
 Decision constraint (agreed): **sub-1 s per search is good enough; minimize disk without compromising
 search quality too much.** That kills every flat/scan option at scale, so disk = data + index always, and
 data precision is the only lever.

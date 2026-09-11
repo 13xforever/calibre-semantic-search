@@ -33,8 +33,15 @@ file_info registries) are versioned with PRAGMA user_version and migrated
 structurally on open. The sqlite chunk tables migrate from the legacy single
 `chunks` table to slim per-model tables whose text lives in a compressed `text_z`
 BLOB; the codec is recorded once in meta['text_codec'] and used verbatim by both
-reads and writes. Each migration step lives in the migrations/ package (one module
-per version step) and is imported at its call site below.
+reads and writes. At user_version 3 the vector blobs become half floats (2 bytes
+per component, ~lossless for normalized embeddings); earlier versions store single
+precision, and the width is derived from user_version, never stored per row. Each
+migration step lives in the migrations/ package (one module per version step) and
+is imported at its call site below.
+
+LanceDB tables store half floats natively; once a table holds enough rows,
+finalize_schema() builds an IVF_HNSW_SQ vector index for it ('index' stage) and
+keeps it merged with the appended rows (the state lives in the dataset manifest).
 '''
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ import threading
 import time
 import zlib
 from dataclasses import dataclass
+from datetime import timedelta
 
 try:
     import numpy as np  # optional, big speedup for search
@@ -97,21 +105,97 @@ def _module_available(name: str) -> bool:
         return False
 
 
-def vec_to_blob(vec) -> bytes:
+def vec_to_blob(vec, f32: bool = False) -> bytes:
+    """Pack a vector as little-endian IEEE floats: binary16 by default (the v3+
+    storage format), binary32 when `f32` (pre-v3 rows and legacy fixtures)."""
+    if f32:
+        if np is not None:
+            return np.asarray(vec, dtype='<f4').tobytes()
+        n = len(vec)
+        return struct.pack('<%df' % n, *vec)
     if np is not None:
-        return np.asarray(vec, dtype='<f4').tobytes()
-    n = len(vec)
-    return struct.pack('<%df' % n, *vec)
+        return np.asarray(vec, dtype='<f2').tobytes()
+    return _floats_to_half_bytes(vec)
 
 
-def blob_to_vec(blob: bytes):
+def blob_to_vec(blob: bytes, f16: bool = True):
+    """Decode a vector blob to float32 values (half blobs are upcast exactly)."""
     if np is not None:
-        return np.frombuffer(blob, dtype='<f4')
+        arr = np.frombuffer(blob, dtype='<f2' if f16 else '<f4')
+        return arr.astype('<f4') if f16 else arr
+    if f16:
+        return _half_bytes_to_floats(blob)
     import array
 
     a = array.array('f')
     a.frombytes(blob)
     return list(a)
+
+
+def _floats_to_half_bytes(vec) -> bytes:
+    """Pure-Python float -> IEEE binary16, round-to-nearest-even (byte-identical to
+    numpy's '<f2' cast). Converts from the full double precision in one step —
+    rounding via an intermediate float32 would disagree at rare boundaries. Only
+    used when numpy is unavailable."""
+    out = bytearray()
+    for x in vec:
+        f = struct.unpack('<Q', struct.pack('<d', float(x)))[0]
+        sign = ((f >> 63) & 1) << 15
+        exp = (f >> 52) & 0x7FF
+        mant = f & ((1 << 52) - 1)
+        if exp == 0x7FF:  # inf / nan
+            out += struct.pack('<H', sign | (0x7E00 if mant else 0x7C00))
+            continue
+        if exp == 0:  # zero or f64 subnormal: far below half's range, flushes to +-0
+            out += struct.pack('<H', sign)
+            continue
+        e = exp - 1023  # true exponent
+        m = mant | (1 << 52)  # 53-bit mantissa with the implicit leading bit
+        if e > 15:  # overflow
+            out += struct.pack('<H', sign | 0x7C00)
+            continue
+        if e < -14:  # half subnormal (or underflow to zero): K = m * 2^(e-28)
+            k = _round_shift(m, 28 - e)
+            if k == 1024:  # rounded up into the smallest normal
+                h = sign | (1 << 10)
+            else:
+                h = sign | k
+        else:  # normal half: keep the top 10 mantissa bits
+            k = _round_shift(m - (1 << 52), 42)
+            if k == 1024:  # carry into the exponent
+                h = sign | ((e + 16) << 10)
+            else:
+                h = sign | ((e + 15) << 10) | k
+        out += struct.pack('<H', h)
+    return bytes(out)
+
+
+def _round_shift(m: int, s: int) -> int:
+    """m >> s with round-to-nearest-even."""
+    r = m >> s
+    rem = m & ((1 << s) - 1)
+    half = 1 << (s - 1)
+    if rem > half or (rem == half and r & 1):
+        r += 1
+    return r
+
+
+def _half_bytes_to_floats(blob: bytes) -> list[float]:
+    """Pure-Python IEEE binary16 -> float (exact). Only used when numpy is unavailable."""
+    out = []
+    for i in range(0, len(blob), 2):
+        h = blob[i] | (blob[i + 1] << 8)
+        sign = -1.0 if h & 0x8000 else 1.0
+        exp = (h >> 10) & 0x1F
+        mant = h & 0x3FF
+        if exp == 0x1F:
+            v = float('inf') if mant == 0 else float('nan')
+        elif exp == 0:
+            v = mant * 2.0 ** -24
+        else:
+            v = (mant + 1024) * 2.0 ** (exp - 25)
+        out.append(sign * v)
+    return out
 
 
 def l2_normalize(vec):
@@ -203,6 +287,7 @@ DEFAULT_DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'as
 BACKEND_KEY = 'vector_backend'  # 'sqlite' | 'lancedb' — where this library's chunks should live
 MIGRATE_KEY = 'backend_migrate'  # JSON progress of an in-flight cross-backend transfer
 RECOMPRESS_KEY = 'recompress'  # JSON progress of a pending/in-flight sqlite codec conversion (written when the user confirms a compression switch)
+VEC_MIGRATE_KEY = 'vec_migrate'  # JSON progress of an in-flight f32->f16 vector conversion (migrations.v3; deleted with the final user_version flip)
 
 
 def _set_hidden(path):
@@ -332,7 +417,9 @@ def ensure_codec_setup(meta: 'MetaStore'):
 
 # Current schema version: brand-new DBs are created at this version, existing DBs
 # reach it through the migrations/ steps (one self-contained file per version).
-SCHEMA_VERSION = 2
+# user_version >= 3 also marks the vector blob format: half floats (2 bytes per
+# component) instead of single precision; v2 and earlier store f32.
+SCHEMA_VERSION = 3
 
 META_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS books(
@@ -641,15 +728,26 @@ class SqliteVectorBackend:
     # -- migration -----------------------------------------------------------------
 
     def pending_work(self) -> bool:
-        from .migrations.v2 import pending
+        from .migrations.v2 import pending as v2_pending
+        from .migrations.v3 import pending as v3_pending
 
-        return pending(self)
+        return v2_pending(self) or v3_pending(self)
 
-    def finalize(self) -> bool:
-        """Run the pending chunk migration. See migrations.v2."""
-        from .migrations.v2 import upgrade
+    def finalize(self, say=None) -> bool:
+        """Run the pending chunk migrations (v2 slim shape, then v3 half-float)."""
+        from .migrations.v2 import pending as v2_pending
+        from .migrations.v2 import upgrade as v2_upgrade
+        from .migrations.v3 import pending as v3_pending
+        from .migrations.v3 import upgrade as v3_upgrade
 
-        return upgrade(self)
+        did = False
+        if v2_pending(self):
+            did = v2_upgrade(self) or did
+        if v3_pending(self):
+            if say is not None:
+                say('schema', 'converting vectors to half precision')
+            did = v3_upgrade(self, say) or did
+        return did
 
     def drop_stale_models(self, current_model: str | None = None) -> int:
         """Drop chunk tables whose model no longer has any indexed book (e.g. after a model switch).
@@ -680,8 +778,11 @@ class SqliteVectorBackend:
     def insert_chunks(self, book_id: int, items):
         """items: list of (chunk, vector, model); text is compressed per the saved codec."""
         name = self._ensure_table(items[0][2])
+        # match the DB's current blob format so a table never mixes widths while a
+        # v3 conversion is still pending (new rows are converted with the rest)
+        f32 = self._vec_bytes() == 4
         rows = [
-            (book_id, c.chunk_no, self._codec.compress(c.text), ' > '.join(c.chapter_path or []), vec_to_blob(v))
+            (book_id, c.chunk_no, self._codec.compress(c.text), ' > '.join(c.chapter_path or []), vec_to_blob(v, f32=f32))
             for c, v, _model in items
         ]
         with self.meta._lock:
@@ -711,10 +812,22 @@ class SqliteVectorBackend:
             free = SEARCH_MIN_BUDGET * 4  # unknown: assume a modest amount of headroom
         return max(SEARCH_MIN_BUDGET, free // 2)
 
+    def _vec_bytes(self) -> int:
+        """Bytes per vector component in this DB's chunk tables (2 for f16 at
+        user_version >= 3, 4 for the legacy f32)."""
+        with self.meta._lock:
+            uv = self.conn.execute('PRAGMA user_version').fetchone()[0]
+        return 2 if uv >= 3 else 4
+
     def _table_dim(self, name: str):
         with self.meta._lock:
             row = self.conn.execute(f'SELECT LENGTH(vector) FROM {name} LIMIT 1').fetchone()
-        return row[0] // 4 if row and row[0] else None
+        if not row or not row[0]:
+            return None
+        # A table converted mid-v3-migration holds f16 blobs while user_version is
+        # still 2, so it reports half its dimension and is skipped by the search's
+        # per-table dim check until the migration's final commit flips it.
+        return row[0] // self._vec_bytes()
 
     def _avg_text_chars(self, name: str) -> int:
         cached = self._text_len_cache.get(name)
@@ -727,21 +840,23 @@ class SqliteVectorBackend:
         self._text_len_cache[name] = avg
         return avg
 
-    def _score_rows(self, rows, qv) -> list[float]:
-        """Dot products of each row's vector (last column) with the query vector."""
+    def _score_rows(self, rows, qv, f16: bool = False) -> list[float]:
+        """Dot products of each row's vector (last column) with the query vector.
+
+        `f16` says whether the row blobs are half floats; scores are computed in
+        single precision either way (half values upcast to f32 exactly)."""
         if np is not None:
             m = np.empty((len(rows), len(qv)), dtype='<f4')
             for i, r in enumerate(rows):
-                m[i] = np.frombuffer(r[-1], dtype='<f4')
+                m[i] = blob_to_vec(r[-1], f16)
             return list(m @ np.asarray(qv, dtype='<f4'))
         import array
 
         qa = array.array('f')
-        qa.frombytes(vec_to_blob(qv))
+        qa.frombytes(vec_to_blob(qv, f32=True))
         out = []
         for r in rows:
-            va = array.array('f')
-            va.frombytes(r[-1])
+            va = blob_to_vec(r[-1], f16)
             s = 0.0
             for a, b in zip(qa, va):
                 s += a * b
@@ -755,16 +870,22 @@ class SqliteVectorBackend:
         SEARCH_MIN_BUDGET floor) and keeps only a top-`limit` heap, so memory stays
         bounded no matter how many chunks are stored.
         """
+        # While a v3 conversion is in flight the tables mix blob widths (a converted
+        # f16 table can even masquerade as another model's dimension), so searching
+        # them would misread rows; stay out of the way until it finishes.
+        if self.meta.get_meta(VEC_MIGRATE_KEY) is not None:
+            return []
         qv = l2_normalize(query_vec)
         dim = qv.shape[0] if np is not None else len(qv)
         tables = [self._table_for(model)] if model is not None else self._chunk_tables()
         budget = self._search_budget()
-        top: list[tuple[float, int, SearchResult]] = []  # min-heap of (score, seq, result)
+        top: list[tuple[float, int, SearchResult]] = []  # min-heap of (score, -seq, result)
         seq = 0
+        f16 = self._vec_bytes() == 2
         for t in tables:
             if not self._table_exists(t) or self._table_dim(t) != dim:
                 continue
-            row_bytes = dim * 4 + self._avg_text_chars(t) + 64
+            row_bytes = dim * (2 if f16 else 4) + self._avg_text_chars(t) + 64
             batch = max(1, budget // max(1, row_bytes))
             last_id = 0
             while True:
@@ -778,14 +899,14 @@ class SqliteVectorBackend:
                 if not rows:
                     break
                 last_id = rows[-1][0]
-                for r, s in zip(rows, self._score_rows(rows, qv)):
+                for r, s in zip(rows, self._score_rows(rows, qv, f16)):
                     if s < min_score:
                         continue
                     heapq.heappush(
                         top,
                         (
                             s,
-                            seq,
+                            -seq,  # on a score tie the earliest row survives eviction
                             SearchResult(
                                 book_id=r[1],
                                 fmt=r[5] or '',
@@ -799,7 +920,7 @@ class SqliteVectorBackend:
                     seq += 1
                     if len(top) > limit:
                         heapq.heappop(top)
-        top.sort(key=lambda e: (-e[0], e[1]))
+        top.sort(key=lambda e: (-e[0], -e[1]))
         return [r for _, _, r in top]
 
 
@@ -823,8 +944,86 @@ class LanceVectorBackend:
     def pending_work(self) -> bool:
         return False  # existing tables are untouched; new tables are created slim on demand
 
-    def finalize(self) -> bool:
+    def finalize(self, say=None) -> bool:
         return False
+
+    # -- ANN index maintenance -------------------------------------------------------
+    #
+    # Vectors are stored as half floats (the same lossy storage the sqlite backend
+    # uses), so an IVF_HNSW_SQ index over them is worth building only once a table
+    # has enough rows; below that, a flat scan wins. The index state lives in the
+    # LanceDB dataset manifest, so no meta marker is needed: an interrupted build
+    # simply leaves "no index" behind and the next open detects it again.
+
+    INDEX_TYPE = 'IvfHnswSq'  # as reported by IndexConfig.index_type
+    MERGE_TAIL_ROWS = 1000  # re-merge once this many rows wait unindexed (flat-scan tail cost)
+    PARTITION_TARGET_ROWS = 1_048_576  # LanceDB's default IVF partition size
+
+    def _our_index(self, t):
+        """The IndexConfig of our vector index on table `t`, or None."""
+        try:
+            cfgs = list(t.list_indices())
+        except Exception:
+            return None
+        for c in cfgs:
+            if getattr(c, 'index_type', None) == self.INDEX_TYPE and getattr(c, 'columns', None) == ['vector']:
+                return c
+        return None
+
+    def index_pending(self) -> bool:
+        """True when any table with rows lacks our index or has a long unindexed tail."""
+        for name in sorted(self._table_names()):
+            t = self._open_named(name)
+            if t is None:
+                continue
+            try:
+                n = t.count_rows()
+            except Exception:
+                continue
+            if not n:
+                continue
+            cfg = self._our_index(t)
+            if cfg is None:
+                return True
+            if (getattr(cfg, 'num_unindexed_rows', 0) or 0) >= self.MERGE_TAIL_ROWS:
+                return True
+        return False
+
+    def finalize_index(self, say=None):
+        """Build / incrementally update the vector index of every table that needs it.
+
+        A missing index is built (IVF_HNSW_SQ, cosine); a stale one is refreshed with
+        optimize(), which also compacts and prunes fragments — followed by an
+        aggressive prune so the space of replaced fragments is reclaimed immediately."""
+        for name in sorted(self._table_names()):
+            t = self._open_named(name)
+            if t is None:
+                continue
+            try:
+                n = t.count_rows()
+            except Exception:
+                continue
+            if not n:
+                continue
+            cfg = self._our_index(t)
+            if cfg is None:
+                if say is not None:
+                    say('index', f'building vector index for {name} ({n:,} rows)')
+                from lancedb.index import IvfHnswSq
+
+                t.create_index(
+                    'vector',
+                    config=IvfHnswSq(
+                        distance_type='cosine',
+                        num_partitions=max(1, n // self.PARTITION_TARGET_ROWS),
+                        ef_construction=150,
+                    ),
+                )
+            elif (getattr(cfg, 'num_unindexed_rows', 0) or 0) >= self.MERGE_TAIL_ROWS:
+                if say is not None:
+                    say('index', f'updating vector index for {name} ({cfg.num_unindexed_rows:,} new rows)')
+                t.optimize()
+                t.optimize(cleanup_older_than=timedelta(0))
 
     def _table_name(self, model: str) -> str:
         return model_table_name(normalize_model(model or ''))
@@ -880,7 +1079,9 @@ class LanceVectorBackend:
                 ('chunk_no', pa.int32()),
                 ('text', pa.string()),
                 ('chapter_path', pa.string()),
-                ('vector', pa.list_(pa.float32(), dim)),
+                # half floats: same lossy storage as the sqlite backend's v3 blobs;
+                # searches re-rank candidates against the stored values (refine)
+                ('vector', pa.list_(pa.float16(), dim)),
             ]
         )
         t = self._db.create_table(name, schema=schema)
@@ -947,7 +1148,9 @@ class LanceVectorBackend:
         tables = [t for t in tables if t is not None]
         for t in tables:
             try:
-                rows.extend(t.search(vec).metric('cosine').limit(limit * 3).to_list())
+                # refine re-scores the ANN candidates against the stored vectors,
+                # correcting the lossy half-float / SQ index distances
+                rows.extend(t.search(vec).metric('cosine').limit(limit * 3).refine_factor(1).to_list())
             except Exception:
                 continue
         if not rows:
@@ -1046,13 +1249,15 @@ class VectorStore:
         return self._recorded_codec_name()
 
     def pending_stages(self) -> list[str]:
-        """Ordered migration stages still to run: 'schema', 'backend', 'codec'.
+        """Ordered migration stages still to run: 'schema', 'backend', 'codec', 'index'.
 
         The 'codec' stage is pending while a meta[RECOMPRESS_KEY] marker asks for a
         conversion (written when the user confirms a compression switch); it is
         deleted when the conversion finishes. A marker whose target package is
         missing blocks the open in __init__, so here it always means the work can
-        actually run."""
+        actually run. The lancedb 'index' stage is pending while any table with rows
+        lacks its vector index or has a long unindexed tail; it needs no marker,
+        because the index state lives in the LanceDB dataset manifest."""
         want = self._wanted_backend()
         stages = []
         if self.backend.pending_work():
@@ -1063,6 +1268,8 @@ class VectorStore:
             stages.append('backend')
         if self.backend_name == 'sqlite' and self.meta.get_meta(RECOMPRESS_KEY) is not None:
             stages.append('codec')
+        if self.backend_name == 'lancedb' and self.backend.index_pending():
+            stages.append('index')
         return stages
 
     def needs_finalize(self) -> bool:
@@ -1076,12 +1283,13 @@ class VectorStore:
             return self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0] != 2
 
     def finalize_schema(self, progress=None):
-        """Run pending migrations (schema -> backend -> codec), then one final VACUUM.
+        """Run pending migrations (schema -> backend -> codec -> index), then one final VACUUM.
 
-        Idempotent and resumable: every stage records its progress in meta, so an
-        interrupted run continues where it stopped on the next open. `progress` is
-        called as progress(stage, detail) with human-readable strings. Meant to be
-        called from a worker thread before indexing starts (see gui._start_for_library)."""
+        Idempotent and resumable: every stage records its progress in meta (or, for
+        the lancedb index stage, in the dataset manifest itself), so an interrupted
+        run continues where it stopped on the next open. `progress` is called as
+        progress(stage, detail) with human-readable strings. Meant to be called from
+        a worker thread before indexing starts (see gui._start_for_library)."""
 
         def say(stage, detail):
             if progress is not None:
@@ -1093,7 +1301,7 @@ class VectorStore:
         did = False
         if self.backend.pending_work():
             say('schema', 'migrating chunk tables')
-            self.backend.finalize()
+            self.backend.finalize(say)
             did = True
         src, dst = self._pending_transfer()
         if dst is not None and dst != src:
@@ -1103,6 +1311,11 @@ class VectorStore:
         if self.backend_name == 'sqlite' and self.meta.get_meta(RECOMPRESS_KEY) is not None:
             say('codec', 'recompressing chunk text')
             self._recompress_chunks(say)
+            did = True
+        # evaluated live: a transfer that just finished lands here in the same pass
+        if self.backend_name == 'lancedb' and self.backend.index_pending():
+            say('index', 'building vector index')
+            self.backend.finalize_index(say)
             did = True
         with self.meta._lock:
             av = self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0]
@@ -1256,8 +1469,10 @@ class VectorStore:
                 rows = self.meta.conn.execute(
                     f'SELECT chunk_no, text_z, chapter_path, vector FROM {table} WHERE book_id=? ORDER BY chunk_no', (book_id,)
                 ).fetchall()
+                uv = self.meta.conn.execute('PRAGMA user_version').fetchone()[0]
             codec = reader._codec
-            return [(_MigrateRow(n, [p for p in cp.split(' > ') if p], codec.decompress(z)), blob_to_vec(v)) for n, z, cp, v in rows]
+            # the schema stage ran first in finalize_schema, so the format is settled
+            return [(_MigrateRow(n, [p for p in cp.split(' > ') if p], codec.decompress(z)), blob_to_vec(v, uv >= 3)) for n, z, cp, v in rows]
         t = reader._open_named(table)
         if t is None:
             return []

@@ -282,7 +282,7 @@ class TestSqlitePerModel(unittest.TestCase):
 
     def test_legacy_chunks_table_migrated(self):
         self.s.close()
-        for suffix in ('', '-wal', '-shm'):  # setUp already created a v2 db at this path
+        for suffix in ('', '-wal', '-shm'):  # setUp already created a fresh db at this path
             p = self.path + suffix
             if os.path.exists(p):
                 os.remove(p)
@@ -300,7 +300,7 @@ class TestSqlitePerModel(unittest.TestCase):
         conn.execute(
             'INSERT INTO chunks(book_id, chunk_no, text, chapter_path, para_start, para_end, char_offset, model, dim, vector) '
             'VALUES(?,?,?,?,?,?,?,?,?,?)',
-            (1, 0, 'legacy text', 'ch', 0, 2, 0, 'old-model', 4, store.vec_to_blob([1.0, 0.0, 0.0, 0.0])),
+            (1, 0, 'legacy text', 'ch', 0, 2, 0, 'old-model', 4, store.vec_to_blob([1.0, 0.0, 0.0, 0.0], f32=True)),
         )
         conn.execute('INSERT INTO books(id, fmt, indexed_at, n_chunks, model, dim) VALUES(?,?,?,?,?,?)', (1, 'EPUB', 0.0, 1, 'old-model', 4))
         conn.execute("INSERT INTO meta(key, value) VALUES('fileinfo:1', 'EPUB|100|1598092103.694143')")
@@ -332,6 +332,11 @@ class TestSqlitePerModel(unittest.TestCase):
                 ac_after = s.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
             self.assertEqual(ac_after, ac_before)  # ...and restored afterwards
             self.assertEqual(s.backend._chunk_tables(), ['chunks_old_model'])
+            with s.meta._lock:
+                uv = s.meta.conn.execute('PRAGMA user_version').fetchone()[0]
+                blob_len = s.meta.conn.execute('SELECT LENGTH(vector) FROM chunks_old_model LIMIT 1').fetchone()[0]
+            self.assertEqual(uv, store.SCHEMA_VERSION)  # v3: the f32 blobs were converted to half floats
+            self.assertEqual(blob_len, 2 * 4)  # two bytes per component
             res = s.search([1.0] * 4, limit=5)
             self.assertEqual(len(res), 1)
             self.assertEqual(res[0].book_id, 1)
@@ -370,7 +375,7 @@ class TestSqlitePerModel(unittest.TestCase):
         try:
             # even with the largest possible row size this is < 2500, so search must batch
             store.SEARCH_MIN_BUDGET = 96 * 1024
-            self.assertLess(store.SEARCH_MIN_BUDGET // (dim * 4 + 64), len(rows))
+            self.assertLess(store.SEARCH_MIN_BUDGET // (dim * 2 + 64), len(rows))
             mid = (scored[100][0] + scored[101][0]) / 2.0
             for limit, min_score in ((7, -1.0), (100, 0.0), (3000, mid)):
                 got = s.search(q, limit=limit, min_score=min_score, model='bf-model')
@@ -390,7 +395,14 @@ class TestVecHelpers(unittest.TestCase):
         blob = store.vec_to_blob(v)
         back = store.blob_to_vec(blob)
         for a, b in zip(v, list(back)):
-            self.assertAlmostEqual(a, b, places=5)
+            self.assertAlmostEqual(a, b, places=3)  # half-precision rounding
+
+    def test_blob_roundtrip_f32(self):
+        v = [0.1, -0.2, 0.3]
+        blob = store.vec_to_blob(v, f32=True)
+        back = store.blob_to_vec(blob, False)
+        for a, b in zip(v, list(back)):
+            self.assertAlmostEqual(a, b, places=7)
 
     def test_zero_vector(self):
         v = store.l2_normalize([0.0, 0.0])
@@ -545,9 +557,9 @@ class TestNumpyFallbackEquivalence(unittest.TestCase):
         store.np = None
         rows = [(i, store.vec_to_blob(store.l2_normalize(v))) for i, v in enumerate(vecs)]  # last column is the vector blob
         store.np = self.np
-        scores_np = backend._score_rows(rows, store.l2_normalize(qv_src))
+        scores_np = backend._score_rows(rows, store.l2_normalize(qv_src), True)  # rows hold f16 blobs
         store.np = None
-        scores_py = backend._score_rows(rows, store.l2_normalize(qv_src))
+        scores_py = backend._score_rows(rows, store.l2_normalize(qv_src), True)
         self.assertEqual(len(scores_np), len(scores_py))
         for a, b in zip(scores_np, scores_py):
             self.assertAlmostEqual(a, b, delta=1e-5)
