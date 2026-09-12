@@ -149,6 +149,17 @@ class TestStatusLines(unittest.TestCase):
         gui.SemanticSearchAction._on_status(a, {'state': 'attributes', 'done': 2, 'total': 10, 'book_id': 5})
         self.assertEqual(a.qaction.tip, 'Extracting attributes (2/10)')
 
+    def test_attributes_line_hides_single_part(self):
+        # a book that fits one LLM call has nothing to count; "part 1/1" is noise
+        lines = _status_lines(FakeApi(), {'state': 'attributes', 'done': 7, 'total': 19, 'book_id': 5, 'sub_done': 1, 'sub_total': 1})
+        self.assertEqual(lines[0], 'Extracting attributes (7/19): book 5')
+
+    def test_attributes_tooltip_hides_single_part(self):
+        a = object.__new__(gui.SemanticSearchAction)
+        a.qaction = _FakeQtAction()
+        gui.SemanticSearchAction._on_status(a, {'state': 'attributes', 'done': 2, 'total': 10, 'book_id': 5, 'sub_done': 1, 'sub_total': 1})
+        self.assertEqual(a.qaction.tip, 'Extracting attributes (2/10)')
+
 
 class _FakeIconSink:
     def __init__(self):
