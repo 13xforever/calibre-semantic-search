@@ -914,7 +914,8 @@ class SemanticSearchAction(InterfaceAction):
         self.show_status()
 
     def reindex_new_and_failed(self):
-        """Queue books that are not indexed yet or previously failed; skip the rest."""
+        """Queue books that are not indexed yet, previously failed, or indexed with no
+        chunks (a silent 0-chunk success left by an older version); skip the rest."""
         if not self._ensure_started():
             return
         api = self._api()
@@ -924,14 +925,15 @@ class SemanticSearchAction(InterfaceAction):
         settings = self.get_settings()
         from .indexer import pick_format
 
-        indexed = {b['id'] for b in self.store.indexed_books()}
+        indexed = {b['id']: b['n_chunks'] for b in self.store.indexed_books()}
         try:
             failed = set(self.store.failed_book_ids('index'))
         except Exception:
             failed = set()
         for bid in sorted(api.all_book_ids()):
-            if bid in indexed and bid not in failed:
-                continue  # already indexed without error -> skip
+            n_chunks = indexed.get(bid)
+            if n_chunks and bid not in failed:
+                continue  # already indexed with chunks, no error -> skip
             formats = api.formats(bid)
             if not formats:
                 continue

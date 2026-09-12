@@ -336,6 +336,60 @@ class TestBookDetailsMenuActions(unittest.TestCase):
         self.assertEqual(m.separators, 0)
 
 
+class _ReindexStore:
+    def __init__(self, indexed=(), failed=()):
+        self._indexed = {bid: n for bid, n in indexed}
+        self._failed = set(failed)
+        self.dirty = []
+
+    def indexed_books(self):
+        return [{'id': b, 'n_chunks': n} for b, n in sorted(self._indexed.items())]
+
+    def failed_book_ids(self, kind=None):
+        return sorted(self._failed) if kind == 'index' else []
+
+    def add_dirty(self, bid, reason='added'):
+        self.dirty.append((bid, reason))
+
+
+class TestReindexNewAndFailed(unittest.TestCase):
+    def _action(self, lib_ids, indexed=(), failed=(), formats=None):
+        a = object.__new__(gui.SemanticSearchAction)
+        store = _ReindexStore(indexed, failed)
+        a.store = store
+        a._ensure_started = lambda: True
+        fmts = formats or {}
+
+        class _Api:
+            def all_book_ids(self):
+                return list(lib_ids)
+
+            def formats(self, bid):
+                return fmts.get(bid, ('EPUB',))
+
+        a._api = lambda: _Api()
+        a.get_settings = lambda: utils.Settings()
+        return a, store
+
+    def test_queues_unindexed_failed_and_zero_chunk(self):
+        # 1 indexed with chunks -> skip; 2 unindexed -> queue; 3 indexed but failed
+        # -> queue; 4 indexed with 0 chunks (silent success from an older version)
+        # -> queue
+        a, store = self._action([1, 2, 3, 4], indexed=[(1, 5), (3, 2), (4, 0)], failed=[3])
+        gui.SemanticSearchAction.reindex_new_and_failed(a)
+        self.assertEqual(store.dirty, [(2, 'reindex'), (3, 'reindex'), (4, 'reindex')])
+
+    def test_all_well_indexed_queues_nothing(self):
+        a, store = self._action([1, 2], indexed=[(1, 5), (2, 3)])
+        gui.SemanticSearchAction.reindex_new_and_failed(a)
+        self.assertEqual(store.dirty, [])
+
+    def test_book_without_formats_skipped(self):
+        a, store = self._action([9], formats={9: ()})
+        gui.SemanticSearchAction.reindex_new_and_failed(a)
+        self.assertEqual(store.dirty, [])
+
+
 class TestBookDetailsMenuHook(unittest.TestCase):
     def _install_fake_bd(self):
         class FakeQMenu:
