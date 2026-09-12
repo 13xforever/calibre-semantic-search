@@ -378,5 +378,41 @@ class TestNonBmpContent(unittest.TestCase):
             self.assertIn(ch, chunks[0].text)
 
 
+class TestNamespacedFallback(unittest.TestCase):
+    """Pages with declared namespace prefixes (e.g. epub:type) must survive the
+    parse_page fallback chain: calibre's libxml2 2.15.x rejects str input that
+    contains certain non-ASCII chars (U+2019, emoji), and the re-parse must keep
+    the namespace declarations — the old fallback stripped them, turning a valid
+    page into an 'undeclared prefix' error."""
+
+    PAGE = (
+        '<html xmlns="http://www.w3.org/1999/xhtml" '
+        'xmlns:epub="http://www.idpf.org/2007/ops"><head><title>t</title></head>'
+        '<body><section epub:type="bodymatter chapter">'
+        '<p>I think they needed to red herring that Abel is Zuma, because otherwise it\u2019s really obvious.</p>'
+        '</section></body></html>'
+    )
+
+    def test_curly_quote_page_chunks(self):
+        # real trigger on libxml2 2.15.x (U+2019 in str input); direct parse elsewhere
+        chunks = chunker.chunks_from_pages([self.PAGE], 1000, 0)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn('it\u2019s really obvious', chunks[0].text)
+
+    def test_forced_fallback_keeps_namespace_declarations(self):
+        from lxml import etree as _etree
+
+        real = chunker.lhtml.fromstring
+        try:
+            chunker.lhtml.fromstring = lambda html, *a, **kw: (_ for _ in ()).throw(
+                _etree.XMLSyntaxError('internal error', None, 1, 1)
+            )
+            chunks = chunker.chunks_from_pages([self.PAGE], 1000, 0)
+        finally:
+            chunker.lhtml.fromstring = real
+        self.assertEqual(len(chunks), 1)
+        self.assertIn('it\u2019s really obvious', chunks[0].text)
+
+
 if __name__ == '__main__':
     unittest.main()

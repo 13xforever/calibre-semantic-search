@@ -18,24 +18,28 @@ from lxml import html as lhtml
 
 HEADING_RE = re.compile(r'^h([1-6])$', re.I)
 BLOCK_TAGS = {'p', 'div', 'blockquote', 'li', 'pre', 'table', 'section', 'article'}
-_XMLNS_DECL_RE = re.compile(r'\s+xmlns(?::[A-Za-z_][\w.-]*)?="[^"]*"')
 
 
 def parse_page(html: str):
     """Parse a spine page into an element tree.
 
-    OEB pages are well-formed XML (they come from ``etree.tostring`` of a parsed
-    tree), so when the HTML parser rejects one we re-parse it in XML mode with
-    namespace declarations stripped. That fallback is required because calibre's
-    bundled libxml2 (2.15.x) raises 'internal error' on non-BMP characters (e.g.
-    emoji) when parsing unicode input — in both the HTML and the XML parser, and
-    even in recover mode; the same document parses fine as raw UTF-8 bytes, so
-    the fallback encodes before parsing.
+    The lenient HTML parser is tried first (pages may carry malformed markup),
+    then the same document as raw UTF-8 bytes in HTML mode, then strict XML.
+    The byte fallbacks are required because calibre's bundled libxml2 (2.15.x)
+    raises 'internal error' when parsing unicode *str* input containing certain
+    non-ASCII characters (e.g. U+2019 or emoji); the same document parses fine
+    as bytes. Namespace declarations are always kept: stripping them breaks
+    prefixed attributes such as ``epub:type`` on otherwise well-formed pages.
     """
     try:
         return lhtml.fromstring(html)
     except etree.XMLSyntaxError:
-        return etree.fromstring(_XMLNS_DECL_RE.sub('', html).encode('utf-8'))
+        pass
+    raw = html.encode('utf-8')
+    try:
+        return lhtml.fromstring(raw)
+    except etree.XMLSyntaxError:
+        return etree.fromstring(raw)
 
 
 @dataclass
@@ -281,6 +285,17 @@ _SKIP_TAGS = {'script', 'style', 'head'}
 _HEADING_TAGS = {f'h{i}' for i in range(1, 7)}
 
 
+def _local_tag(tag):
+    """Lowercase local name of an element tag.
+
+    Elements from the strict-XML fallback carry Clark-notation tags ({uri}name);
+    HTML-parsed trees use plain names. Comparisons must work on both.
+    """
+    if not isinstance(tag, str):
+        return ''
+    return tag.rsplit('}', 1)[-1].lower()
+
+
 def _has_block_desc(el):
     """True if `el`'s subtree contains a text-bearing block-level or heading element.
 
@@ -288,7 +303,7 @@ def _has_block_desc(el):
     not count: a subtree of inline runs plus empty markers is still an inline run.
     """
     for d in el.iter():
-        if d is not el and isinstance(d.tag, str) and d.tag.lower() in BLOCK_TAGS | _HEADING_TAGS:
+        if d is not el and _local_tag(d.tag) in BLOCK_TAGS | _HEADING_TAGS:
             if any(ch.strip() for ch in d.itertext()):
                 return True
     return False
@@ -300,9 +315,9 @@ def _inline_segments(el):
     cur = []
 
     def go(node):
-        if not isinstance(node.tag, str):
+        t = _local_tag(node.tag)
+        if not t:
             return
-        t = node.tag.lower()
         if t == 'br':
             if ''.join(cur).strip():
                 segs.append(''.join(cur))
@@ -334,8 +349,10 @@ def html_to_units(html: str):
     <body>, separated by <br/>. Such runs are collected too, split on <br/>.
     """
     root = parse_page(html)
-    if root.tag == 'html':
-        body = root.find('.//body')
+    if _local_tag(root.tag) == 'html':
+        # .find('.//body') misses namespaced trees from the strict-XML fallback,
+        # so scan by local name (works on both html and etree elements)
+        body = next((c for c in root.iter() if _local_tag(c.tag) == 'body'), None)
         root = body if body is not None else root
     out = []
 
@@ -345,7 +362,7 @@ def html_to_units(html: str):
         return ''.join(el.itertext())
 
     def walk(el):
-        tag = el.tag.lower() if isinstance(el.tag, str) else ''
+        tag = _local_tag(el.tag)
         if tag in _SKIP_TAGS:
             return
         if tag == 'br':
