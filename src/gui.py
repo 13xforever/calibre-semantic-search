@@ -698,34 +698,24 @@ class SemanticSearchAction(InterfaceAction):
             lines.append(f'Attributes stored: {done_attrs}/{len(with_chunks)} books')
         except Exception:
             pass
-        import json
-
         try:
-            failed = json.loads(self.store.get_meta('failed', '{}') or '{}')
+            failed = self.store.failed_entries('index')
         except Exception:
-            failed = {}
+            failed = []
         if failed and api is not None:
             lines.append('')
             lines.append(f'Failed books: {len(failed)}')
-            for bid_str, info in sorted(failed.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
-                try:
-                    bid = int(bid_str)
-                except ValueError:
-                    continue
-                lines.append(f'{self._book_label(bid, api)}: {(info or {}).get("error", "unknown error")}')
+            for entry in failed:
+                lines.append(f'{self._book_label(entry["book_id"], api)}: {entry["error"]}')
         try:
-            attr_failed = json.loads(self.store.get_meta('attr_failed', '{}') or '{}')
+            attr_failed = self.store.failed_entries('attr')
         except Exception:
-            attr_failed = {}
+            attr_failed = []
         if attr_failed and api is not None:
             lines.append('')
             lines.append(f'Attribute failures: {len(attr_failed)} (use "Extract attributes..." to retry)')
-            for bid_str, info in sorted(attr_failed.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0):
-                try:
-                    bid = int(bid_str)
-                except ValueError:
-                    continue
-                lines.append(f'{self._book_label(bid, api)}: {(info or {}).get("error", "unknown error")}')
+            for entry in attr_failed:
+                lines.append(f'{self._book_label(entry["book_id"], api)}: {entry["error"]}')
         return lines
 
     def show_status(self):
@@ -930,18 +920,17 @@ class SemanticSearchAction(InterfaceAction):
         api = self._api()
         if api is None:
             return
-        import json
 
         settings = self.get_settings()
         from .indexer import pick_format
 
         indexed = {b['id'] for b in self.store.indexed_books()}
         try:
-            failed = set(json.loads(self.store.get_meta('failed', '{}') or '{}').keys())
+            failed = set(self.store.failed_book_ids('index'))
         except Exception:
             failed = set()
         for bid in sorted(api.all_book_ids()):
-            if bid in indexed and str(bid) not in failed:
+            if bid in indexed and bid not in failed:
                 continue  # already indexed without error -> skip
             formats = api.formats(bid)
             if not formats:
@@ -1019,7 +1008,7 @@ class SemanticSearchAction(InterfaceAction):
             return
         # Retry books that previously failed, then ask the indexer to run the
         # attribute phase; raise the live status dialog so progress is immediate.
-        self.store.set_meta('attr_failed', '{}')
+        self.store.wipe_failed('attr')
         self.indexer.request_attributes()
         self.show_status()
 

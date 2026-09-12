@@ -9,6 +9,7 @@ Public API (used by indexer/dialog/attributes):
     book_chunks_text(book_id) -> list[str]
     get_meta / set_meta / delete_meta / meta_keys(prefix)
     set_attrs / get_attrs / clear_attrs / attr_book_ids
+    set_failed / clear_failed / wipe_failed / failed_book_ids / failed_entries
     cleanup_stale_models(current_model=None)
     close
 
@@ -28,16 +29,19 @@ finalize_schema() executes as an in-place, resumable conversion — the marker i
 deleted when it finishes. Opening a store whose data cannot be read with the
 currently installed packages raises MissingDependencyError.
 
-Schema versioning: the meta tables (books/dirty/attrs_raw plus the models/formats/
-file_info registries) are versioned with PRAGMA user_version and migrated
-structurally on open. The sqlite chunk tables migrate from the legacy single
-`chunks` table to slim per-model tables whose text lives in a compressed `text_z`
-BLOB; the codec is recorded once in meta['text_codec'] and used verbatim by both
-reads and writes. At user_version 3 the vector blobs become half floats (2 bytes
-per component, ~lossless for normalized embeddings); earlier versions store single
-precision, and the width is derived from user_version, never stored per row. Each
-migration step lives in the migrations/ package (one module per version step) and
-is imported at its call site below.
+Schema versioning: the meta tables (books/dirty/attrs_raw/failed plus the
+models/formats/file_info registries) are versioned with PRAGMA user_version and
+migrated structurally on open. The sqlite chunk tables migrate from the legacy
+single `chunks` table to slim per-model tables whose text lives in a compressed
+`text_z` BLOB; the codec is recorded once in meta['text_codec'] and used verbatim
+by both reads and writes. At user_version 3 the vector blobs become half floats
+(2 bytes per component, ~lossless for normalized embeddings); earlier versions
+store single precision, and the width is derived from user_version, never stored
+per row. v4 moves failed-book records out of meta JSON into the `failed` table;
+it runs deferred at the end of the schema stage, because its user_version bump
+must follow the v3 blob-format flip (both gate on >= 3). Each migration step
+lives in the migrations/ package (one module per version step) and is imported
+at its call site below.
 
 LanceDB tables store half floats natively; once a table holds enough rows,
 finalize_schema() builds an IVF_HNSW_SQ vector index for it ('index' stage) and
@@ -418,8 +422,9 @@ def ensure_codec_setup(meta: 'MetaStore'):
 # Current schema version: brand-new DBs are created at this version, existing DBs
 # reach it through the migrations/ steps (one self-contained file per version).
 # user_version >= 3 also marks the vector blob format: half floats (2 bytes per
-# component) instead of single precision; v2 and earlier store f32.
-SCHEMA_VERSION = 3
+# component) instead of single precision; v2 and earlier store f32. v4 moves
+# failed-book records from meta JSON into the `failed` table.
+SCHEMA_VERSION = 4
 
 META_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS books(
@@ -438,6 +443,12 @@ CREATE TABLE IF NOT EXISTS attrs_raw(
     book_id INTEGER PRIMARY KEY,
     json TEXT NOT NULL DEFAULT '{}',
     fields TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS failed(
+    book_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    error TEXT NOT NULL,
+    PRIMARY KEY (book_id, kind)
 );
 CREATE TABLE IF NOT EXISTS models(
     id INTEGER PRIMARY KEY,
@@ -685,6 +696,55 @@ class MetaStore:
         with self._lock:
             rows = self.conn.execute('SELECT book_id FROM attrs_raw').fetchall()
         return [r[0] for r in rows]
+
+    # -- failed books ---------------------------------------------------------------
+    #
+    # Books that failed indexing (kind 'index') or attribute extraction (kind
+    # 'attr'), until retried. One row per book and kind: a book can be in both
+    # states at once (indexed but attr-extraction failed, then re-index fails).
+
+    def set_failed(self, book_id: int, kind: str, error: str):
+        with self._lock:
+            self.conn.execute(
+                'INSERT INTO failed(book_id, kind, error) VALUES(?,?,?) '
+                'ON CONFLICT(book_id, kind) DO UPDATE SET error=excluded.error',
+                (book_id, kind, error),
+            )
+            self.conn.commit()
+
+    def clear_failed(self, book_id: int, kind: str | None = None):
+        """Drop one book's failure record(s); `kind=None` drops both kinds."""
+        with self._lock:
+            if kind is None:
+                self.conn.execute('DELETE FROM failed WHERE book_id=?', (book_id,))
+            else:
+                self.conn.execute('DELETE FROM failed WHERE book_id=? AND kind=?', (book_id, kind))
+            self.conn.commit()
+
+    def wipe_failed(self, kind: str):
+        """Drop every failure record of one kind (the 'retry all' actions)."""
+        with self._lock:
+            self.conn.execute('DELETE FROM failed WHERE kind=?', (kind,))
+            self.conn.commit()
+
+    def failed_book_ids(self, kind: str | None = None) -> list[int]:
+        with self._lock:
+            if kind is None:
+                rows = self.conn.execute('SELECT book_id FROM failed ORDER BY book_id').fetchall()
+            else:
+                rows = self.conn.execute('SELECT book_id FROM failed WHERE kind=? ORDER BY book_id', (kind,)).fetchall()
+        return [r[0] for r in rows]
+
+    def failed_entries(self, kind: str | None = None) -> list[dict]:
+        """{'book_id', 'kind', 'error'} rows, ordered by book_id then kind."""
+        with self._lock:
+            if kind is None:
+                rows = self.conn.execute('SELECT book_id, kind, error FROM failed ORDER BY book_id, kind').fetchall()
+            else:
+                rows = self.conn.execute(
+                    'SELECT book_id, kind, error FROM failed WHERE kind=? ORDER BY book_id', (kind,)
+                ).fetchall()
+        return [{'book_id': r[0], 'kind': r[1], 'error': r[2]} for r in rows]
 
 
 class SqliteVectorBackend:
@@ -1248,6 +1308,10 @@ class VectorStore:
             return None
         return self._recorded_codec_name()
 
+    def _meta_version(self) -> int:
+        with self.meta._lock:
+            return self.meta.conn.execute('PRAGMA user_version').fetchone()[0]
+
     def pending_stages(self) -> list[str]:
         """Ordered migration stages still to run: 'schema', 'backend', 'codec', 'index'.
 
@@ -1257,10 +1321,13 @@ class VectorStore:
         missing blocks the open in __init__, so here it always means the work can
         actually run. The lancedb 'index' stage is pending while any table with rows
         lacks its vector index or has a long unindexed tail; it needs no marker,
-        because the index state lives in the LanceDB dataset manifest."""
+        because the index state lives in the LanceDB dataset manifest. The meta
+        schema (v4: failed records out of meta JSON) is pending until user_version
+        reaches SCHEMA_VERSION; it runs at the end of the 'schema' stage, after the
+        chunk migrations have settled the blob format."""
         want = self._wanted_backend()
         stages = []
-        if self.backend.pending_work():
+        if self.backend.pending_work() or self._meta_version() < SCHEMA_VERSION:
             stages.append('schema')
         # a transfer is pending when the backends differ, or when one was interrupted
         # (MIGRATE_KEY is set from the first inserted row until completion)
@@ -1302,6 +1369,17 @@ class VectorStore:
         if self.backend.pending_work():
             say('schema', 'migrating chunk tables')
             self.backend.finalize(say)
+            did = True
+        # evaluated live: a legacy DB finishes its chunk migrations (v2/v3) above and
+        # lands here in the same pass. The version bump must come after them — v3's
+        # pending check and the blob-width derivation both gate on user_version >= 3,
+        # so flipping to SCHEMA_VERSION earlier would skip the f16 conversion while
+        # search already reads half-float widths.
+        if self._meta_version() < SCHEMA_VERSION:
+            from .migrations.v4 import upgrade as v4_upgrade
+
+            say('schema', 'moving failed-book records to their own table')
+            v4_upgrade(self.meta)
             did = True
         src, dst = self._pending_transfer()
         if dst is not None and dst != src:
@@ -1703,6 +1781,21 @@ class VectorStore:
 
     def attr_book_ids(self):
         return self.meta.attr_book_ids()
+
+    def set_failed(self, book_id, kind, error):
+        self.meta.set_failed(book_id, kind, error)
+
+    def clear_failed(self, book_id, kind=None):
+        self.meta.clear_failed(book_id, kind)
+
+    def wipe_failed(self, kind):
+        self.meta.wipe_failed(kind)
+
+    def failed_book_ids(self, kind=None):
+        return self.meta.failed_book_ids(kind)
+
+    def failed_entries(self, kind=None):
+        return self.meta.failed_entries(kind)
 
     # -- search ------------------------------------------------------------------------
 

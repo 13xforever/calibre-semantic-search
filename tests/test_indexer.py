@@ -1,5 +1,4 @@
 import importlib.util
-import json
 import os as _os
 import sys as _sys
 import tempfile
@@ -170,8 +169,7 @@ class TestAttrPhase(unittest.TestCase):
         ix._process_attributes([1], settings, llm=FailingLLM())
         self.assertEqual(done[0][0], 1)
         self.assertEqual(len(done[0][1]), 1)
-        failed = json.loads(vs.get_meta('attr_failed', '{}'))
-        self.assertIn('1', failed)
+        self.assertEqual(vs.failed_book_ids('attr'), [1])
         vs.close()
 
     def test_fulltext_reports_sub_progress(self):
@@ -194,16 +192,15 @@ class TestAttrPhase(unittest.TestCase):
         vs, ix, settings, statuses, done, writer = self._make()
         self._index_book(vs, 1)
         self._index_book(vs, 2)
-        vs.set_meta('attr_failed', json.dumps({'1': {'error': 'x'}}))
+        vs.set_failed(1, 'attr', 'x')
         self.assertEqual(ix._pending_attr_books(settings), [2])
         vs.close()
 
     def test_success_clears_prior_failure(self):
         vs, ix, settings, statuses, done, writer = self._make()
-        vs.set_meta('attr_failed', json.dumps({'1': {'error': 'old'}}))
+        vs.set_failed(1, 'attr', 'old')
         ix._process_attributes([1], settings, llm=FakeLLM({'gender': 'male'}))
-        failed = json.loads(vs.get_meta('attr_failed', '{}'))
-        self.assertNotIn('1', failed)
+        self.assertEqual(vs.failed_book_ids('attr'), [])
         vs.close()
 
 
@@ -279,8 +276,7 @@ class TestForcedAttrExtraction(unittest.TestCase):
         _index_book(vs, 7)
         ix.request_attributes(7)
         ix._process_attributes(ix._attr_phase_books(settings), settings, llm=FailingLLM())
-        failed = json.loads(vs.get_meta('attr_failed', '{}'))
-        self.assertIn('7', failed)
+        self.assertEqual(vs.failed_book_ids('attr'), [7])
         self.assertEqual(ix._forced_attrs, set())
         vs.close()
 
@@ -311,14 +307,13 @@ class TestReconcile(unittest.TestCase):
         _index_book(vs, 2)
         vs.set_attrs(2, {'gender': 'f'})
         vs.set_file_info(2, 'EPUB', 100, 1234)
-        vs.set_meta('failed', json.dumps({'2': {'error': 'x'}}))
-        vs.set_meta('attr_failed', json.dumps({'2': {'error': 'y'}}))
+        vs.set_failed(2, 'index', 'x')
+        vs.set_failed(2, 'attr', 'y')
         ix.reconcile()
         self.assertFalse(vs.book_is_indexed(2))
         self.assertEqual(vs.get_attrs(2), {})
         self.assertIsNone(vs.get_file_info(2))
-        self.assertNotIn('2', json.loads(vs.get_meta('failed', '{}')))
-        self.assertNotIn('2', json.loads(vs.get_meta('attr_failed', '{}')))
+        self.assertEqual(vs.failed_book_ids(), [])
 
     def test_removed_dirty_book_dropped(self):
         vs, ix = self._make([1])
@@ -341,20 +336,20 @@ class TestReconcile(unittest.TestCase):
         # a book that failed indexing has no books row, only fileinfo + a failed entry
         vs, ix = self._make([1])
         vs.set_file_info(3, 'EPUB', 100, 1234)
-        vs.set_meta('failed', json.dumps({'3': {'error': 'x'}}))
+        vs.set_failed(3, 'index', 'x')
         ix.reconcile()
         self.assertIsNone(vs.get_file_info(3))
-        self.assertNotIn('3', json.loads(vs.get_meta('failed', '{}')))
+        self.assertEqual(vs.failed_book_ids(), [])
 
     def test_failed_unchanged_book_not_requeued(self):
         # a book that failed indexing (e.g. scanned file) stays failed when its
         # file is unchanged; it is only retried via 'Re-index new && failed'
         vs, ix = self._make([1, 3])
         vs.set_file_info(3, 'EPUB', 100, 1234)
-        vs.set_meta('failed', json.dumps({'3': {'error': 'no meaningful text extracted (0 chars from EPUB)'}}))
+        vs.set_failed(3, 'index', 'no meaningful text extracted (0 chars from EPUB)')
         ix.reconcile()
         self.assertNotIn(3, vs.dirty_book_ids())
-        self.assertIn('3', json.loads(vs.get_meta('failed', '{}')))
+        self.assertEqual(vs.failed_book_ids('index'), [3])
         vs.close()
 
     def test_surviving_books_untouched(self):
@@ -458,9 +453,9 @@ class TestProcessOneUnexpectedError(unittest.TestCase):
         finally:
             indexer.extract_book_pages = orig_extract
             indexer.chunks_from_pages = orig_chunks
-        failed = json.loads(vs.get_meta('failed', '{}'))
-        self.assertIn('58', failed)
-        self.assertIn('internal error', failed['58']['error'])
+        entries = {e['book_id']: e['error'] for e in vs.failed_entries('index')}
+        self.assertIn(58, entries)
+        self.assertIn('internal error', entries[58])
         self.assertNotIn(58, vs.dirty_book_ids())
         self.assertIn('error', [s['state'] for s in statuses])
         vs.close()
@@ -497,9 +492,9 @@ class TestZeroChunkGuard(unittest.TestCase):
             ix._process_one(58)
         finally:
             indexer.extract_book_pages = orig
-        failed = json.loads(vs.get_meta('failed', '{}'))
-        self.assertIn('58', failed)
-        self.assertIn('no meaningful text extracted (0 chars from EPUB)', failed['58']['error'])
+        entries = {e['book_id']: e['error'] for e in vs.failed_entries('index')}
+        self.assertIn(58, entries)
+        self.assertIn('no meaningful text extracted (0 chars from EPUB)', entries[58])
         self.assertNotIn(58, vs.dirty_book_ids())
         self.assertFalse(vs.book_is_indexed(58))
         # file info recorded so reconcile does not auto-retry an unchanged file
@@ -516,9 +511,9 @@ class TestZeroChunkGuard(unittest.TestCase):
             ix._process_one(58)
         finally:
             indexer.extract_book_pages = orig
-        failed = json.loads(vs.get_meta('failed', '{}'))
-        self.assertIn('58', failed)
-        self.assertIn('no meaningful text extracted', failed['58']['error'])
+        entries = {e['book_id']: e['error'] for e in vs.failed_entries('index')}
+        self.assertIn(58, entries)
+        self.assertIn('no meaningful text extracted', entries[58])
         self.assertNotIn(58, vs.dirty_book_ids())
         self.assertFalse(vs.book_is_indexed(58))
         vs.close()
@@ -534,9 +529,9 @@ class TestZeroChunkGuard(unittest.TestCase):
             ix._process_one(58)
         finally:
             indexer.extract_book_pages, indexer.chunks_from_pages = orig_e, orig_c
-        failed = json.loads(vs.get_meta('failed', '{}'))
-        self.assertIn('58', failed)
-        self.assertIn('chunking produced no chunks from', failed['58']['error'])
+        entries = {e['book_id']: e['error'] for e in vs.failed_entries('index')}
+        self.assertIn(58, entries)
+        self.assertIn('chunking produced no chunks from', entries[58])
         self.assertNotIn(58, vs.dirty_book_ids())
         self.assertFalse(vs.book_is_indexed(58))
         vs.close()
@@ -561,7 +556,7 @@ class TestZeroChunkGuard(unittest.TestCase):
         finally:
             indexer.extract_book_pages = orig_e
             embed_client_mod.EmbedClient = orig_cl
-        self.assertNotIn('58', json.loads(vs.get_meta('failed', '{}')))
+        self.assertEqual(vs.failed_book_ids(), [])
         self.assertTrue(vs.book_is_indexed(58))
         self.assertNotIn(58, vs.dirty_book_ids())
         self.assertIn('done', [s['state'] for s in statuses])

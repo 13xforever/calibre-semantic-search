@@ -91,8 +91,8 @@ class FakeStore:
     def dirty_book_ids(self):
         return [3]
 
-    def get_meta(self, k, d=None):
-        return '{}' if k == 'failed' else (d or '')
+    def failed_entries(self, kind=None):
+        return []
 
     def get_attrs(self, bid):
         return self._attrs.get(bid, {})

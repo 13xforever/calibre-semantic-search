@@ -153,6 +153,19 @@ class _LifecycleOps:
         self.assertIn(904, s.dirty_book_ids())
         s.remove_dirty(904)
         self.assertNotIn(904, s.dirty_book_ids())
+        # -- failed books ---------------------------------------------------------------
+        s.wipe_failed('index')  # start from a known state (scenario fixtures may seed rows)
+        s.wipe_failed('attr')
+        self.assertEqual(s.failed_book_ids(), [])
+        s.set_failed(901, 'index', 'boom')
+        s.set_failed(902, 'attr', 'llm down')
+        self.assertEqual(s.failed_book_ids(), [901, 902])
+        self.assertEqual(s.failed_book_ids('index'), [901])
+        self.assertEqual(s.failed_entries('attr'), [{'book_id': 902, 'kind': 'attr', 'error': 'llm down'}])
+        s.set_failed(901, 'index', 'boom again')  # upsert: same row, new error
+        self.assertEqual([e['error'] for e in s.failed_entries('index')], ['boom again'])
+        s.clear_failed(902)  # drops every kind for the book
+        self.assertEqual(s.failed_book_ids(), [901])
         # -- persisted indexing status --------------------------------------------------------
         s.set_meta('indexing_status', 'running')
         self.assertEqual(s.get_meta('indexing_status'), 'running')
@@ -188,6 +201,8 @@ class _LifecycleOps:
         self.assertEqual(s.get_attrs(903), {})
         self.assertNotIn(904, s.dirty_book_ids())
         self.assertNotIn(901, s.file_info_book_ids())
+        self.assertEqual(s.failed_entries('index'), [{'book_id': 901, 'kind': 'index', 'error': 'boom again'}])
+        self.assertEqual(s.failed_book_ids('attr'), [])
         self.assertEqual(s.get_meta('indexing_status'), 'running')
 
 
@@ -220,8 +235,9 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
         conn.execute("INSERT INTO attrs_raw(book_id, json, fields) VALUES(1,'{\"title\":\"Legacy Book One\"}','title')")
         for bid, val in ((1, 'EPUB|717102|1598092103.694143'), (2, 'PDF|1737973|1209541068.0')):
             conn.execute('INSERT INTO meta(key, value) VALUES(?,?)', (f'fileinfo:{bid}', val))
-        conn.execute("INSERT INTO meta(key, value) VALUES('attr_failed','{}')")
-        conn.execute("INSERT INTO meta(key, value) VALUES('failed','{}')")
+        # legacy failure records as meta JSON blobs (the pre-v4 layout)
+        conn.execute("INSERT INTO meta(key, value) VALUES('failed','{\"3\": {\"error\": \"no meaningful text extracted\", \"at\": 1788528101.0}}')")
+        conn.execute("INSERT INTO meta(key, value) VALUES('attr_failed','{\"1\": {\"error\": \"llm timeout\", \"at\": 1788528102.0}}')")
         self._legacy_texts = {}
         for bid, n in ((1, 2), (2, 1)):
             for cn in range(n):
@@ -267,6 +283,9 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
         self.assertEqual(n, 3)  # fat table untouched at v1
         self.assertEqual(s.backend._chunk_tables(), [])
         self.assertTrue(s.needs_finalize())
+        # the legacy failure blobs stay in meta until finalize runs v4
+        self.assertIsNotNone(s.get_meta('failed'))
+        self.assertIsNotNone(s.get_meta('attr_failed'))
 
         # stage 2: finalize splits + slims the chunk tables (v2) and converts the
         # vectors to half floats (v3) in the same pass
@@ -283,6 +302,11 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
         self.assertIn('chunks_legacy_embedding_8b', tables)
         self.assertEqual(slim_cols, {'id', 'book_id', 'chunk_no', 'text_z', 'chapter_path', 'vector'})
         self.assertEqual(blob_len, 2 * self.LEGACY_DIM)  # f32 -> f16: two bytes per component
+        # v4 moved the legacy failure blobs into the failed table and deleted the keys
+        self.assertEqual(s.failed_book_ids('index'), [3])
+        self.assertEqual(s.failed_entries('attr'), [{'book_id': 1, 'kind': 'attr', 'error': 'llm timeout'}])
+        self.assertIsNone(s.get_meta('failed'))
+        self.assertIsNone(s.get_meta('attr_failed'))
         self.assertFalse(s.needs_finalize())
         res = s.search([1.0] * self.LEGACY_DIM, limit=5)
         self.assertEqual((res[0].book_id, res[0].chunk_no), (1, 0))
@@ -719,6 +743,65 @@ class TestBackendMigration(_MigrateOps, unittest.TestCase):
         self.assertEqual(self.s.backend_name, 'lancedb')
         self.assertFalse(self.s._sqlite_has_chunks())
         self._check(self.s)
+
+
+class TestFailedTableUpgrade(_MigrateOps, unittest.TestCase):
+    """A settled v3 library still carries the legacy failure JSON in meta; only the
+    deferred v4 step runs on finalize (no chunk work is pending)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'semantic-search.db')
+        self.s = None
+
+    def tearDown(self):
+        if self.s is not None:
+            self.s.close()
+        self.tmp.cleanup()
+
+    def test_settled_v3_db_migrates_failed_blobs(self):
+        s = store.VectorStore(self.path, backend='sqlite')
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        # simulate a library written by the pre-v4 code: restore the legacy failure
+        # JSON blobs and roll user_version back to 3 (the chunk tables are already
+        # settled, so v2/v3 have nothing left to do)
+        with s.meta._lock:
+            c = s.meta.conn
+            c.execute("INSERT INTO meta(key, value) VALUES('failed','{\"601\": {\"error\": \"no meaningful text extracted\", \"at\": 1.0}}')")
+            c.execute("INSERT INTO meta(key, value) VALUES('attr_failed','{\"602\": {\"error\": \"llm timeout\", \"at\": 2.0}}')")
+            c.execute('PRAGMA user_version=3')
+            c.commit()
+        s.close()
+
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        # no chunk work is pending, yet the meta schema must keep 'schema' pending
+        # (this is what makes the GUI run finalize at all)
+        self.assertEqual(s.pending_stages(), ['schema'])
+        self.assertTrue(s.needs_finalize())
+        stages = []
+        s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        with s.meta._lock:
+            uv = s.meta.conn.execute('PRAGMA user_version').fetchone()[0]
+        self.assertEqual(uv, store.SCHEMA_VERSION)
+        self.assertEqual(s.failed_book_ids('index'), [601])
+        self.assertEqual(s.failed_entries('attr'), [{'book_id': 602, 'kind': 'attr', 'error': 'llm timeout'}])
+        self.assertIsNone(s.get_meta('failed'))
+        self.assertIsNone(s.get_meta('attr_failed'))
+        # only the v4 step ran in this pass — no chunk-table migration
+        self.assertEqual(stages, [('schema', 'moving failed-book records to their own table')])
+        self._check(s)  # data intact
+
+    def test_latest_db_has_no_schema_work(self):
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        stages = []
+        s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        self.assertEqual(stages, [])
+        self.assertEqual(s.pending_stages(), [])
 
 
 class TestBlockedStates(unittest.TestCase):

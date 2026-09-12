@@ -11,7 +11,6 @@ unchanged, and 'Re-index new && failed' retries them on demand.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 import time
@@ -197,11 +196,8 @@ class Indexer(threading.Thread):
     def _pending_attr_books(self, settings) -> list[int]:
         from .attributes import pending_attribute_books
 
-        try:
-            failed = set(json.loads(self.store.get_meta('attr_failed', '{}') or '{}').keys())
-        except Exception:
-            failed = set()
-        return [b for b in pending_attribute_books(self.store, settings) if str(b) not in failed]
+        failed = set(self.store.failed_book_ids('attr'))
+        return [b for b in pending_attribute_books(self.store, settings) if b not in failed]
 
     def _attr_phase_books(self, settings) -> list[int]:
         """Books for the next attribute phase: normal pending books plus forced re-extractions."""
@@ -215,16 +211,10 @@ class Indexer(threading.Thread):
             self._forced_attrs.discard(int(book_id))
 
     def _set_attr_failed(self, book_id: int, error: str | None):
-        try:
-            failed = json.loads(self.store.get_meta('attr_failed', '{}') or '{}')
-        except Exception:
-            failed = {}
-        key = str(book_id)
         if error is None:
-            failed.pop(key, None)
+            self.store.clear_failed(book_id, 'attr')
         else:
-            failed[key] = {'error': error, 'at': time.time()}
-        self.store.set_meta('attr_failed', json.dumps(failed))
+            self.store.set_failed(book_id, 'attr', error)
 
     def _process_attributes(self, pending: list[int], settings, llm=None):
         """Extract attributes for every book in `pending`, reporting live progress.
@@ -280,38 +270,30 @@ class Indexer(threading.Thread):
             self._reconcile_locked()
 
     def _reconcile_locked(self):
-        import json
-
         api = self.get_new_api()
         if api is None:
             return
         settings = self.settings_provider()
         lib_ids = set(api.all_book_ids())
         indexed = {b['id']: b for b in self.store.indexed_books()}
-        try:
-            failed = json.loads(self.store.get_meta('failed', '{}') or '{}')
-        except Exception:
-            failed = {}
-        try:
-            attr_failed = json.loads(self.store.get_meta('attr_failed', '{}') or '{}')
-        except Exception:
-            attr_failed = {}
+        failed_indexing = set(self.store.failed_book_ids('index'))
         # Every book id the store knows about, so a vanished book is cleaned up
         # even when it left no books/dirty row behind (failed indexing) and
         # orphans from older versions are swept on the first run.
-        known = set(indexed) | set(self.store.dirty_book_ids()) | set(self.store.attr_book_ids()) | set(self.store.file_info_book_ids())
-        for d in (failed, attr_failed):
-            for k in d:
-                if str(k).isdigit():
-                    known.add(int(str(k)))
+        known = (
+            set(indexed)
+            | set(self.store.dirty_book_ids())
+            | set(self.store.attr_book_ids())
+            | set(self.store.file_info_book_ids())
+            | set(self.store.failed_book_ids())
+        )
         # remove books that vanished from the library
         for bid in sorted(known - lib_ids):
             self.store.clear_book(bid)
             self.store.remove_dirty(bid)
             self.store.clear_file_info(bid)
             self.store.clear_attrs(bid)
-            failed.pop(str(bid), None)
-            attr_failed.pop(str(bid), None)
+            self.store.clear_failed(bid)
         for bid in lib_ids:
             formats = api.formats(bid)
             fmt = pick_format(formats, settings.format_priority)
@@ -325,7 +307,7 @@ class Indexer(threading.Thread):
             info = indexed.get(bid)
             if info is None:
                 # never indexed; skip if it failed before and the file is unchanged
-                if str(bid) in failed and fi is not None and fi['fmt'] == fmt and self._same_file(fi, md):
+                if bid in failed_indexing and fi is not None and fi['fmt'] == fmt and self._same_file(fi, md):
                     continue
                 self.store.add_dirty(bid, 'added')
                 continue
@@ -336,8 +318,6 @@ class Indexer(threading.Thread):
                 changed = fi['fmt'] != fmt or not self._same_file(fi, md)
             if changed:
                 self.store.add_dirty(bid, 'changed')
-        self.store.set_meta('failed', json.dumps(failed))
-        self.store.set_meta('attr_failed', json.dumps(attr_failed))
         try:
             # removed books may have been the last ones of their model
             self.store.cleanup_stale_models(settings.embed.model)
@@ -529,22 +509,12 @@ class Indexer(threading.Thread):
             self.store.set_file_info(book_id, fmt, *fi)
         else:
             self.store.clear_file_info(book_id)
-        import json
-
-        try:
-            failed = json.loads(self.store.get_meta('failed', '{}') or '{}')
-        except Exception:
-            failed = {}
-        if str(book_id) in failed:
-            del failed[str(book_id)]
-            self.store.set_meta('failed', json.dumps(failed))
+        self.store.clear_failed(book_id, 'index')
         self.store.remove_dirty(book_id)
         self.current_book_id = None
         self._status('done', book_id, n_chunks=len(chunks))
 
     def _fail(self, book_id: int, msg: str):
-        import json
-
         api = None
         try:
             api = self.get_new_api()
@@ -563,13 +533,7 @@ class Indexer(threading.Thread):
                     self.store.clear_file_info(book_id)
             except Exception:
                 pass
-        failed = {}
-        try:
-            failed = json.loads(self.store.get_meta('failed', '{}') or '{}')
-        except Exception:
-            failed = {}
-        failed[str(book_id)] = {'error': msg, 'at': time.time()}
-        self.store.set_meta('failed', json.dumps(failed))
+        self.store.set_failed(book_id, 'index', msg)
         self.store.remove_dirty(book_id)
         self.current_book_id = None
         self._status('error', book_id, error=msg)
