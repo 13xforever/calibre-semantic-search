@@ -330,6 +330,17 @@ class TestReconcile(unittest.TestCase):
         self.assertIsNone(vs.get_file_info(3))
         self.assertNotIn('3', json.loads(vs.get_meta('failed', '{}')))
 
+    def test_failed_unchanged_book_not_requeued(self):
+        # a book that failed indexing (e.g. scanned file) stays failed when its
+        # file is unchanged; it is only retried via 'Re-index new && failed'
+        vs, ix = self._make([1, 3])
+        vs.set_file_info(3, 'EPUB', 100, 1234)
+        vs.set_meta('failed', json.dumps({'3': {'error': 'no meaningful text extracted (0 chars from EPUB)'}}))
+        ix.reconcile()
+        self.assertNotIn(3, vs.dirty_book_ids())
+        self.assertIn('3', json.loads(vs.get_meta('failed', '{}')))
+        vs.close()
+
     def test_surviving_books_untouched(self):
         vs, ix = self._make([1])
         _index_book(vs, 1)
@@ -424,7 +435,8 @@ class TestProcessOneUnexpectedError(unittest.TestCase):
             raise RuntimeError('internal error, line 15, column 126')
 
         try:
-            indexer.extract_book_pages = lambda path, fmt: ('pages', ['<body><p>hello world</p></body>'])
+            page = '<body><p>' + 'hello world ' * 100 + '</p></body>'
+            indexer.extract_book_pages = lambda path, fmt: ('pages', [page])
             indexer.chunks_from_pages = boom
             ix._process_one(58)
         finally:
@@ -435,6 +447,108 @@ class TestProcessOneUnexpectedError(unittest.TestCase):
         self.assertIn('internal error', failed['58']['error'])
         self.assertNotIn(58, vs.dirty_book_ids())
         self.assertIn('error', [s['state'] for s in statuses])
+        vs.close()
+
+
+class TestZeroChunkGuard(unittest.TestCase):
+    """Extraction that yields no meaningful text, or chunking that loses all of it,
+    must fail the book explicitly (visible in the status dialog, retryable via
+    'Re-index new && failed') instead of recording a silent 0-chunk success."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _make(self, bid=58):
+        vs = store_mod.VectorStore(_os.path.join(self._tmp.name, 't.db'), backend='sqlite')
+        settings = utils.Settings()
+        statuses = []
+        api = FakeApi([bid])
+        api.format = lambda b, fmt, as_path=False: _os.path.join(self._tmp.name, 'fake.epub')
+        ix = indexer.Indexer(
+            store=vs, get_new_api=lambda: api, settings_provider=lambda: settings, status_cb=statuses.append
+        )
+        vs.add_dirty(bid)
+        return vs, ix, statuses
+
+    def test_no_text_fails_book(self):
+        vs, ix, statuses = self._make()
+        orig = indexer.extract_book_pages
+        try:
+            indexer.extract_book_pages = lambda path, fmt: ('pages', ['', '   '])
+            ix._process_one(58)
+        finally:
+            indexer.extract_book_pages = orig
+        failed = json.loads(vs.get_meta('failed', '{}'))
+        self.assertIn('58', failed)
+        self.assertIn('no meaningful text extracted (0 chars from EPUB)', failed['58']['error'])
+        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertFalse(vs.book_is_indexed(58))
+        # file info recorded so reconcile does not auto-retry an unchanged file
+        self.assertEqual(vs.get_file_info(58)['fmt'], 'EPUB')
+        self.assertIn('error', [s['state'] for s in statuses])
+        vs.close()
+
+    def test_tiny_text_fails_book(self):
+        vs, ix, statuses = self._make()
+        orig = indexer.extract_book_pages
+        try:
+            page = '<body><p>' + 'word ' * 40 + '</p></body>'
+            indexer.extract_book_pages = lambda path, fmt: ('pages', [page])
+            ix._process_one(58)
+        finally:
+            indexer.extract_book_pages = orig
+        failed = json.loads(vs.get_meta('failed', '{}'))
+        self.assertIn('58', failed)
+        self.assertIn('no meaningful text extracted', failed['58']['error'])
+        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertFalse(vs.book_is_indexed(58))
+        vs.close()
+
+    def test_text_present_but_no_chunks_fails_book(self):
+        # the book-41 failure mode: real text extracted, chunking lost it all
+        vs, ix, statuses = self._make()
+        orig_e, orig_c = indexer.extract_book_pages, indexer.chunks_from_pages
+        try:
+            page = '<body><p>' + 'word ' * 200 + '</p></body>'
+            indexer.extract_book_pages = lambda path, fmt: ('pages', [page])
+            indexer.chunks_from_pages = lambda *a, **kw: []
+            ix._process_one(58)
+        finally:
+            indexer.extract_book_pages, indexer.chunks_from_pages = orig_e, orig_c
+        failed = json.loads(vs.get_meta('failed', '{}'))
+        self.assertIn('58', failed)
+        self.assertIn('chunking produced no chunks from', failed['58']['error'])
+        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertFalse(vs.book_is_indexed(58))
+        vs.close()
+
+    def test_text_above_threshold_still_indexes(self):
+        vs, ix, statuses = self._make()
+        embed_client_mod = _loadpkg('embed_client')
+
+        class FakeEmbed:
+            def __init__(self, **kw):
+                pass
+
+            def embed_batched(self, texts, batch_size=1, concurrency=1, progress=None):
+                return [[0.1] * 8 for _ in texts]
+
+        orig_e, orig_cl = indexer.extract_book_pages, embed_client_mod.EmbedClient
+        try:
+            page = '<body><p>' + 'word ' * 200 + '</p></body>'
+            indexer.extract_book_pages = lambda path, fmt: ('pages', [page])
+            embed_client_mod.EmbedClient = FakeEmbed
+            ix._process_one(58)
+        finally:
+            indexer.extract_book_pages = orig_e
+            embed_client_mod.EmbedClient = orig_cl
+        self.assertNotIn('58', json.loads(vs.get_meta('failed', '{}')))
+        self.assertTrue(vs.book_is_indexed(58))
+        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertIn('done', [s['state'] for s in statuses])
         vs.close()
 
 

@@ -2,6 +2,11 @@
 
 Runs as a daemon thread. All calibre/Qt access happens through the injected
 `get_new_api()` callable so it works across library switches and is testable.
+
+Books that yield fewer than MIN_EXTRACTED_CHARS of text (scanned/image-only) or
+that lose all their text in chunking fail explicitly via _fail instead of being
+recorded as 0-chunk successes: reconcile skips failed books whose file is
+unchanged, and 'Re-index new && failed' retries them on demand.
 '''
 
 from __future__ import annotations
@@ -19,6 +24,13 @@ from .chunker import (
     split_plain_text,
 )
 from .store import VectorStore
+
+# Minimum amount of extractable text for a book to count as indexable content.
+# Below this the file is treated as scanned/image-only (or broken) and indexing
+# fails explicitly, instead of recording a silent 0-chunk "success" that never
+# surfaces in the GUI. Char count (not chunk count) so the guard is independent
+# of target_chars/overlap/max_chunks_per_book settings.
+MIN_EXTRACTED_CHARS = 1000
 
 
 class IndexerError(RuntimeError):
@@ -446,11 +458,15 @@ class Indexer(threading.Thread):
         if kind == 'error':
             self._fail(book_id, payload)
             return
-        if kind == 'pages' and not any((p or '').strip() for p in payload):
-            self._status('done', book_id, note='no text found')
+        if kind == 'pages':
+            extracted_chars = sum(len((p or '').strip()) for p in payload)
+        else:
+            extracted_chars = len((payload or '').strip())
+        if extracted_chars < MIN_EXTRACTED_CHARS:
             self.store.clear_book(book_id)
-            self.store.upsert_book(book_id, fmt, 0, settings.embed.model)
-            self.store.remove_dirty(book_id)
+            self._fail(
+                book_id, f'no meaningful text extracted ({extracted_chars} chars from {fmt}): the file may be scanned or image-only'
+            )
             return
 
         eff_target = min(settings.target_chars, max_chunk_chars(settings.embed_context_tokens))
@@ -463,9 +479,10 @@ class Indexer(threading.Thread):
         if settings.max_chunks_per_book > 0:
             chunks = chunks[: settings.max_chunks_per_book]
         if not chunks:
+            # text was extracted but chunking lost it all (e.g. a non-standard
+            # page structure): fail loudly instead of recording an empty index
             self.store.clear_book(book_id)
-            self.store.upsert_book(book_id, fmt, 0, settings.embed.model)
-            self.store.remove_dirty(book_id)
+            self._fail(book_id, f'chunking produced no chunks from {extracted_chars} chars of {fmt} text')
             return
 
         from .embed_client import EmbedClient
