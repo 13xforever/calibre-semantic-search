@@ -212,6 +212,59 @@ class TestPageToParagraphs(unittest.TestCase):
         self.assertEqual(paras, ['Visible text'])
 
 
+class TestInlineRuns(unittest.TestCase):
+    """Books whose text is not wrapped in block elements: old Mobipocket files
+    leave it as inline runs (separated by <br/>) inside non-block wrappers like
+    <widger>, or directly under <body>. Such runs must still be collected."""
+
+    def test_widger_wrapped_br_flow(self):
+        html = (
+            '<html><body><p><img src="cover.png"/></p><div class="mbp_pagebreak"/>'
+            '<br/><widger>line one<br/>line two<br/><span>mid</span> tail'
+            '<br/><br/>final line</widger></body></html>'
+        )
+        paras, paths = chunker.page_to_paragraphs(html)
+        self.assertEqual(paras, ['line one', 'line two', 'mid tail', 'final line'])
+
+    def test_inline_run_directly_under_body(self):
+        html = '<body><widger>alpha<br/>beta</widger></body>'
+        paras, paths = chunker.page_to_paragraphs(html)
+        self.assertEqual(paras, ['alpha', 'beta'])
+
+    def test_br_tail_flow_with_empty_marker(self):
+        # real Mobipocket shape: line text sits in <br> tails, with empty
+        # page-break divs sprinkled in; the empty marker must not break collection
+        html = (
+            '<body><widger>'
+            '<br/><br/>PART 1<br/><span>1874</span><br/>'
+            '<div class="mbp_pagebreak"/>'
+            'line after marker<br/>final line'
+            '</widger></body>'
+        )
+        paras, paths = chunker.page_to_paragraphs(html)
+        self.assertEqual(paras, ['PART 1', '1874', 'line after marker', 'final line'])
+
+    def test_no_double_count_with_nested_blocks(self):
+        html = '<body><div><span>inner</span></div><p>block</p></body>'
+        paras, paths = chunker.page_to_paragraphs(html)
+        self.assertEqual(paras, ['inner', 'block'])
+
+    def test_script_style_not_collected_in_inline_run(self):
+        html = '<body><widger>a<script>var x=1;</script>b</widger></body>'
+        paras, paths = chunker.page_to_paragraphs(html)
+        self.assertEqual(paras, ['ab'])
+
+    def test_widger_book_chunks_end_to_end(self):
+        # shape of the real-world case: one huge page, all text in a <widger>
+        lines = [f'paragraph {i} ' + 'word ' * 20 for i in range(50)]
+        html = '<html><body><p><img src="c.png"/></p><widger>' + '<br/>'.join(lines) + '</widger></body></html>'
+        chunks = chunker.chunks_from_pages([html], 1000, 150)
+        self.assertGreater(len(chunks), 1)
+        joined = ' '.join(c.text for c in chunks)
+        for i in (0, 25, 49):
+            self.assertIn(f'paragraph {i}', joined)
+
+
 class TestChunksFromPages(unittest.TestCase):
     def test_two_pages(self):
         pages = [

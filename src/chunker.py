@@ -277,10 +277,61 @@ def split_plain_text(text: str, target_chars: int, overlap_chars: int, max_token
     return group_paragraphs(paragraphs, paths, target_chars, overlap_chars, max_tokens)
 
 
+_SKIP_TAGS = {'script', 'style', 'head'}
+_HEADING_TAGS = {f'h{i}' for i in range(1, 7)}
+
+
+def _has_block_desc(el):
+    """True if `el`'s subtree contains a text-bearing block-level or heading element.
+
+    Empty blocks (e.g. <div class="mbp_pagebreak"/>) carry no content, so they do
+    not count: a subtree of inline runs plus empty markers is still an inline run.
+    """
+    for d in el.iter():
+        if d is not el and isinstance(d.tag, str) and d.tag.lower() in BLOCK_TAGS | _HEADING_TAGS:
+            if any(ch.strip() for ch in d.itertext()):
+                return True
+    return False
+
+
+def _inline_segments(el):
+    """Text of an inline-only subtree as segments split on <br/> elements."""
+    segs = []
+    cur = []
+
+    def go(node):
+        if not isinstance(node.tag, str):
+            return
+        t = node.tag.lower()
+        if t == 'br':
+            if ''.join(cur).strip():
+                segs.append(''.join(cur))
+            cur.clear()
+            return
+        if t in ('script', 'style'):
+            return
+        if node.text:
+            cur.append(node.text)
+        for ch in node:
+            go(ch)
+            if ch.tail:
+                cur.append(ch.tail)
+
+    go(el)
+    if ''.join(cur).strip():
+        segs.append(''.join(cur))
+    return segs
+
+
 def html_to_units(html: str):
     """Walk an HTML page and yield (kind, payload) units.
 
     kind is 'heading' (payload: (level, text)) or 'para' (payload: text).
+
+    Text lives in block elements (<p>, <div>, ...) in well-formed OEB pages, but
+    some conversions (old Mobipocket files in particular) leave it as inline runs
+    — e.g. wrapped in a non-block tag like <widger> or sitting directly under
+    <body>, separated by <br/>. Such runs are collected too, split on <br/>.
     """
     root = parse_page(html)
     if root.tag == 'html':
@@ -295,6 +346,14 @@ def html_to_units(html: str):
 
     def walk(el):
         tag = el.tag.lower() if isinstance(el.tag, str) else ''
+        if tag in _SKIP_TAGS:
+            return
+        if tag == 'br':
+            # in mixed content, text after a bare <br/> is an inline run of its own
+            s = re.sub(r'\s+', ' ', el.tail or '').strip()
+            if s:
+                out.append(('para', s))
+            return
         m = HEADING_RE.match(tag)
         if m:
             text = text_of(el).strip()
@@ -305,14 +364,20 @@ def html_to_units(html: str):
             return
         if tag in BLOCK_TAGS:
             text = text_of(el).strip()
-            # don't double count nested blocks: only treat as a paragraph
-            # unit if it has no block-level children of interest
-            has_block_child = any(
-                isinstance(c.tag, str) and c.tag.lower() in BLOCK_TAGS | {t for t in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6')}
-                for c in el
-            )
-            if text and not has_block_child:
+            # don't double count nested blocks: only treat as a paragraph unit
+            # if the subtree holds no other block-level element of interest
+            if text and not _has_block_desc(el):
                 out.append(('para', re.sub(r'\s+', ' ', text)))
+                return
+        elif not _has_block_desc(el):
+            segs = _inline_segments(el)
+            if el.tail and el.tail.strip():
+                segs.append(el.tail)
+            for seg in segs:
+                s = re.sub(r'\s+', ' ', seg).strip()
+                if s:
+                    out.append(('para', s))
+            return
         for child in el:
             walk(child)
 
