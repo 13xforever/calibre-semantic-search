@@ -485,6 +485,8 @@ class SemanticSearchAction(InterfaceAction):
             tip = _('Indexing paused')
         elif state == 'attributes':
             tip = f"Extracting attributes ({d.get('done')}/{d.get('total')})"
+            if d.get('sub_total'):
+                tip += f", part {d.get('sub_done')}/{d.get('sub_total')}"
         elif state == 'attributes_done':
             tip = f"Attributes: {d.get('done')}/{d.get('total')} done"
         elif state == 'attr_error':
@@ -667,6 +669,8 @@ class SemanticSearchAction(InterfaceAction):
         elif st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
             if st.get('state') == 'attributes':
                 line = f"Extracting attributes ({st.get('done')}/{st.get('total')}): {self._book_label(st.get('book_id'), api)}"
+                if st.get('sub_total'):
+                    line += f", part {st.get('sub_done')}/{st.get('sub_total')}"
             else:
                 line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
                 if st.get('total'):

@@ -306,6 +306,31 @@ class TestExtract(unittest.TestCase):
         self.assertEqual(values['tropes'], ['Slow Burn', 'enemies to lovers'])
         self.assertEqual(store.attrs[11]['tropes'], ['Slow Burn', 'enemies to lovers'])
 
+    def test_fulltext_reports_progress_per_group(self):
+        store = FakeStore()
+        api = FakeApi()
+        llm = FakeLLM({'gender': 'male'})
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.attr_mode = 'fulltext'
+        # 3000 tokens -> ~6916 char budget, so [5000,5000,100] splits into 2 groups
+        settings.attr_context_tokens = 3000
+        attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
+        calls = []
+        attributes.extract_book_attributes(2, api, store, settings, llm=llm, progress_cb=lambda d, t: calls.append((d, t)))
+        self.assertEqual(calls, [(1, 2), (2, 2)])
+
+    def test_sampled_mode_emits_no_progress(self):
+        store = FakeStore()
+        api = FakeApi()
+        llm = FakeLLM({'gender': 'female'})
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
+        calls = []
+        attributes.extract_book_attributes(3, api, store, settings, llm=llm, progress_cb=lambda d, t: calls.append((d, t)))
+        self.assertEqual(calls, [])
+
 
 if __name__ == '__main__':
     unittest.main()

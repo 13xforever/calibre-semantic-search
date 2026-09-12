@@ -103,10 +103,10 @@ class FakeApi:
         return [1, 2, 3]
 
 
-def _status_lines(api):
+def _status_lines(api, status=None):
     a = object.__new__(gui.SemanticSearchAction)
     a.store = FakeStore()
-    a._last_status = {'state': 'attributes', 'done': 7, 'total': 19, 'book_id': 5}
+    a._last_status = status or {'state': 'attributes', 'done': 7, 'total': 19, 'book_id': 5}
     a._api = (lambda: api) if api is not None else (lambda: None)
     a.get_settings = lambda: utils.Settings()
     return gui.SemanticSearchAction.status_lines(a)
@@ -131,6 +131,23 @@ class TestStatusLines(unittest.TestCase):
     def test_no_api_falls_back_to_indexed(self):
         lines = _status_lines(None)
         self.assertEqual(lines[1], 'Indexed books: 2')
+
+    def test_attributes_line_shows_sub_progress(self):
+        # fulltext mode reports per-book sub-progress (map steps) alongside book-level done/total
+        lines = _status_lines(FakeApi(), {'state': 'attributes', 'done': 7, 'total': 19, 'book_id': 5, 'sub_done': 3, 'sub_total': 8})
+        self.assertEqual(lines[0], 'Extracting attributes (7/19): book 5, part 3/8')
+
+    def test_attributes_tooltip_shows_sub_progress(self):
+        a = object.__new__(gui.SemanticSearchAction)
+        a.qaction = _FakeQtAction()
+        gui.SemanticSearchAction._on_status(a, {'state': 'attributes', 'done': 2, 'total': 10, 'book_id': 5, 'sub_done': 3, 'sub_total': 7})
+        self.assertEqual(a.qaction.tip, 'Extracting attributes (2/10), part 3/7')
+
+    def test_attributes_tooltip_without_sub_progress(self):
+        a = object.__new__(gui.SemanticSearchAction)
+        a.qaction = _FakeQtAction()
+        gui.SemanticSearchAction._on_status(a, {'state': 'attributes', 'done': 2, 'total': 10, 'book_id': 5})
+        self.assertEqual(a.qaction.tip, 'Extracting attributes (2/10)')
 
 
 class _FakeIconSink:

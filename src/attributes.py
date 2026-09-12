@@ -215,6 +215,8 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
     """Extract attributes for one book and write them to custom columns.
 
     Returns the raw values dict. Raises on LLM errors (caller decides whether to retry).
+    In fulltext mode `progress_cb(done, total)` is called before each map call so the
+    caller can surface per-book sub-progress; sampled mode is a single call and emits none.
     """
     fields = settings.enabled_attributes()
     if not fields:
@@ -238,7 +240,7 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
         partials = []
         for i, g in enumerate(groups):
             if progress_cb:
-                progress_cb(f'map {i + 1}/{len(groups)}')
+                progress_cb(i + 1, len(groups))
             res = llm.generate_structured_output(_prompt_for(g, fields), schema, 'You are extracting book attributes from a portion of a book. Only report what is present in this portion.')
             if res.exception is not None:
                 raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')

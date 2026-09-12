@@ -255,8 +255,13 @@ class Indexer(threading.Thread):
             if self.stop_event.is_set() or self._paused.is_set():
                 return False  # interrupted; the phase resumes on a later pass
             self._status('attributes', bid, done=i + 1, total=total)
+
+            def progress(d, t, _bid=bid, _i=i):
+                # per-book sub-progress (fulltext map steps) on top of book-level done/total
+                self._status('attributes', _bid, done=_i + 1, total=total, sub_done=d, sub_total=t)
+
             try:
-                extract_book_attributes(bid, self.attr_writer, self.store, settings, llm=llm)
+                extract_book_attributes(bid, self.attr_writer, self.store, settings, llm=llm, progress_cb=progress)
                 self._set_attr_failed(bid, None)
             except Exception as e:
                 self._set_attr_failed(bid, repr(e))

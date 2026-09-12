@@ -174,6 +174,22 @@ class TestAttrPhase(unittest.TestCase):
         self.assertIn('1', failed)
         vs.close()
 
+    def test_fulltext_reports_sub_progress(self):
+        # fulltext mode makes one LLM call per map group; each call must surface as
+        # sub-progress on top of the book-level done/total (like embedding's chunk count)
+        vs, ix, settings, statuses, done, writer = self._make()
+        settings.attr_mode = 'fulltext'
+        settings.attr_context_tokens = 3000  # ~6916 char budget -> [5000,5000,100] splits into 2 groups
+        attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
+        ix._process_attributes([1], settings, llm=FakeLLM({'gender': 'f'}))
+        sub = [s for s in statuses if s.get('sub_total')]
+        self.assertEqual([(s['sub_done'], s['sub_total']) for s in sub], [(1, 2), (2, 2)])
+        for s in sub:
+            self.assertEqual(s['state'], 'attributes')
+            self.assertEqual((s['done'], s['total']), (1, 1))
+            self.assertEqual(s['book_id'], 1)
+        vs.close()
+
     def test_pending_excludes_failed(self):
         vs, ix, settings, statuses, done, writer = self._make()
         self._index_book(vs, 1)
