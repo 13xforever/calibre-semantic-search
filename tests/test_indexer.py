@@ -396,5 +396,47 @@ class TestPauseResume(unittest.TestCase):
         vs.close()
 
 
+class TestProcessOneUnexpectedError(unittest.TestCase):
+    """An unexpected per-book crash (e.g. a parser bug in a dependency) must fail
+    the book and remove it from the dirty queue, not leak into run() where it
+    would be retried forever."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_unexpected_exception_fails_book_and_leaves_dirty(self):
+        vs = store_mod.VectorStore(_os.path.join(self._tmp.name, 't.db'), backend='sqlite')
+        settings = utils.Settings()
+        statuses = []
+        api = FakeApi([58])
+        api.format = lambda bid, fmt, as_path=False: _os.path.join(self._tmp.name, 'fake.epub')
+        ix = indexer.Indexer(
+            store=vs, get_new_api=lambda: api, settings_provider=lambda: settings, status_cb=statuses.append
+        )
+        vs.add_dirty(58)
+        orig_extract = indexer.extract_book_pages
+        orig_chunks = indexer.chunks_from_pages
+
+        def boom(*a, **kw):
+            raise RuntimeError('internal error, line 15, column 126')
+
+        try:
+            indexer.extract_book_pages = lambda path, fmt: ('pages', ['<body><p>hello world</p></body>'])
+            indexer.chunks_from_pages = boom
+            ix._process_one(58)
+        finally:
+            indexer.extract_book_pages = orig_extract
+            indexer.chunks_from_pages = orig_chunks
+        failed = json.loads(vs.get_meta('failed', '{}'))
+        self.assertIn('58', failed)
+        self.assertIn('internal error', failed['58']['error'])
+        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertIn('error', [s['state'] for s in statuses])
+        vs.close()
+
+
 if __name__ == '__main__':
     unittest.main()

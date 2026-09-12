@@ -229,5 +229,101 @@ class TestChunksFromPages(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
 
 
+class TestHtmlParserFallback(unittest.TestCase):
+    """calibre's bundled libxml2 (2.15.x) HTML parser rejects non-BMP characters
+    ('internal error') even in recover mode; OEB pages must still be chunked via
+    the XML-mode fallback in parse_page."""
+
+    PAGE = (
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 7</title></head>'
+        '<body><div id="book-inner">'
+        '<p><span xmlns="http://www.w3.org/1999/xhtml" class="koboSpan" id="kobo.25.1">On the bridge \U0001F60A</span></p>'
+        '<p>Second paragraph.</p>'
+        '</div></body></html>'
+    )
+
+    def test_emoji_page_chunks(self):
+        chunks = chunker.chunks_from_pages([self.PAGE], 1000, 0)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn('On the bridge', chunks[0].text)
+        self.assertIn('Second paragraph.', chunks[0].text)
+
+    def test_fallback_matches_html_parser(self):
+        from lxml import etree as _etree
+
+        real = chunker.lhtml.fromstring
+        try:
+            chunker.lhtml.fromstring = lambda html, *a, **kw: (_ for _ in ()).throw(
+                _etree.XMLSyntaxError('internal error', None, 15, 126)
+            )
+            fallback = chunker.chunks_from_pages([self.PAGE], 1000, 0)
+        finally:
+            chunker.lhtml.fromstring = real
+        normal = chunker.chunks_from_pages([self.PAGE], 1000, 0)
+        self.assertEqual([c.text for c in fallback], [c.text for c in normal])
+        self.assertTrue(fallback)
+
+    def test_fallback_keeps_headings_and_paths(self):
+        from lxml import etree as _etree
+
+        page = (
+            '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+            '<h1>Chapter One</h1><p>First \U0001F600 para.</p>'
+            '</body></html>'
+        )
+        real = chunker.lhtml.fromstring
+        try:
+            chunker.lhtml.fromstring = lambda html, *a, **kw: (_ for _ in ()).throw(
+                _etree.XMLSyntaxError('internal error', None, 1, 1)
+            )
+            paras, paths = chunker.page_to_paragraphs(page)
+        finally:
+            chunker.lhtml.fromstring = real
+        self.assertEqual(paras, ['First \U0001F600 para.'])
+        self.assertEqual(paths, [['Chapter One']])
+
+
+class TestNonBmpContent(unittest.TestCase):
+    """Non-BMP content must survive chunking under both libxml2 builds the dev
+    gate uses: the venv wheel's (2.11.x, where the HTML parser handles it
+    directly) and calibre's bundled one (2.15.x, which needs the bytes fallback
+    in parse_page)."""
+
+    # 👩🏻‍👩🏼‍👧🏼‍👧🏻 — ZWJ family with skin-tone modifiers
+    FAMILY = '\U0001F469\U0001F3FB\u200D\U0001F469\U0001F3FC\u200D\U0001F467\U0001F3FC\u200D\U0001F467\U0001F3FB'
+    # CJK Unified Ideographs extensions A, B, C, D, E
+    CJK_EXT = '\u3400\U00020000\U0002A700\U0002B740\U0002B820'
+
+    def test_zwj_family_emoji_page(self):
+        page = f'<body><p>Home {self.FAMILY} home</p></body>'
+        chunks = chunker.chunks_from_pages([page], 1000, 0)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn(self.FAMILY, chunks[0].text)
+
+    def test_cjk_extension_ideographs_page(self):
+        page = f'<body><p>{self.CJK_EXT} test</p></body>'
+        chunks = chunker.chunks_from_pages([page], 1000, 0)
+        self.assertEqual(len(chunks), 1)
+        for ch in self.CJK_EXT:
+            self.assertIn(ch, chunks[0].text)
+
+    def test_fallback_preserves_zwj_and_cjk_extensions(self):
+        from lxml import etree as _etree
+
+        page = f'<body><p>{self.FAMILY} {self.CJK_EXT}</p></body>'
+        real = chunker.lhtml.fromstring
+        try:
+            chunker.lhtml.fromstring = lambda html, *a, **kw: (_ for _ in ()).throw(
+                _etree.XMLSyntaxError('internal error', None, 1, 1)
+            )
+            chunks = chunker.chunks_from_pages([page], 1000, 0)
+        finally:
+            chunker.lhtml.fromstring = real
+        self.assertEqual(len(chunks), 1)
+        self.assertIn(self.FAMILY, chunks[0].text)
+        for ch in self.CJK_EXT:
+            self.assertIn(ch, chunks[0].text)
+
+
 if __name__ == '__main__':
     unittest.main()

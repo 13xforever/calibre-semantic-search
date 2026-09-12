@@ -13,6 +13,7 @@ Usage:
 import os
 import py_compile
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -49,11 +50,54 @@ def cmd_lint():
     return proc.returncode == 0
 
 
+def _find_calibre_debug():
+    """Path to calibre-debug, or None.
+
+    Checked in a .env file at the repo root (CALIBRE_DEBUG=path), then on PATH."""
+    env_file = os.path.join(ROOT, '.env')
+    if os.path.isfile(env_file):
+        with open(env_file, encoding='utf-8') as fh:
+            for line in fh:
+                key, sep, value = line.partition('=')
+                if sep and key.strip() == 'CALIBRE_DEBUG':
+                    value = value.strip().strip('"').strip("'")
+                    if value and os.path.isfile(value):
+                        return value
+    for name in ('calibre-debug', 'calibre-debug.exe'):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _calibre_parser_tests():
+    """Re-run the chunker tests under calibre's Python so they exercise calibre's
+    bundled libxml2 (the PyPI lxml wheel bundles a different one). Skipped with
+    a note when calibre-debug is not available."""
+    exe = _find_calibre_debug()
+    if exe is None:
+        print('note: calibre-debug not found (set CALIBRE_DEBUG in .env) - chunker tested against the venv libxml2 only')
+        return True
+    code = (
+        "import sys, unittest\n"
+        f"sys.path.insert(0, {TESTS!r})\n"
+        "import lxml.etree as _e\n"
+        "print('calibre parser: libxml2 %d.%d.%d' % tuple(_e.LIBXML_VERSION[:3]))\n"
+        f"suite = unittest.TestLoader().discover({TESTS!r}, top_level_dir={TESTS!r}, pattern='test_chunker.py')\n"
+        "sys.exit(0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)"
+    )
+    print(f'running chunker tests under calibre parser: {exe}')
+    proc = subprocess.run([exe, '-c', code])
+    return proc.returncode == 0
+
+
 def cmd_test():
     loader = unittest.TestLoader()
     suite = loader.discover(TESTS, top_level_dir=TESTS)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
-    return result.wasSuccessful()
+    if not result.wasSuccessful():
+        return False
+    return _calibre_parser_tests()
 
 
 def _src_entries():

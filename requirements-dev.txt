@@ -4,6 +4,9 @@
 # pins match what the external-dependency installer (DEP_PINS in src/utils.py) fetches.
 ruff             # lint step: pyflakes + isort rules (config in ruff.toml)
 lancedb==0.38.0  # hard test dependency - the lancedb backend tests must run, not skip
-lxml==6.1.1      # exact version calibre 9.14 bundles; the chunker's HTML walk runs against it in tests too (keep in sync when calibre updates it)
+lxml==6.1.1      # exact version calibre 9.14 bundles (keep in sync when calibre updates it). NOTE: the PyPI wheel
+                 # compiles libxml2 2.11.9 into its binary while calibre builds lxml against libxml2 2.15.x - different parsers for the same
+                 # lxml version. The dev gate re-runs the chunker tests under calibre-debug (CALIBRE_DEBUG in .env, or PATH) to cover
+                 # calibre's parser; that run is skipped with a note when unavailable.
 numpy==2.5.3     # optional at runtime (pure-Python fallback), but needed here to exercise the numpy paths in tests; calibre does not bundle it
 zstandard==0.25.0  # zstd text codec; without it a fresh store falls back to zlib

@@ -1,8 +1,11 @@
 '''Chunk book text into paragraph groups with chapter context.
 
 No calibre or Qt imports, so it is unit-testable standalone. The only
-non-stdlib dependency is lxml, which calibre bundles (requirements-dev.txt
-pins the exact version calibre ships, so tests exercise the same parser).
+non-stdlib dependency is lxml, which calibre bundles. requirements-dev.txt
+pins the exact lxml version calibre ships, but the PyPI wheel compiles a
+different libxml2 into its binary than calibre does — so the dev gate runs
+tests/test_chunker.py twice: under the venv's lxml and, when calibre-debug
+is available, under calibre's Python (see parse_page for why both matter).
 '''
 
 from __future__ import annotations
@@ -10,10 +13,29 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from lxml import etree
 from lxml import html as lhtml
 
 HEADING_RE = re.compile(r'^h([1-6])$', re.I)
 BLOCK_TAGS = {'p', 'div', 'blockquote', 'li', 'pre', 'table', 'section', 'article'}
+_XMLNS_DECL_RE = re.compile(r'\s+xmlns(?::[A-Za-z_][\w.-]*)?="[^"]*"')
+
+
+def parse_page(html: str):
+    """Parse a spine page into an element tree.
+
+    OEB pages are well-formed XML (they come from ``etree.tostring`` of a parsed
+    tree), so when the HTML parser rejects one we re-parse it in XML mode with
+    namespace declarations stripped. That fallback is required because calibre's
+    bundled libxml2 (2.15.x) raises 'internal error' on non-BMP characters (e.g.
+    emoji) when parsing unicode input — in both the HTML and the XML parser, and
+    even in recover mode; the same document parses fine as raw UTF-8 bytes, so
+    the fallback encodes before parsing.
+    """
+    try:
+        return lhtml.fromstring(html)
+    except etree.XMLSyntaxError:
+        return etree.fromstring(_XMLNS_DECL_RE.sub('', html).encode('utf-8'))
 
 
 @dataclass
@@ -260,24 +282,29 @@ def html_to_units(html: str):
 
     kind is 'heading' (payload: (level, text)) or 'para' (payload: text).
     """
-    root = lhtml.fromstring(html)
+    root = parse_page(html)
     if root.tag == 'html':
         body = root.find('.//body')
         root = body if body is not None else root
     out = []
 
+    def text_of(el):
+        # itertext() works on both html and plain etree elements (text_content()
+        # is missing from the latter in some lxml builds)
+        return ''.join(el.itertext())
+
     def walk(el):
         tag = el.tag.lower() if isinstance(el.tag, str) else ''
         m = HEADING_RE.match(tag)
         if m:
-            text = (el.text_content() or '').strip()
+            text = text_of(el).strip()
             if text:
                 out.append(('heading', (int(m.group(1)), text)))
             for child in el:
                 walk(child)
             return
         if tag in BLOCK_TAGS:
-            text = (el.text_content() or '').strip()
+            text = text_of(el).strip()
             # don't double count nested blocks: only treat as a paragraph
             # unit if it has no block-level children of interest
             has_block_child = any(

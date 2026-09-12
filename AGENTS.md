@@ -23,6 +23,7 @@ calibre **GUI plugin** (not a standalone app): meaning-based search + LLM-extrac
 - `calibre.*` is unavailable in the test interpreter: any `calibre.ai` / `calibre.db` import must stay **inside functions**, never at module top level.
 - The lancedb backend tests are **not skipped** — `lancedb` is a hard test dependency; without it the suite fails loudly on purpose. Don't wrap them in `skipUnless`.
 - Simulating a *missing* optional package means patching `store._module_available` (the real module stays importable, mirroring an in-session uninstall where the loaded module still works while fresh opens must block). See `test_db_lifecycle.TestBlockedStates` / `TestCodecRecompress`.
+- The chunker tests run **twice** in the gate: under the venv's PyPI lxml, and — when `calibre-debug` is found (via `.env` with `CALIBRE_DEBUG=path`, then PATH) — under calibre's Python, because the two bundle different libxml2 builds for the same pinned lxml version and `chunker.parse_page` must work on both. The calibre run is skipped with a note when unavailable; don't remove it or wrap it in `skipUnless`.
 
 ## Architecture
 

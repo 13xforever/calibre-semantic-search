@@ -396,6 +396,18 @@ class Indexer(threading.Thread):
             pass
 
     def _process_one(self, book_id: int):
+        try:
+            self._index_book(book_id)
+        except Exception as e:
+            # An unexpected per-book crash must fail the book (visible in the
+            # status dialog) instead of leaking into run(), which would retry it
+            # forever and wedge the whole indexing run.
+            try:
+                self._fail(book_id, f'indexing failed unexpectedly: {e!r}')
+            except Exception as e2:
+                _default_log(f'_fail also failed for book {book_id}: {e2!r}')
+
+    def _index_book(self, book_id: int):
         api = self.get_new_api()
         if api is None:
             return
@@ -511,10 +523,14 @@ class Indexer(threading.Thread):
     def _fail(self, book_id: int, msg: str):
         import json
 
-        api = self.get_new_api()
-        settings = self.settings_provider()
-        formats = api.formats(book_id) if api is not None else ()
-        fmt = pick_format(formats, settings.format_priority) if formats else None
+        api = None
+        try:
+            api = self.get_new_api()
+            settings = self.settings_provider()
+            formats = api.formats(book_id) if api is not None else ()
+            fmt = pick_format(formats, settings.format_priority) if formats else None
+        except Exception:
+            fmt = None
         if fmt is not None and api is not None:
             try:
                 md = api.format_metadata(book_id, fmt)
