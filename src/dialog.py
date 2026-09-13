@@ -71,6 +71,24 @@ def best_search_phrase(chunk_text: str, max_len: int = 400) -> str:
     return best.strip()
 
 
+class _ResultsTable(QTableWidget):
+    """Results table where Home/End jump the row selection to the top/bottom row.
+
+    Qt's default moves the current *cell* instead (Home -> first column, End -> last
+    column, Ctrl+... -> corner cells), which is invisible under SelectRows; rows are
+    the unit of interaction here, so all four should select the first/last row.
+    """
+
+    def keyPressEvent(self, e):
+        # Only bare and Ctrl variants; anything else (e.g. Shift) keeps Qt's default.
+        if e.key() in (Qt.Key.Key_Home, Qt.Key.Key_End) and not (e.modifiers() & ~Qt.KeyboardModifier.ControlModifier):
+            if self.rowCount() > 0:
+                self.setCurrentCell(0 if e.key() == Qt.Key.Key_Home else self.rowCount() - 1, 0)
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+
 class SemanticSearchDialog(QDialog):
     def __init__(self, gui, action):
         super().__init__(gui)
@@ -99,7 +117,7 @@ class SemanticSearchDialog(QDialog):
         self.status_label = QLabel('')
         v.addWidget(self.status_label)
 
-        self.table = QTableWidget(0, 4)
+        self.table = _ResultsTable(0, 4)
         self.table.setHorizontalHeaderLabels([_('Book'), _('Chapter'), _('Match'), _('Score')])
         # Match is Stretch so it absorbs all leftover width: the table always spans the full
         # dialog and the snippet column grows/shrinks with the window (and when other columns

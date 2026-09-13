@@ -45,6 +45,8 @@ def _install_stubs():
     qtcore.Qt = types.SimpleNamespace(
         ItemDataRole=types.SimpleNamespace(UserRole=256),
         SortOrder=types.SimpleNamespace(AscendingOrder=0, DescendingOrder=1),
+        Key=types.SimpleNamespace(Key_Up=81, Key_Down=82, Key_Home=167, Key_End=168),
+        KeyboardModifier=types.SimpleNamespace(NoModifier=0, ShiftModifier=0x02000000, ControlModifier=0x04000000),
     )
 
     class _Item:
@@ -280,6 +282,75 @@ class TestStaleResults(unittest.TestCase):
         dialog.SemanticSearchDialog.do_search(d)
         self.assertEqual(d.results, [])
         self.assertEqual(len(d.table.grid), 0)
+
+
+class TestHomeEndRowJump(unittest.TestCase):
+    """Regression: Qt's default Home/End moves the current *cell* between columns (invisible
+    under SelectRows); rows are the unit of interaction, so Home/Ctrl+Home and End/Ctrl+End
+    must jump the row selection to the top/bottom row."""
+
+    def _table(self, n_rows):
+        t = dialog._ResultsTable(0, 4)
+        t.rowCount = lambda: n_rows
+        t.current = None
+        t.setCurrentCell = lambda r, c: setattr(t, 'current', (r, c))
+        return t
+
+    def _event(self, key, modifiers=0):
+        e = types.SimpleNamespace()
+        e.key = lambda: key
+        e.modifiers = lambda: modifiers
+        e.accepted = False
+        e.accept = lambda: setattr(e, 'accepted', True)
+        return e
+
+    def test_home_jumps_to_first_row(self):
+        t = self._table(5)
+        e = self._event(dialog.Qt.Key.Key_Home)
+        dialog._ResultsTable.keyPressEvent(t, e)
+        self.assertEqual(t.current, (0, 0))
+        self.assertTrue(e.accepted)
+
+    def test_end_jumps_to_last_row(self):
+        t = self._table(5)
+        e = self._event(dialog.Qt.Key.Key_End)
+        dialog._ResultsTable.keyPressEvent(t, e)
+        self.assertEqual(t.current, (4, 0))
+        self.assertTrue(e.accepted)
+
+    def test_ctrl_variants_match(self):
+        ctrl = dialog.Qt.KeyboardModifier.ControlModifier
+        t = self._table(5)
+        dialog._ResultsTable.keyPressEvent(t, self._event(dialog.Qt.Key.Key_Home, ctrl))
+        self.assertEqual(t.current, (0, 0))
+        t = self._table(5)
+        dialog._ResultsTable.keyPressEvent(t, self._event(dialog.Qt.Key.Key_End, ctrl))
+        self.assertEqual(t.current, (4, 0))
+
+    def test_empty_table_is_noop(self):
+        t = self._table(0)
+        e = self._event(dialog.Qt.Key.Key_Home)
+        dialog._ResultsTable.keyPressEvent(t, e)
+        self.assertIsNone(t.current)
+        self.assertTrue(e.accepted)
+
+    def test_other_keys_and_modifiers_pass_through(self):
+        t = self._table(5)
+        seen = []
+        base = dialog.QTableWidget
+        original = getattr(base, 'keyPressEvent', None)
+        had_key_press = hasattr(base, 'keyPressEvent')
+        base.keyPressEvent = lambda self, e: seen.append(e)
+        try:
+            shift = dialog.Qt.KeyboardModifier.ShiftModifier
+            for key, mods in ((dialog.Qt.Key.Key_Up, 0), (dialog.Qt.Key.Key_Down, 0), (dialog.Qt.Key.Key_Home, shift)):
+                dialog._ResultsTable.keyPressEvent(t, self._event(key, mods))
+        finally:
+            if had_key_press:
+                base.keyPressEvent = original
+            else:
+                delattr(base, 'keyPressEvent')
+        self.assertEqual(len(seen), 3)
 
 
 class TestWorkerLifetime(unittest.TestCase):
