@@ -209,6 +209,29 @@ class TestVectorStore(unittest.TestCase):
         self.assertEqual(s.get_attrs(4), {})
         self.assertEqual(s.attr_book_ids(), [5])
 
+    def test_add_dirty_many(self):
+        s = self.s
+        s.add_dirty_many([1, 2, 3], 'reindex')
+        self.assertEqual(sorted(s.dirty_book_ids()), [1, 2, 3])
+        # same upsert semantics as add_dirty: no duplicates, reason updated
+        s.add_dirty(2, 'changed')
+        self.assertEqual(sorted(s.dirty_book_ids()), [1, 2, 3])
+        s.remove_dirty(2)
+        self.assertEqual(sorted(s.dirty_book_ids()), [1, 3])
+        s.add_dirty_many([], 'x')  # empty is a no-op, not an error
+        self.assertEqual(sorted(s.dirty_book_ids()), [1, 3])
+
+    def test_attrs_fields(self):
+        s = self.s
+        self.assertEqual(s.attrs_fields(), {})
+        s.set_attrs(4, {'gender': 'f', 'tropes': ['x']})
+        s.set_attrs(5, {})
+        got = s.attrs_fields()
+        self.assertEqual(got[4], frozenset({'gender', 'tropes'}))
+        self.assertEqual(got[5], frozenset())  # stored-but-empty still counts as a row
+        s.clear_attrs(4)
+        self.assertEqual(s.attrs_fields(), {5: frozenset()})
+
 
 class TestSqlitePerModel(unittest.TestCase):
     """sqlite backend: per-model tables, legacy migration, stale cleanup, batched search."""
@@ -409,6 +432,56 @@ class TestVecHelpers(unittest.TestCase):
         self.assertEqual(list(v), [0.0, 0.0])
 
 
+class TestHalfLut(unittest.TestCase):
+    """The no-numpy decode path: the LUT must be exact for every half bit pattern."""
+
+    @staticmethod
+    def _naive(blob):
+        # independent reference: the original per-bit double-precision decode
+        out = []
+        for i in range(0, len(blob), 2):
+            h = blob[i] | (blob[i + 1] << 8)
+            sign = -1.0 if h & 0x8000 else 1.0
+            exp = (h >> 10) & 0x1F
+            mant = h & 0x3FF
+            if exp == 0x1F:
+                v = float('inf') if mant == 0 else float('nan')
+            elif exp == 0:
+                v = mant * 2.0 ** -24
+            else:
+                v = (mant + 1024) * 2.0 ** (exp - 25)
+            out.append(sign * v)
+        return out
+
+    def test_random_blobs_match_naive_reference(self):
+        rnd = random.Random(1)
+        for _ in range(64):
+            n = rnd.randrange(1, 512)
+            blob = bytes(rnd.randrange(256) for _ in range(2 * n))
+            got = store._half_bytes_to_floats(blob)
+            want = self._naive(blob)
+            self.assertEqual(len(got), len(want))
+            for a, b in zip(got, want):
+                if math.isnan(a) and math.isnan(b):
+                    continue
+                self.assertEqual(a, b)  # exact: the f32 LUT entries are lossless
+
+    def test_special_values(self):
+        # +1.0, -1.0, max finite (65504), +inf, nan, zero, smallest subnormal
+        blob = bytes.fromhex('003C 00BC FF7B 007C 007E 0000 0100'.replace(' ', ''))
+        got = store._half_bytes_to_floats(blob)
+        self.assertEqual(got[0], 1.0)
+        self.assertEqual(got[1], -1.0)
+        self.assertEqual(got[2], 65504.0)
+        self.assertEqual(got[3], float('inf'))
+        self.assertTrue(math.isnan(got[4]))
+        self.assertEqual(got[5], 0.0)
+        self.assertEqual(got[6], 2.0 ** -24)
+
+    def test_empty_blob(self):
+        self.assertEqual(store._half_bytes_to_floats(b''), [])
+
+
 class TestVectorStoreLance(unittest.TestCase):
     """Runtime coverage for the LanceDB backend (forced, not auto).
 
@@ -563,6 +636,55 @@ class TestNumpyFallbackEquivalence(unittest.TestCase):
         self.assertEqual(len(scores_np), len(scores_py))
         for a, b in zip(scores_np, scores_py):
             self.assertAlmostEqual(a, b, delta=1e-5)
+
+
+class TestFinalizeCancel(unittest.TestCase):
+    """finalize_schema(cancel=...) stops at the next checkpoint and stays resumable."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'test.db')
+        self.s = store.VectorStore(self.path)
+
+    def tearDown(self):
+        self.s.close()
+        self.tmp.cleanup()
+
+    def test_pre_set_cancel_raises_before_any_work(self):
+        import threading
+
+        ev = threading.Event()
+        ev.set()
+        with self.assertRaises(store.FinalizeCancelled):
+            self.s.finalize_schema(cancel=ev)
+
+    def test_uncancelled_run_completes(self):
+        # a fresh store has nothing pending: the run is a no-op and must not raise
+        self.s.finalize_schema()
+        self.assertFalse(self.s.needs_finalize())
+
+    def test_cancel_aborts_recompress_stage_resumably(self):
+        import threading
+        from dataclasses import dataclass
+
+        @dataclass
+        class C:
+            chunk_no: int
+            text: str
+            chapter_path: list = None
+
+        s = self.s
+        for i in range(10):
+            s.insert_chunk(1, C(i, f'text {i}', []), 'm', store.l2_normalize([1.0, 0.0, 0.0]))
+        s.commit()
+        s.upsert_book(1, 'EPUB', 10, 'm')
+        s.set_meta(store.RECOMPRESS_KEY, store.recompress_marker('zlib'))
+        ev = threading.Event()
+        ev.set()
+        with self.assertRaises(store.FinalizeCancelled):
+            s.finalize_schema(cancel=ev)
+        # the marker survives: a later open resumes the conversion from where it stopped
+        self.assertIsNotNone(s.get_meta(store.RECOMPRESS_KEY))
 
 
 if __name__ == '__main__':

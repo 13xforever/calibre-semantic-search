@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 from calibre.gui2.actions import InterfaceAction
 from calibre.utils.localization import _
@@ -21,6 +22,7 @@ from .store import (
     BACKEND_KEY,
     MIGRATE_KEY,
     RECOMPRESS_KEY,
+    FinalizeCancelled,
     MetaStore,
     MissingDependencyError,
     VectorStore,
@@ -163,6 +165,7 @@ class SemanticSearchAction(InterfaceAction):
     _db_sig = pyqtSignal(object)  # (method, args, kwargs, threading.Event)
     _finalize_sig = pyqtSignal(object, object)  # (store, error-or-None)
     _finalize_prog_sig = pyqtSignal(object)  # (stage, detail) migration progress lines
+    _open_sig = pyqtSignal()  # the background open finished; apply self._open_result
 
     def __init__(self, parent, site_customization):
         super().__init__(parent, site_customization)
@@ -171,6 +174,12 @@ class SemanticSearchAction(InterfaceAction):
         self.search_action = None
         self._reconcile_thread = None
         self._finalize_thread = None
+        self._finalize_cancel = None  # threading.Event handed to the running finalize_schema
+        self._open_thread = None
+        self._open_generation = 0  # bumped per open; stale results are discarded
+        self._open_result = None  # (generation, 'ok'|'blocked'|'error', payload, show_error)
+        self._reindex_queue_thread = None
+        self._status_slow_cache = None  # (store, monotonic ts, indexed_books, pending-attrs set)
         self._last_status = None
         self._last_finalize = None  # (stage, detail) of the running/pending migration
         self._blocked_dep = None  # package missing for this library ('lancedb'/'zstandard')
@@ -184,6 +193,7 @@ class SemanticSearchAction(InterfaceAction):
         self._db_sig.connect(self._on_db_write)
         self._finalize_sig.connect(self._on_finalize_done)
         self._finalize_prog_sig.connect(self._on_finalize_progress)
+        self._open_sig.connect(self._on_open_done)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -272,16 +282,42 @@ class SemanticSearchAction(InterfaceAction):
         self._start_for_library()
 
     def _ensure_started(self) -> bool:
-        if self.store is None:
+        if self.store is not None:
+            return True
+        t = self._open_thread
+        if (t is None or not t.is_alive()) and self._open_result is None:
+            # nothing in flight (or the previous open was applied and failed): retry
             self._start_for_library(show_error=True)
-        return self.store is not None
+            t = self._open_thread
+        # Wait for the background open. The result is polled directly (not via the
+        # queued signal) because this call can itself run while the event loop is
+        # busy; a bounded deadline keeps a pathologically slow open from freezing
+        # the click — the open keeps running and the next attempt picks it up.
+        deadline = time.time() + 30.0
+        while self.store is None:
+            self._apply_open_result()
+            if self.store is not None:
+                return True
+            t = self._open_thread
+            if (t is None or not t.is_alive()) and self._open_result is None:
+                return False  # blocked/failed result applied, or the open never ran
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
 
     def _start_for_library(self, show_error: bool = False):
-        if self._finalize_thread is not None and self._finalize_thread.is_alive():
-            # don't close the store out from under an in-flight migration; give it a
-            # moment to finish (partial work resumes on the next start)
-            self._finalize_thread.join(timeout=5.0)
+        # Stop any in-flight migration of the previous library first: set its cancel
+        # event, give it a moment to reach a checkpoint (per batch / per book), then
+        # close the store. Partial work is resumable on the next open.
+        cancel = self._finalize_cancel
+        if cancel is not None:
+            cancel.set()
+        ft = self._finalize_thread
+        if ft is not None and ft.is_alive():
+            ft.join(timeout=5.0)
         self._finalize_thread = None
+        self._finalize_cancel = None
         self._stop_indexer()
         if self.store is not None:
             try:
@@ -289,26 +325,80 @@ class SemanticSearchAction(InterfaceAction):
             except Exception:
                 pass
         self.store = None
+        self._open_result = None
         try:
             db = self.gui.current_db
         except Exception:
+            self._open_thread = None
             return
         if db is None:
+            self._open_thread = None
             return
         try:
             libdir = os.path.dirname(db.backend.dbpath)
         except Exception:
+            self._open_thread = None
             return
         settings = self.get_settings()
+        # Opening can take a long time (legacy schema migration, orphan sweep,
+        # lancedb table scan), so it runs off the GUI thread; the result is applied
+        # on the GUI thread by _apply_open_result.
+        gen = self._open_generation + 1
+        self._open_generation = gen
+        path = os.path.join(libdir, 'semantic-search.db')
+        t = threading.Thread(target=self._open_safe, args=(path, settings.vector_backend, show_error, gen), name='SSOpen', daemon=True)
+        self._open_thread = t
+        t.start()
+        self._update_action_availability()
+
+    def _open_safe(self, path, backend, show_error, gen):
+        # SSOpen thread: build the store (or capture why it cannot be opened).
         try:
-            self.store = VectorStore(os.path.join(libdir, 'semantic-search.db'), backend=settings.vector_backend)
+            store = VectorStore(path, backend=backend)
         except MissingDependencyError as e:
+            self._open_result = (gen, 'blocked', e, show_error)
+        except Exception as e:
+            self._open_result = (gen, 'error', e, show_error)
+        else:
+            try:
+                needs = store.needs_finalize()
+            except Exception as e:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+                self._open_result = (gen, 'error', e, show_error)
+            else:
+                self._open_result = (gen, 'ok', (store, needs), show_error)
+        self._open_sig.emit()
+
+    def _on_open_done(self):
+        # queued signal from the SSOpen thread; the actual state change happens in
+        # _apply_open_result so it can also be driven directly by _ensure_started
+        self._apply_open_result()
+
+    def _apply_open_result(self):
+        res = self._open_result
+        if res is None:
+            return
+        gen, kind, obj, show_error = res
+        if gen != self._open_generation:
+            # superseded by a newer open (the library switched again in the meantime)
+            if kind == 'ok':
+                try:
+                    obj[0].close()
+                except Exception:
+                    pass
+            self._open_result = None
+            return
+        self._open_result = None
+        if kind == 'blocked':
             # the library's stored data needs a package that is not installed; the
             # store cannot be opened at all. Block until it is reinstalled (or the
             # backend is switched in settings when no data is involved yet).
-            self._blocked_dep = e.dep
-            self._blocked_has_data = e.has_data
-            self._blocked_want = e.want_backend
+            self._blocked_dep = obj.dep
+            self._blocked_has_data = obj.has_data
+            self._blocked_want = obj.want_backend
             if show_error:
                 from calibre.gui2 import error_dialog
 
@@ -316,26 +406,30 @@ class SemanticSearchAction(InterfaceAction):
             self.qaction.setToolTip(_('Indexing disabled: a required package is missing (see Settings)'))
             self._update_action_availability()
             return
-        except Exception as e:
+        if kind == 'error':
             if show_error:
                 from calibre.gui2 import error_dialog
 
-                error_dialog(self.gui, 'Semantic search', f'Failed to open the semantic search store:\n{e}', show=True)
+                error_dialog(self.gui, 'Semantic search', f'Failed to open the semantic search store:\n{obj}', show=True)
+            self._update_action_availability()
             return
+        store, needs = obj
+        self.store = store
         self._blocked_dep = None
         self._blocked_has_data = False
         self._blocked_want = None
-        if self.store.needs_finalize():
+        if needs:
             # legacy chunk tables / pending schema work (backend switch, codec
             # change): migrate in the background (can take minutes on large
             # libraries), then start the indexer
+            cancel = threading.Event()
+            self._finalize_cancel = cancel
             self._last_finalize = None
-            t = threading.Thread(target=self._finalize_safe, args=(self.store,), name='SSFinalize', daemon=True)
+            t = threading.Thread(target=self._finalize_safe, args=(store, cancel), name='SSFinalize', daemon=True)
             self._finalize_thread = t
             t.start()
-            self._update_action_availability()
-            return
-        self._begin_indexing()
+        else:
+            self._begin_indexing()
         self._update_action_availability()
 
     def _block_message(self):
@@ -393,10 +487,12 @@ class SemanticSearchAction(InterfaceAction):
         self._reconcile_thread = t
         t.start()
 
-    def _finalize_safe(self, store):
+    def _finalize_safe(self, store, cancel):
         try:
-            store.finalize_schema(progress=self._emit_finalize_progress)
+            store.finalize_schema(progress=self._emit_finalize_progress, cancel=cancel)
             self._finalize_sig.emit(store, None)
+        except FinalizeCancelled:
+            pass  # the library was switched away; the new startup owns things now
         except Exception as e:
             self._finalize_sig.emit(store, e)
 
@@ -462,6 +558,14 @@ class SemanticSearchAction(InterfaceAction):
         except Exception:
             pass
         self._stop_indexer()
+        cancel = self._finalize_cancel
+        if cancel is not None:
+            cancel.set()
+        ft = self._finalize_thread
+        if ft is not None and ft.is_alive():
+            ft.join(timeout=5.0)
+        self._finalize_thread = None
+        self._finalize_cancel = None
         if self.store is not None:
             try:
                 self.store.close()
@@ -660,7 +764,23 @@ class SemanticSearchAction(InterfaceAction):
                     lines.append(ln)
                 return lines
             return ['Store not started.']
-        books = self.store.indexed_books()
+        # The store queries below are the slow part of this line set (a full books
+        # scan plus the attribute-pending scan); the status dialog refreshes every
+        # second, so cache them for a couple of seconds per open store.
+        c = getattr(self, '_status_slow_cache', None)
+        now = time.monotonic()
+        if c is not None and c[0] is self.store and now - c[1] < 2.0:
+            books, pending_attrs = c[2], c[3]
+        else:
+            books = self.store.indexed_books()
+            try:
+                settings = self.get_settings()
+                from .attributes import pending_attribute_books
+
+                pending_attrs = set(pending_attribute_books(self.store, settings))
+            except Exception:
+                pending_attrs = None
+            self._status_slow_cache = (self.store, now, books, pending_attrs)
         n_chunks = sum(b['n_chunks'] for b in books)
         api = self._api()
         lines = []
@@ -690,16 +810,10 @@ class SemanticSearchAction(InterfaceAction):
         if ft is not None and ft.is_alive():
             detail = self._last_finalize[1] if self._last_finalize else 'in progress'
             lines.append(f'Migrating search database: {detail} (can take a while on large libraries)')
-        try:
-            settings = self.get_settings()
-            from .attributes import pending_attribute_books
-
+        if pending_attrs is not None:
             with_chunks = [b for b in books if b['n_chunks'] > 0]
-            pending_attrs = pending_attribute_books(self.store, settings)
             done_attrs = max(0, len(with_chunks) - len(pending_attrs))
             lines.append(f'Attributes stored: {done_attrs}/{len(with_chunks)} books')
-        except Exception:
-            pass
         try:
             failed = self.store.failed_entries('index')
         except Exception:
@@ -923,15 +1037,23 @@ class SemanticSearchAction(InterfaceAction):
         api = self._api()
         if api is None:
             return
-
+        store = self.store
         settings = self.get_settings()
+        # The scan touches every book in the library, so it runs off the GUI thread;
+        # the queue write itself is one batched commit.
+        t = threading.Thread(target=self._queue_reindex_new_and_failed, args=(store, api, settings), name='SSReindexQueue', daemon=True)
+        self._reindex_queue_thread = t
+        t.start()
+
+    def _queue_reindex_new_and_failed(self, store, api, settings):
         from .indexer import pick_format
 
-        indexed = {b['id']: b['n_chunks'] for b in self.store.indexed_books()}
+        indexed = {b['id']: b['n_chunks'] for b in store.indexed_books()}
         try:
-            failed = set(self.store.failed_book_ids('index'))
+            failed = set(store.failed_book_ids('index'))
         except Exception:
             failed = set()
+        queued = []
         for bid in sorted(api.all_book_ids()):
             n_chunks = indexed.get(bid)
             if n_chunks and bid not in failed:
@@ -942,7 +1064,9 @@ class SemanticSearchAction(InterfaceAction):
             fmt = pick_format(formats, settings.format_priority)
             if fmt is None:
                 continue
-            self.store.add_dirty(bid, 'reindex')
+            queued.append(bid)
+        if queued and self.store is store:  # the library may have switched mid-scan
+            store.add_dirty_many(queued, 'reindex')
 
     def reindex_all(self):
         if not self._ensure_started():
@@ -961,9 +1085,16 @@ class SemanticSearchAction(InterfaceAction):
         )
         if not ok:
             return
+        store = self.store
         settings = self.get_settings()
+        t = threading.Thread(target=self._queue_reindex_all, args=(store, api, settings), name='SSReindexQueue', daemon=True)
+        self._reindex_queue_thread = t
+        t.start()
+
+    def _queue_reindex_all(self, store, api, settings):
         from .indexer import pick_format
 
+        queued = []
         for bid in sorted(api.all_book_ids()):
             formats = api.formats(bid)
             if not formats:
@@ -971,7 +1102,9 @@ class SemanticSearchAction(InterfaceAction):
             fmt = pick_format(formats, settings.format_priority)
             if fmt is None:
                 continue
-            self.store.add_dirty(bid, 'reindex')
+            queued.append(bid)
+        if queued and self.store is store:  # the library may have switched mid-scan
+            store.add_dirty_many(queued, 'reindex')
 
     def _check_llm_provider(self):
         """Return True if a text-to-text AI provider is configured; show an error otherwise."""

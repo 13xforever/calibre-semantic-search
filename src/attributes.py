@@ -309,13 +309,12 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
 
 def pending_attribute_books(store, settings) -> list[int]:
     """Books that are indexed but lack stored attributes (or schema changed)."""
-    enabled = [f.name for f in settings.enabled_attributes()]
+    enabled = frozenset(f.name for f in settings.enabled_attributes())
+    fields = store.attrs_fields()  # one query for every book's stored field names
     out = []
     for b in store.indexed_books():
         if b['n_chunks'] == 0:
             continue
-        data = store.get_attrs(b['id'])
-        stored = set(data.keys())
-        if stored != set(enabled):
+        if fields.get(b['id'], frozenset()) != enabled:
             out.append(b['id'])
     return out

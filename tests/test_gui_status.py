@@ -97,6 +97,9 @@ class FakeStore:
     def get_attrs(self, bid):
         return self._attrs.get(bid, {})
 
+    def attrs_fields(self):
+        return {bid: frozenset(v.keys()) for bid, v in self._attrs.items()}
+
 
 class FakeApi:
     def all_book_ids(self):
@@ -362,6 +365,9 @@ class _ReindexStore:
     def add_dirty(self, bid, reason='added'):
         self.dirty.append((bid, reason))
 
+    def add_dirty_many(self, bids, reason='added'):
+        self.dirty.extend((b, reason) for b in bids)
+
 
 class TestReindexNewAndFailed(unittest.TestCase):
     def _action(self, lib_ids, indexed=(), failed=(), formats=None):
@@ -388,16 +394,19 @@ class TestReindexNewAndFailed(unittest.TestCase):
         # -> queue
         a, store = self._action([1, 2, 3, 4], indexed=[(1, 5), (3, 2), (4, 0)], failed=[3])
         gui.SemanticSearchAction.reindex_new_and_failed(a)
+        a._reindex_queue_thread.join(timeout=5)
         self.assertEqual(store.dirty, [(2, 'reindex'), (3, 'reindex'), (4, 'reindex')])
 
     def test_all_well_indexed_queues_nothing(self):
         a, store = self._action([1, 2], indexed=[(1, 5), (2, 3)])
         gui.SemanticSearchAction.reindex_new_and_failed(a)
+        a._reindex_queue_thread.join(timeout=5)
         self.assertEqual(store.dirty, [])
 
     def test_book_without_formats_skipped(self):
         a, store = self._action([9], formats={9: ()})
         gui.SemanticSearchAction.reindex_new_and_failed(a)
+        a._reindex_queue_thread.join(timeout=5)
         self.assertEqual(store.dirty, [])
 
 

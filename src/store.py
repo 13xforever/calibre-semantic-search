@@ -2,13 +2,13 @@
 
 Public API (used by indexer/dialog/attributes):
   VectorStore(db_path, backend=None) -> facade with:
-    add_dirty / dirty_book_ids / remove_dirty
-    book_is_indexed / indexed_books / clear_book / upsert_book
-    insert_chunk / commit
-    search(query_vec, limit, min_score, model=None) -> list[SearchResult]
-    book_chunks_text(book_id) -> list[str]
-    get_meta / set_meta / delete_meta / meta_keys(prefix)
-    set_attrs / get_attrs / clear_attrs / attr_book_ids
+     add_dirty / add_dirty_many / dirty_book_ids / remove_dirty
+     book_is_indexed / indexed_books / clear_book / upsert_book
+     insert_chunk / commit
+     search(query_vec, limit, min_score, model=None) -> list[SearchResult]
+     book_chunks_text(book_id) -> list[str]
+     get_meta / set_meta / delete_meta / meta_keys(prefix)
+     set_attrs / get_attrs / clear_attrs / attr_book_ids / attrs_fields
     set_failed / clear_failed / wipe_failed / failed_book_ids / failed_entries
     cleanup_stale_models(current_model=None)
     close
@@ -53,6 +53,7 @@ from __future__ import annotations
 import base64
 import heapq
 import json
+import operator
 import os
 import re
 import shutil
@@ -97,6 +98,13 @@ class MissingDependencyError(RuntimeError):
         self.has_data = has_data
         self.want_backend = want_backend
         super().__init__(f"this library's search data needs the '{dep}' package, which is not installed")
+
+
+class FinalizeCancelled(Exception):
+    """finalize_schema was asked to stop (e.g. the library is being switched away).
+
+    Raised at a stage checkpoint when its cancel event is set. No data is lost:
+    every stage records resumable progress in meta before it does work."""
 
 
 def _module_available(name: str) -> bool:
@@ -184,22 +192,41 @@ def _round_shift(m: int, s: int) -> int:
     return r
 
 
+def _half_bits_to_float(h: int) -> float:
+    """One IEEE binary16 bit pattern to float (exact)."""
+    sign = -1.0 if h & 0x8000 else 1.0
+    exp = (h >> 10) & 0x1F
+    mant = h & 0x3FF
+    if exp == 0x1F:
+        v = float('inf') if mant == 0 else float('nan')
+    elif exp == 0:
+        v = mant * 2.0 ** -24
+    else:
+        v = (mant + 1024) * 2.0 ** (exp - 25)
+    return sign * v
+
+
+_HALF_LUT = None
+
+
+def _half_lut():
+    """Lazy half->float table for all 65536 patterns (exact: every half value is
+    representable in f32, so the array('f') entries are lossless)."""
+    global _HALF_LUT
+    if _HALF_LUT is None:
+        import array
+
+        a = array.array('f')
+        a.fromlist([_half_bits_to_float(h) for h in range(65536)])
+        _HALF_LUT = a
+    return _HALF_LUT
+
+
 def _half_bytes_to_floats(blob: bytes) -> list[float]:
     """Pure-Python IEEE binary16 -> float (exact). Only used when numpy is unavailable."""
-    out = []
-    for i in range(0, len(blob), 2):
-        h = blob[i] | (blob[i + 1] << 8)
-        sign = -1.0 if h & 0x8000 else 1.0
-        exp = (h >> 10) & 0x1F
-        mant = h & 0x3FF
-        if exp == 0x1F:
-            v = float('inf') if mant == 0 else float('nan')
-        elif exp == 0:
-            v = mant * 2.0 ** -24
-        else:
-            v = (mant + 1024) * 2.0 ** (exp - 25)
-        out.append(sign * v)
-    return out
+    n = len(blob) // 2
+    lut = _half_lut()
+    return [lut[h] for h in struct.unpack('<%dH' % n, blob)]
 
 
 def l2_normalize(vec):
@@ -584,6 +611,19 @@ class MetaStore:
             )
             self.conn.commit()
 
+    def add_dirty_many(self, book_ids, reason: str = 'added'):
+        """Queue many books in a single commit (per-book add_dirty fsyncs do not scale)."""
+        if not book_ids:
+            return
+        ts = int(time.time())
+        with self._lock:
+            self.conn.executemany(
+                'INSERT INTO dirty(book_id, reason, added_at) VALUES(?,?,?) '
+                'ON CONFLICT(book_id) DO UPDATE SET reason=excluded.reason, added_at=excluded.added_at',
+                [(b, reason, ts) for b in book_ids],
+            )
+            self.conn.commit()
+
     def dirty_book_ids(self):
         with self._lock:
             rows = self.conn.execute('SELECT book_id FROM dirty').fetchall()
@@ -696,6 +736,18 @@ class MetaStore:
         with self._lock:
             rows = self.conn.execute('SELECT book_id FROM attrs_raw').fetchall()
         return [r[0] for r in rows]
+
+    def attrs_fields(self):
+        """{book_id: frozenset(field names)} for every book with stored attributes.
+
+        One query instead of a get_attrs round-trip per book; the fields column is
+        maintained as ','.join(keys) by set_attrs, so it matches the JSON keys."""
+        with self._lock:
+            rows = self.conn.execute('SELECT book_id, fields FROM attrs_raw').fetchall()
+        out = {}
+        for bid, fields in rows:
+            out[bid] = frozenset(fields.split(',')) if fields else frozenset()
+        return out
 
     # -- failed books ---------------------------------------------------------------
     #
@@ -914,13 +966,13 @@ class SqliteVectorBackend:
 
         qa = array.array('f')
         qa.frombytes(vec_to_blob(qv, f32=True))
+        # map/operator.mul runs the per-element multiply in C (same left-to-right
+        # double accumulation as a Python loop, but without the bytecode overhead)
+        mul = operator.mul
         out = []
         for r in rows:
             va = blob_to_vec(r[-1], f16)
-            s = 0.0
-            for a, b in zip(qa, va):
-                s += a * b
-            out.append(s)
+            out.append(sum(map(mul, qa, va)))
         return out
 
     def search(self, query_vec, limit: int, min_score: float, model: str | None = None) -> list[SearchResult]:
@@ -1349,22 +1401,33 @@ class VectorStore:
         with self.meta._lock:
             return self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0] != 2
 
-    def finalize_schema(self, progress=None):
+    def finalize_schema(self, progress=None, cancel=None):
         """Run pending migrations (schema -> backend -> codec -> index), then one final VACUUM.
 
         Idempotent and resumable: every stage records its progress in meta (or, for
         the lancedb index stage, in the dataset manifest itself), so an interrupted
         run continues where it stopped on the next open. `progress` is called as
-        progress(stage, detail) with human-readable strings. Meant to be called from
-        a worker thread before indexing starts (see gui._start_for_library)."""
+        progress(stage, detail) with human-readable strings. `cancel` is a threading
+        Event: when set, the run stops at the next checkpoint by raising
+        FinalizeCancelled (checkpoints are every stage boundary and every say() call,
+        i.e. per batch / per book inside the long stages). Meant to be called from a
+        worker thread before indexing starts (see gui._start_for_library)."""
+
+        def cancelled():
+            if cancel is not None and cancel.is_set():
+                raise FinalizeCancelled()
 
         def say(stage, detail):
+            # say doubles as the fine-grained cancel checkpoint; progress errors
+            # still never break the migration
+            cancelled()
             if progress is not None:
                 try:
                     progress(stage, detail)
                 except Exception:
                     pass
 
+        cancelled()
         did = False
         if self.backend.pending_work():
             say('schema', 'migrating chunk tables')
@@ -1375,6 +1438,7 @@ class VectorStore:
         # pending check and the blob-width derivation both gate on user_version >= 3,
         # so flipping to SCHEMA_VERSION earlier would skip the f16 conversion while
         # search already reads half-float widths.
+        cancelled()
         if self._meta_version() < SCHEMA_VERSION:
             from .migrations.v4 import upgrade as v4_upgrade
 
@@ -1384,17 +1448,20 @@ class VectorStore:
         src, dst = self._pending_transfer()
         if dst is not None and dst != src:
             say('backend', f'moving data to the {dst} backend')
-            self._migrate_backend(src, dst)
+            self._migrate_backend(src, dst, say)
             did = True
+        cancelled()
         if self.backend_name == 'sqlite' and self.meta.get_meta(RECOMPRESS_KEY) is not None:
             say('codec', 'recompressing chunk text')
             self._recompress_chunks(say)
             did = True
         # evaluated live: a transfer that just finished lands here in the same pass
+        cancelled()
         if self.backend_name == 'lancedb' and self.backend.index_pending():
             say('index', 'building vector index')
             self.backend.finalize_index(say)
             did = True
+        cancelled()
         with self.meta._lock:
             av = self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0]
         if not did and av == 2:
@@ -1558,7 +1625,7 @@ class VectorStore:
         rows.sort(key=lambda r: int(r['chunk_no']))
         return [(_MigrateRow(int(r['chunk_no']), [p for p in str(r['chapter_path']).split(' > ') if p], str(r['text'])), r['vector']) for r in rows]
 
-    def _migrate_backend(self, src: str, dst: str):
+    def _migrate_backend(self, src: str, dst: str, say=None):
         """Move all chunk data from the `src` backend to `dst`, then drop the src storage.
 
         Resumable: meta[MIGRATE_KEY] marks the transfer in-flight from the first row
@@ -1566,7 +1633,8 @@ class VectorStore:
         in the target (delete + insert), so a restart never duplicates. The
         meta[BACKEND_KEY] flip happens only after every book has moved, and the old
         storage is dropped last — an interruption always leaves a consistent state
-        that the next open resumes."""
+        that the next open resumes. `say(stage, detail)` reports per-book progress
+        (and doubles as the cancel checkpoint between books)."""
         dep = self._missing_dependency(dst)
         if dep is not None:  # e.g. switching to lancedb before its package is installed
             raise MissingDependencyError(dep, True, dst)
@@ -1587,6 +1655,7 @@ class VectorStore:
             prog['books_done'] = sorted(books_done)
             self._save_migrate_progress(prog)
 
+        total_books = sum(len(v) for v in books_by_model.values())
         for model in sorted(books_by_model):
             if model in models_done:
                 continue
@@ -1600,6 +1669,8 @@ class VectorStore:
                     target.insert_chunks(bid, [(c, v, model) for c, v in items])
                 books_done.add(bid)
                 save()
+                if say is not None:
+                    say('backend', f'{dst}: book {len(books_done)}/{total_books}')
             models_done.add(model)
             with self.meta._lock:
                 self.meta.wal_checkpoint_truncate()
@@ -1718,6 +1789,9 @@ class VectorStore:
     def add_dirty(self, book_id, reason='added'):
         self.meta.add_dirty(book_id, reason)
 
+    def add_dirty_many(self, book_ids, reason='added'):
+        self.meta.add_dirty_many(book_ids, reason)
+
     def dirty_book_ids(self):
         return self.meta.dirty_book_ids()
 
@@ -1781,6 +1855,9 @@ class VectorStore:
 
     def attr_book_ids(self):
         return self.meta.attr_book_ids()
+
+    def attrs_fields(self):
+        return self.meta.attrs_fields()
 
     def set_failed(self, book_id, kind, error):
         self.meta.set_failed(book_id, kind, error)
