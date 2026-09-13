@@ -1,3 +1,9 @@
+# Disclaimer
+> [!WARNING] 
+> Everything here was written by Qwen3.8, do not trust it to keep your data safe.
+> 
+> This is purely a test/benchmark project, not intended for serious use.
+
 # Semantic Search (calibre plugin)
 
 Meaning-based search across your calibre library, with LLM-extracted book
