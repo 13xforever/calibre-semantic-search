@@ -149,6 +149,9 @@ class SemanticSearchDialog(QDialog):
         min_score = min(1.0, max(0.0, float(settings.search_min_score)))
         self.btn_search.setEnabled(False)
         self.status_label.setText(_('Searching...'))
+        # Clear the previous search's rows so they don't linger while this one runs.
+        self.results = []
+        self._render_table()
         w = SearchWorker(self.store, client, q, limit=MAX_RESULTS, min_score=min_score, model=settings.embed.model)
         self.worker = w
         _live_workers.add(w)
@@ -167,26 +170,27 @@ class SemanticSearchDialog(QDialog):
         self._render_table()
         self.status_label.setText(f'{len(self.results)} matches')
 
-    def _book_meta(self, book_id, api):
+    def _book_title(self, book_id, api):
         if book_id not in self._meta_cache:
-            title, authors = '?', ''
+            title = '?'
             if api is not None:
                 try:
-                    mi = api.get_metadata(book_id)
-                    title, authors = mi.title or '?', ', '.join(mi.authors or [])
+                    title = api.get_metadata(book_id).title or '?'
                 except Exception:
                     pass
-            self._meta_cache[book_id] = (title, authors)
+            self._meta_cache[book_id] = title
         return self._meta_cache[book_id]
 
     def _render_table(self):
         api = self.action._api()
         self.table.setRowCount(0)
         for row, r in enumerate(self.results):
-            title, authors = self._book_meta(r.book_id, api)
-            label = f'{title}\n{authors}' if authors else title
+            # Title only: Qt's item views paint just the first line of multi-line item
+            # text, so a 'title\nauthors' label would silently drop the author line.
+            title = self._book_title(r.book_id, api)
             self.table.insertRow(row)
-            it = QTableWidgetItem(label)
+            it = QTableWidgetItem(title)
+            it.setToolTip(title)  # full title on hover when the column elides it
             it.setData(Qt.ItemDataRole.UserRole, r.book_id)
             self.table.setItem(row, 0, it)
             self.table.setItem(row, 1, QTableWidgetItem(r.chapter_label or '—'))

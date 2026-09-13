@@ -51,9 +51,13 @@ def _install_stubs():
         def __init__(self, text=''):
             self._text = text
             self.data = None
+            self.tooltip = None
 
         def text(self):
             return self._text
+
+        def setToolTip(self, text):
+            self.tooltip = text
 
         def setData(self, role, value):
             self.data = value
@@ -178,7 +182,7 @@ def _result(i=0, score=0.5):
 
 class _FakeApi:
     def get_metadata(self, bid):
-        return types.SimpleNamespace(title=f'Title {bid}', authors=[f'Author {bid}'])
+        return types.SimpleNamespace(title=f'Title {bid}')
 
 
 def _make_dialog(min_score=0.2, api=None, books=None):
@@ -265,6 +269,19 @@ class TestRepeatSearch(unittest.TestCase):
         self.assertIsNotNone(d.worker)
 
 
+class TestStaleResults(unittest.TestCase):
+    """Regression: the previous search's rows used to linger in the table until the new
+    results arrived."""
+
+    def test_old_rows_cleared_when_searching_again(self):
+        d = _make_dialog()
+        dialog.SemanticSearchDialog._on_results(d, [_result(1), _result(2)])
+        self.assertEqual(len(d.table.grid), 2)
+        dialog.SemanticSearchDialog.do_search(d)
+        self.assertEqual(d.results, [])
+        self.assertEqual(len(d.table.grid), 0)
+
+
 class TestWorkerLifetime(unittest.TestCase):
     """Regression: clearing self.worker on results used to drop the last reference to the
     QThread while it was still running, aborting calibre with 'QThread: Destroyed while
@@ -299,8 +316,16 @@ class TestOnResults(unittest.TestCase):
         d = _make_dialog(api=_FakeApi())
         dialog.SemanticSearchDialog._on_results(d, [_result(7)])
         book_item = d.table.grid[0][0]
-        self.assertEqual(book_item.text(), 'Title 7\nAuthor 7')
+        self.assertEqual(book_item.text(), 'Title 7')
+        self.assertEqual(book_item.tooltip, 'Title 7')
         self.assertEqual(book_item.data, 7)
+
+    def test_book_cell_is_single_line_title(self):
+        # Qt's item views paint only the first line of multi-line item text, so the
+        # book cell must never carry a '\n' (the author line would be silently dropped).
+        d = _make_dialog(api=_FakeApi())
+        dialog.SemanticSearchDialog._on_results(d, [_result(7)])
+        self.assertNotIn('\n', d.table.grid[0][0].text())
 
     def test_capped_status(self):
         # hitting the row cap looks like any other count: no special-casing
