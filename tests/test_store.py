@@ -73,7 +73,41 @@ class _C:
     char_offset: int = 0
 
 
-class TestVectorStore(unittest.TestCase):
+class _SearchBookMixin:
+    """search_book checks shared by the sqlite and lancedb backend test classes."""
+
+    def _check_search_book(self):
+        s = self.s
+        dim = 8
+        for b in (11, 12):
+            chunks = [_C(i, f'book {b} chunk {i}', ['ch'], i, i + 1, i) for i in range(4)]
+            vecs = [store.l2_normalize([1.0 - 0.05 * i] + [0.1] * (dim - 1)) for i in range(4)]
+            for c, v in zip(chunks, vecs):
+                s.insert_chunk(b, c, 'sb-model', v)
+            s.commit()
+            s.upsert_book(b, 'EPUB', 4, 'sb-model')
+
+        q = store.l2_normalize([1.0] + [0.0] * (dim - 1))
+        res = s.search_book(q, 11, model='sb-model')
+        # every chunk of the book, best first, no cap
+        self.assertEqual(len(res), 4)
+        self.assertTrue(all(r.book_id == 11 for r in res))
+        self.assertEqual([r.chunk_no for r in res], [0, 1, 2, 3])  # a_i decreases with i
+        scores = [r.score for r in res]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual(res[0].fmt, 'EPUB')
+        self.assertIn('book 11 chunk 0', res[0].text)
+        # min_score keeps only the book's top chunks
+        mid = (res[1].score + res[2].score) / 2.0
+        top2 = s.search_book(q, 11, min_score=mid, model='sb-model')
+        self.assertEqual([r.chunk_no for r in top2], [0, 1])
+        # unknown book -> empty; another book's chunks never leak in
+        self.assertEqual(s.search_book(q, 999, model='sb-model'), [])
+        other = s.search_book(q, 12, model='sb-model')
+        self.assertTrue(other and all(r.book_id == 12 for r in other))
+
+
+class TestVectorStore(_SearchBookMixin, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tmp.name, 'test.db')
@@ -120,40 +154,64 @@ class TestVectorStore(unittest.TestCase):
         self.assertEqual(books[0]['fmt'], 'EPUB')
         self.assertEqual(books[0]['n_chunks'], 5)
 
+        # one result per book: the single book's best chunk, whatever limit asks for
         results = s.search(q, limit=3)
-        self.assertEqual(len(results), 3)
-        # scores descending
-        for a, b in zip(results, results[1:]):
-            self.assertGreaterEqual(a.score, b.score)
-        # top result is book 1 with valid fields
+        self.assertEqual(len(results), 1)
         r = results[0]
         self.assertEqual(r.book_id, 1)
         self.assertEqual(r.fmt, 'EPUB')
         self.assertIn('text of chunk', r.text)
         self.assertEqual(r.chapter_path, ['Ch', f'S{r.chunk_no}'])
 
+    def test_search_returns_best_per_book(self):
+        s = self.s
+        # 3 books x 3 chunks; a decreases globally so every score is distinct and
+        # book b's best chunk is its first one (query e_0, score monotone in a)
+        dim = 8
+        for b in range(1, 4):
+            chunks = [_C(i, f'book {b} chunk {i}', ['ch'], i, i + 1, i) for i in range(3)]
+            vecs = [store.l2_normalize([1.0 - 0.001 * ((b - 1) * 3 + i)] + [0.1] * (dim - 1)) for i in range(3)]
+            for c, v in zip(chunks, vecs):
+                s.insert_chunk(b, c, 'pm-model', v)
+            s.commit()
+            s.upsert_book(b, 'EPUB', 3, 'pm-model')
+
+        q = store.l2_normalize([1.0] + [0.0] * (dim - 1))
+        res = s.search(q, limit=10, model='pm-model')
+        self.assertEqual([r.book_id for r in res], [1, 2, 3])
+        for r in res:
+            self.assertEqual(r.chunk_no, 0)  # each book's best chunk
+        scores = [r.score for r in res]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        # a smaller limit truncates the books, never duplicates them
+        top2 = s.search(q, limit=2, model='pm-model')
+        self.assertEqual([r.book_id for r in top2], [1, 2])
+
     def test_search_min_score_filters(self):
         s = self.s
-        chunks = self._chunks()
-        import math
-
+        # two books; the threshold lands between the books' best chunks while book 1's
+        # worst chunk is already below it (book-level filtering, not chunk-level)
         dim = 8
-        vecs = [[math.cos(i * 0.3 + t) for t in range(dim)] for i in range(5)]
-        q = [1.0] * dim
-        for c, v in zip(chunks, vecs):
-            s.insert_chunk(1, c, 'test-model', store.l2_normalize(v))
-        s.commit()
-        s.upsert_book(1, 'EPUB', 5, 'test-model')
+        for b in range(1, 3):
+            chunks = [_C(i, f'book {b} chunk {i}', ['ch'], i, i + 1, i) for i in range(3)]
+            vecs = [store.l2_normalize([1.0 - 0.05 * ((b - 1) * 3 + i)] + [0.1] * (dim - 1)) for i in range(3)]
+            for c, v in zip(chunks, vecs):
+                s.insert_chunk(b, c, 'pm-model', v)
+            s.commit()
+            s.upsert_book(b, 'EPUB', 3, 'pm-model')
 
-        all_res = s.search(q, limit=10)
-        self.assertEqual(len(all_res), 5)
-        scores = [r.score for r in all_res]
-        # threshold between the 2nd and 3rd best score keeps exactly the top 2
-        mid = (scores[1] + scores[2]) / 2.0
-        top2 = s.search(q, limit=10, min_score=mid)
-        self.assertEqual([r.chunk_no for r in top2], [r.chunk_no for r in all_res[:2]])
+        q = store.l2_normalize([1.0] + [0.0] * (dim - 1))
+        all_res = s.search(q, limit=10, model='pm-model')
+        self.assertEqual([r.book_id for r in all_res], [1, 2])
+        bests = {r.book_id: r.score for r in all_res}
+        mid = (bests[1] + bests[2]) / 2.0
+        top1 = s.search(q, limit=10, min_score=mid, model='pm-model')
+        self.assertEqual([r.book_id for r in top1], [1])
         # threshold above the best score returns nothing
-        self.assertEqual(s.search(q, limit=10, min_score=scores[0] + 0.001), [])
+        self.assertEqual(s.search(q, limit=10, min_score=bests[1] + 0.001, model='pm-model'), [])
+
+    def test_search_book(self):
+        self._check_search_book()
 
     def test_dim_mismatch_isolated(self):
         s = self.s
@@ -391,16 +449,25 @@ class TestSqlitePerModel(unittest.TestCase):
             scored.append((sum(a * b for a, b in zip(qa, va)), i, bid, cno))
 
         def expected_top(limit, min_score):
-            sel = sorted((e for e in scored if e[0] >= min_score), key=lambda e: (-e[0], e[1]))
-            return [(e[2], e[3]) for e in sel[:limit]]
+            # per-book best (first row wins ties, like the scan), then top books
+            per_book = {}
+            for e in scored:
+                if e[0] < min_score:
+                    continue
+                cur = per_book.get(e[2])
+                if cur is None or e[0] > cur[0]:
+                    per_book[e[2]] = e
+            sel = sorted(per_book.values(), key=lambda e: (-e[0], e[2]))[:limit]
+            return [(e[2], e[3]) for e in sel]
 
         orig_min = store.SEARCH_MIN_BUDGET
         try:
             # even with the largest possible row size this is < 2500, so search must batch
             store.SEARCH_MIN_BUDGET = 96 * 1024
-            self.assertLess(store.SEARCH_MIN_BUDGET // (dim * 2 + 64), len(rows))
-            mid = (scored[100][0] + scored[101][0]) / 2.0
-            for limit, min_score in ((7, -1.0), (100, 0.0), (3000, mid)):
+            self.assertLess(store.SEARCH_MIN_BUDGET // (dim * 6 + 64), len(rows))
+            # between book 3's and book 4's best chunks: keeps exactly books 1-3
+            mid = (scored[2 * n_chunks][0] + scored[3 * n_chunks][0]) / 2.0
+            for limit, min_score in ((2, -1.0), (7, -1.0), (10, mid)):
                 got = s.search(q, limit=limit, min_score=min_score, model='bf-model')
                 self.assertEqual([(r.book_id, r.chunk_no) for r in got], expected_top(limit, min_score))
         finally:
@@ -482,7 +549,7 @@ class TestHalfLut(unittest.TestCase):
         self.assertEqual(store._half_bytes_to_floats(b''), [])
 
 
-class TestVectorStoreLance(unittest.TestCase):
+class TestVectorStoreLance(_SearchBookMixin, unittest.TestCase):
     """Runtime coverage for the LanceDB backend (forced, not auto).
 
     Not skipped when lancedb is missing: without the package, VectorStore raises a
@@ -501,7 +568,6 @@ class TestVectorStoreLance(unittest.TestCase):
         self.assertEqual(self.s.backend_name, 'lancedb')
 
     def test_roundtrip_search_and_chunks_text(self):
-        import math
         from dataclasses import dataclass
 
         @dataclass
@@ -514,26 +580,35 @@ class TestVectorStoreLance(unittest.TestCase):
             char_offset: int = 0
 
         s = self.s
-        chunks = [C(i, f'text of chunk {i}', ['Ch', f'S{i}'], i, i + 3, i * 10) for i in range(5)]
         dim = 8
-        vecs = [[math.cos(i * 0.3 + t) for t in range(dim)] for i in range(5)]
-        for c, v in zip(chunks, vecs):
-            s.insert_chunk(1, c, 'test-model', store.l2_normalize(v))
-        s.commit()
-        s.upsert_book(1, 'EPUB', 5, 'test-model')
+        # two books; per-book bests well separated (a drops 0.2 per book, 0.02 per chunk)
+        for b in (1, 2):
+            chunks = [C(i, f'text of chunk {i} of book {b}', ['Ch', f'S{i}'], i, i + 3, i * 10) for i in range(5)]
+            vecs = [store.l2_normalize([1.0 - 0.2 * (b - 1) - 0.02 * i] + [0.1] * (dim - 1)) for i in range(5)]
+            for c, v in zip(chunks, vecs):
+                s.insert_chunk(b, c, 'test-model', v)
+            s.commit()
+            s.upsert_book(b, 'EPUB', 5, 'test-model')
 
-        results = s.search([1.0] * dim, limit=3)
-        self.assertEqual(len(results), 3)
-        self.assertEqual(results[0].book_id, 1)
+        q = store.l2_normalize([1.0] + [0.0] * (dim - 1))
+        results = s.search(q, limit=3)
+        self.assertEqual(len(results), 2)  # one result per book, not per chunk
+        self.assertEqual([r.book_id for r in results], [1, 2])
         for a, b in zip(results, results[1:]):
             self.assertGreaterEqual(a.score, b.score)
+        for r in results:
+            self.assertEqual(r.chunk_no, 0)  # each book's best chunk
 
-        self.assertEqual(s.book_chunks_text(1), [f'text of chunk {i}' for i in range(5)])
+        self.assertEqual(s.book_chunks_text(1), [f'text of chunk {i} of book 1' for i in range(5)])
 
         s.clear_book(1)
+        s.clear_book(2)
         self.assertFalse(s.book_is_indexed(1))
         self.assertEqual(s.book_chunks_text(1), [])
-        self.assertEqual(s.search([1.0] * dim), [])
+        self.assertEqual(s.search(q), [])
+
+    def test_search_book(self):
+        self._check_search_book()
 
 
 class TestDefaultDictLoading(unittest.TestCase):

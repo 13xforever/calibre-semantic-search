@@ -5,8 +5,9 @@ Public API (used by indexer/dialog/attributes):
      add_dirty / add_dirty_many / dirty_book_ids / remove_dirty
      book_is_indexed / indexed_books / clear_book / upsert_book
      insert_chunk / commit
-     search(query_vec, limit, min_score, model=None) -> list[SearchResult]
-     book_chunks_text(book_id) -> list[str]
+      search(query_vec, limit, min_score, model=None) -> list[SearchResult]
+      search_book(query_vec, book_id, min_score=0.0, model=None) -> list[SearchResult]
+      book_chunks_text(book_id) -> list[str]
      get_meta / set_meta / delete_meta / meta_keys(prefix)
      set_attrs / get_attrs / clear_attrs / attr_book_ids / attrs_fields
     set_failed / clear_failed / wipe_failed / failed_book_ids / failed_entries
@@ -263,7 +264,7 @@ def model_table_name(model: str) -> str:
     return f'chunks_{slug}'[:80]
 
 
-# Memory budget for the batched sqlite search: half of the available RAM, with a floor.
+# Memory budget for the batched sqlite search: a quarter of the available RAM, with a floor.
 SEARCH_MIN_BUDGET = 10 * 1024 * 1024
 
 
@@ -809,7 +810,6 @@ class SqliteVectorBackend:
         self.conn = meta.conn  # share connection/lock
         ensure_codec_setup(meta)
         self._codec = TextCodec(json.loads(meta.get_meta(TEXT_CODEC_KEY)))
-        self._text_len_cache: dict[str, int] = {}
 
     # -- table management ------------------------------------------------------
 
@@ -921,8 +921,8 @@ class SqliteVectorBackend:
     def _search_budget(self) -> int:
         free = available_ram_bytes()
         if free is None:
-            free = SEARCH_MIN_BUDGET * 4  # unknown: assume a modest amount of headroom
-        return max(SEARCH_MIN_BUDGET, free // 2)
+            free = SEARCH_MIN_BUDGET * 8  # unknown: assume a modest amount of headroom
+        return max(SEARCH_MIN_BUDGET, free // 4)
 
     def _vec_bytes(self) -> int:
         """Bytes per vector component in this DB's chunk tables (2 for f16 at
@@ -940,17 +940,6 @@ class SqliteVectorBackend:
         # still 2, so it reports half its dimension and is skipped by the search's
         # per-table dim check until the migration's final commit flips it.
         return row[0] // self._vec_bytes()
-
-    def _avg_text_chars(self, name: str) -> int:
-        cached = self._text_len_cache.get(name)
-        if cached is not None:
-            return cached
-        with self.meta._lock:
-            rows = self.conn.execute(f'SELECT text_z FROM {name} LIMIT 200').fetchall()
-        total = sum(len(self._codec.decompress(z)) for z, in rows)
-        avg = int(total / len(rows)) if rows else 1024
-        self._text_len_cache[name] = avg
-        return avg
 
     def _score_rows(self, rows, qv, f16: bool = False) -> list[float]:
         """Dot products of each row's vector (last column) with the query vector.
@@ -976,12 +965,15 @@ class SqliteVectorBackend:
         return out
 
     def search(self, query_vec, limit: int, min_score: float, model: str | None = None) -> list[SearchResult]:
-        """Top-k by cosine similarity.
+        """Top-`limit` books by their best chunk's cosine similarity (one result per book).
 
-        Reads vectors in RAM-budgeted batches (half the available free RAM, with a
-        SEARCH_MIN_BUDGET floor) and keeps only a top-`limit` heap, so memory stays
-        bounded no matter how many chunks are stored.
+        Phase 1 reads vectors in RAM-budgeted batches (a quarter of the available free
+        RAM, with a SEARCH_MIN_BUDGET floor) and keeps only each book's best row so far,
+        so memory stays bounded no matter how many chunks are stored; phase 2 fetches
+        the winning rows by id for their text.
         """
+        if limit <= 0:
+            return []
         # While a v3 conversion is in flight the tables mix blob widths (a converted
         # f16 table can even masquerade as another model's dimension), so searching
         # them would misread rows; stay out of the way until it finishes.
@@ -991,21 +983,19 @@ class SqliteVectorBackend:
         dim = qv.shape[0] if np is not None else len(qv)
         tables = [self._table_for(model)] if model is not None else self._chunk_tables()
         budget = self._search_budget()
-        top: list[tuple[float, int, SearchResult]] = []  # min-heap of (score, -seq, result)
-        seq = 0
         f16 = self._vec_bytes() == 2
+        best: dict[int, tuple[float, str, int]] = {}  # book_id -> (score, table, row id)
         for t in tables:
             if not self._table_exists(t) or self._table_dim(t) != dim:
                 continue
-            row_bytes = dim * (2 if f16 else 4) + self._avg_text_chars(t) + 64
+            # per row: the vector blob plus one f32 scoring-matrix row, plus overhead
+            row_bytes = dim * ((2 if f16 else 4) + 4) + 64
             batch = max(1, budget // max(1, row_bytes))
             last_id = 0
             while True:
                 with self.meta._lock:
                     rows = self.conn.execute(
-                        f'SELECT c.id, c.book_id, c.chunk_no, c.text_z, c.chapter_path, f.fmt, c.vector '
-                        f'FROM {t} c LEFT JOIN books b ON b.id=c.book_id LEFT JOIN formats f ON f.id=b.fmt_id '
-                        'WHERE c.id>? ORDER BY c.id LIMIT ?',
+                        f'SELECT id, book_id, vector FROM {t} WHERE id>? ORDER BY id LIMIT ?',
                         (last_id, batch),
                     ).fetchall()
                 if not rows:
@@ -1014,26 +1004,71 @@ class SqliteVectorBackend:
                 for r, s in zip(rows, self._score_rows(rows, qv, f16)):
                     if s < min_score:
                         continue
-                    heapq.heappush(
-                        top,
-                        (
-                            s,
-                            -seq,  # on a score tie the earliest row survives eviction
-                            SearchResult(
-                                book_id=r[1],
-                                fmt=r[5] or '',
-                                chunk_no=r[2],
-                                text=self._codec.decompress(r[3]),
-                                chapter_path=[p for p in r[4].split(' > ') if p],
-                                score=s,
-                            ),
-                        ),
+                    cur = best.get(r[1])
+                    if cur is None or s > cur[0]:
+                        best[r[1]] = (s, t, r[0])
+        top = sorted(best.items(), key=lambda kv: (-kv[1][0], kv[0]))[:limit]
+        by_table: dict[str, list[int]] = {}  # table -> winning row ids
+        for _bid, (_s, t, rid) in top:
+            by_table.setdefault(t, []).append(rid)
+        fmt_map = {i['id']: i['fmt'] for i in self.meta.indexed_books()}
+        out: list[SearchResult] = []
+        for t, rids in by_table.items():
+            for i in range(0, len(rids), 400):  # sqlite binds at most 999 variables per statement
+                part = rids[i : i + 400]
+                marks = ','.join('?' * len(part))
+                with self.meta._lock:
+                    rows = self.conn.execute(
+                        f'SELECT book_id, chunk_no, text_z, chapter_path FROM {t} WHERE id IN ({marks})',
+                        part,
+                    ).fetchall()
+                for bid, cno, z, path in rows:
+                    out.append(
+                        SearchResult(
+                            book_id=bid,
+                            fmt=fmt_map.get(bid, ''),
+                            chunk_no=cno,
+                            text=self._codec.decompress(z),
+                            chapter_path=[p for p in path.split(' > ') if p],
+                            score=best[bid][0],
+                        )
                     )
-                    seq += 1
-                    if len(top) > limit:
-                        heapq.heappop(top)
-        top.sort(key=lambda e: (-e[0], -e[1]))
-        return [r for _, _, r in top]
+        out.sort(key=lambda x: (-x.score, x.book_id))
+        return out
+
+    def search_book(self, query_vec, book_id: int, min_score: float = 0.0, model: str | None = None) -> list[SearchResult]:
+        """All of one book's chunks scoring >= min_score, best first (no cap)."""
+        if self.meta.get_meta(VEC_MIGRATE_KEY) is not None:
+            return []
+        qv = l2_normalize(query_vec)
+        dim = qv.shape[0] if np is not None else len(qv)
+        tables = [self._table_for(model)] if model is not None else self._chunk_tables()
+        f16 = self._vec_bytes() == 2
+        fmt_map = {i['id']: i['fmt'] for i in self.meta.indexed_books()}
+        out: list[SearchResult] = []
+        for t in tables:
+            if not self._table_exists(t) or self._table_dim(t) != dim:
+                continue
+            with self.meta._lock:
+                rows = self.conn.execute(
+                    f'SELECT chunk_no, text_z, chapter_path, vector FROM {t} WHERE book_id=?',
+                    (book_id,),
+                ).fetchall()
+            for r, s in zip(rows, self._score_rows(rows, qv, f16)):
+                if s < min_score:
+                    continue
+                out.append(
+                    SearchResult(
+                        book_id=book_id,
+                        fmt=fmt_map.get(book_id, ''),
+                        chunk_no=r[0],
+                        text=self._codec.decompress(r[1]),
+                        chapter_path=[p for p in r[2].split(' > ') if p],
+                        score=s,
+                    )
+                )
+        out.sort(key=lambda x: (-x.score, x.chunk_no))
+        return out
 
 
 class LanceVectorBackend:
@@ -1252,42 +1287,117 @@ class LanceVectorBackend:
             out.extend(str(r['text']) for r in rows)
         return out
 
+    SEARCH_PAGE = 500  # rows per ANN page in search()
+
+    def _ann_page(self, t, vec, offset):
+        """One page of table `t`'s ANN results (distance order). refine re-scores the
+        candidates against the stored vectors, correcting the lossy half-float / SQ index."""
+        return t.search(vec).metric('cosine').limit(self.SEARCH_PAGE).offset(offset).refine_factor(1).to_list()
+
     def search(self, query_vec, limit: int, min_score: float, model: str | None = None) -> list[SearchResult]:
+        """Top-`limit` books by their best chunk's cosine similarity (one result per book).
+
+        Pages each table's ANN results and merges them k-way, keeping the best chunk seen
+        so far for every book; stops once `limit` books are in hand and no pending page can
+        still beat the weakest of them.
+        """
+        if limit <= 0:
+            return []
         qv = l2_normalize(query_vec)
         vec = qv.tolist() if np is not None else list(qv)
-        rows = []
         tables = [self._open_table(model)] if model is not None else self._all_tables()
-        tables = [t for t in tables if t is not None]
+        cursors = []  # each: {'t': table, 'rows': pending page rows, 'off': next offset}
         for t in tables:
+            if t is None:
+                continue
             try:
-                # refine re-scores the ANN candidates against the stored vectors,
-                # correcting the lossy half-float / SQ index distances
-                rows.extend(t.search(vec).metric('cosine').limit(limit * 3).refine_factor(1).to_list())
+                rows = self._ann_page(t, vec, 0)
             except Exception:
                 continue
-        if not rows:
-            return []
+            cursors.append({'t': t, 'rows': list(rows), 'off': len(rows)})
+        best: dict[int, SearchResult] = {}
         fmt_map = {i['id']: i['fmt'] for i in self.meta.indexed_books()}
-        out = []
-        for r in rows:
-            s = float(r['_distance'])
-            # cosine distance = 1 - similarity; stored vectors are normalized, so this is the
-            # same cosine-similarity scale as the sqlite backend (dot product of unit vectors)
-            score = 1.0 - s
-            if score < min_score:
-                continue
-            out.append(
-                SearchResult(
-                    book_id=int(r['book_id']),
-                    fmt=fmt_map.get(int(r['book_id']), ''),
+        T = float('-inf')  # lower bound on the weakest book still in the top-`limit`
+        while True:
+            heads = [c['rows'][0] for c in cursors if c['rows']]
+            if not heads:
+                break
+            # cosine distance = 1 - similarity; stored vectors are normalized, so this is
+            # the same cosine-similarity scale as the sqlite backend (dot of unit vectors)
+            if len(best) >= limit and max(1.0 - float(h['_distance']) for h in heads) < T:
+                break
+            ci = max((i for i, c in enumerate(cursors) if c['rows']), key=lambda i: -float(cursors[i]['rows'][0]['_distance']))
+            r = cursors[ci]['rows'].pop(0)
+            s = 1.0 - float(r['_distance'])
+            bid = int(r['book_id'])
+            cur = best.get(bid)
+            if s >= min_score and (cur is None or s > cur.score):
+                best[bid] = SearchResult(
+                    book_id=bid,
+                    fmt=fmt_map.get(bid, ''),
                     chunk_no=int(r['chunk_no']),
                     text=str(r['text']),
                     chapter_path=[p for p in str(r['chapter_path']).split(' > ') if p],
-                    score=score,
+                    score=s,
                 )
-            )
-        out.sort(key=lambda x: x.score, reverse=True)
-        return out[:limit]
+                # a new book may have pushed the top-`limit` threshold up; refresh it
+                # periodically (a stale-low T only delays the stop below, never wrongs it)
+                if cur is None and len(best) >= limit and len(best) % 256 == 0:
+                    T = heapq.nlargest(limit, (x.score for x in best.values()))[-1]
+            if not cursors[ci]['rows']:
+                try:
+                    page = self._ann_page(cursors[ci]['t'], vec, cursors[ci]['off'])
+                except Exception:
+                    page = []
+                cursors[ci]['rows'] = list(page)
+                cursors[ci]['off'] += len(page)
+        return sorted(best.values(), key=lambda x: (-x.score, x.book_id))[:limit]
+
+    def search_book(self, query_vec, book_id: int, min_score: float = 0.0, model: str | None = None) -> list[SearchResult]:
+        """All of one book's chunks scoring >= min_score, best first (no cap)."""
+        qv = l2_normalize(query_vec)
+        tables = [self._open_table(model)] if model is not None else self._all_tables()
+        fmt_map = {i['id']: i['fmt'] for i in self.meta.indexed_books()}
+        out: list[SearchResult] = []
+        for t in tables:
+            if t is None:
+                continue
+            try:
+                rows = t.search().where(f'book_id = {int(book_id)}').limit(10_000_000).to_list()
+            except Exception:
+                continue
+            if not rows:
+                continue
+            # a filter-only scan has no _distance; score the stored (unit) vectors
+            # directly, normalizing to guard against half-float norm drift
+            if np is not None:
+                m = np.empty((len(rows), len(qv)), dtype='<f4')
+                for i, r in enumerate(rows):
+                    m[i] = np.asarray(r['vector'], dtype='<f4')
+                norms = np.linalg.norm(m, axis=1)
+                scores = (m @ np.asarray(qv, dtype='<f4')) / np.where(norms == 0, 1.0, norms)
+            else:
+                qa = [float(x) for x in qv]
+                scores = []
+                for r in rows:
+                    v = [float(x) for x in r['vector']]
+                    n = (sum(x * x for x in v)) ** 0.5
+                    scores.append(sum(a * b for a, b in zip(qa, v)) / n if n else 0.0)
+            for r, s in zip(rows, scores):
+                if s < min_score:
+                    continue
+                out.append(
+                    SearchResult(
+                        book_id=book_id,
+                        fmt=fmt_map.get(book_id, ''),
+                        chunk_no=int(r['chunk_no']),
+                        text=str(r['text']),
+                        chapter_path=[p for p in str(r['chapter_path']).split(' > ') if p],
+                        score=float(s),
+                    )
+                )
+        out.sort(key=lambda x: (-x.score, x.chunk_no))
+        return out
 
 
 class _MigrateRow:
@@ -1877,7 +1987,12 @@ class VectorStore:
     # -- search ------------------------------------------------------------------------
 
     def search(self, query_vec, limit: int = 20, min_score: float = 0.0, model: str | None = None) -> list[SearchResult]:
+        """Top-`limit` books by their best chunk's cosine similarity (one result per book)."""
         return self.backend.search(query_vec, limit, min_score, model)
+
+    def search_book(self, query_vec, book_id: int, min_score: float = 0.0, model: str | None = None) -> list[SearchResult]:
+        """All of one book's chunks scoring >= min_score, best first (no cap)."""
+        return self.backend.search_book(query_vec, book_id, min_score, model)
 
     def book_chunks_text(self, book_id: int):
         return self.backend.book_chunks_text(book_id)

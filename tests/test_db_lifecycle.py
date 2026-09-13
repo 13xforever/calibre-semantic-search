@@ -126,9 +126,9 @@ class _LifecycleOps:
             self.assertEqual(reg[bid]['fmt'], fmt)
             self.assertEqual(reg[bid]['n_chunks'], n)
             self.assertEqual(reg[bid]['model'], store.normalize_model(self.MODEL))
-        # -- search (min_score=-1.0: cosine range, so every stored chunk is returned) --
+        # -- search (min_score=-1.0: cosine range, so every book's best chunk qualifies) --
         res = s.search(q, limit=9, min_score=-1.0)
-        self.assertEqual(len(res), 9)
+        self.assertEqual(len(res), 3)  # one result per book
         self.assertEqual((res[0].book_id, res[0].chunk_no), (901, 0))
         self.assertGreater(res[0].score, 0.999)
         self.assertEqual(res[0].text, 'book 901 chunk 0')
@@ -136,9 +136,14 @@ class _LifecycleOps:
         self.assertEqual(res[0].fmt, 'EPUB')
         for a, b in zip(res, res[1:]):
             self.assertGreaterEqual(a.score, b.score)
+        # each result really is its book's best chunk (cross-check via search_book)
+        for r in res:
+            best = s.search_book(q, r.book_id, min_score=-1.0)[0]
+            self.assertEqual(r.chunk_no, best.chunk_no)
+            self.assertAlmostEqual(r.score, best.score, places=5)
         mid = (res[1].score + res[2].score) / 2.0
         top2 = s.search(q, limit=9, min_score=mid)
-        self.assertEqual([(r.book_id, r.chunk_no) for r in top2], [(r.book_id, r.chunk_no) for r in res[:2]])
+        self.assertEqual([r.book_id for r in top2], [r.book_id for r in res[:2]])
         self.assertEqual(s.search(q, limit=9, min_score=res[0].score + 0.001), [])
         self.assertEqual(s.book_chunks_text(903), [f'book 903 chunk {i}' for i in range(4)])
         # -- attributes ---------------------------------------------------------------
@@ -425,7 +430,7 @@ class TestLanceDb(_LifecycleOps, unittest.TestCase):
         finally:
             store.LanceVectorBackend.MERGE_TAIL_ROWS = orig
         res = s.search([1.0] * self.DIM, limit=10, min_score=-1.0)
-        self.assertEqual(len(res), 7)
+        self.assertEqual([r.book_id for r in res], [1])  # one row per book even with 7 tied chunks
 
     def test_lancedb_dir_is_hidden(self):
         s = store.VectorStore(self.path, backend='lancedb')
@@ -462,7 +467,7 @@ class _MigrateOps:
     def _check(self, s):
         q = [1.0] * self.DIM
         res = s.search(q, limit=5, min_score=-1.0)
-        self.assertEqual(len(res), 5)
+        self.assertEqual(len(res), 2)  # one result per book
         self.assertEqual((res[0].book_id, res[0].chunk_no), (601, 0))
         self.assertGreater(res[0].score, 0.999)
         self.assertEqual(res[0].text, 'book 601 chunk 0')

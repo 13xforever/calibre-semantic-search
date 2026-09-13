@@ -63,10 +63,11 @@ attributes in custom columns.
 2. On first start (and whenever books are added/changed) the indexer queues
    books automatically: extract -> chunk -> embed -> store. Watch progress in
    *Index status*.
-3. **Search...** — type a natural-language query, e.g. *"a slow-burn romance
-   between enemies"*. Double-click a row (or *Open in viewer*) to jump to the
-   matching passage; *Restrict library to results* filters the library view to
-   the matched books.
+ 3. **Search...** — type a natural-language query, e.g. *"a slow-burn romance
+    between enemies"*. Results show one row per book (its best matching
+    passage). Double-click a row (or *Show book matches*) to see every match in
+    that book; double-click there (or *Open in viewer*) to jump to the passage.
+    *Restrict library to results* filters the library view to the matched books.
 4. **Extract attributes...** — runs the LLM pass over indexed books that lack
    stored attributes and writes them to the custom columns. Use
    *Re-index all books* after changing the embedding model or chunk settings.
@@ -80,8 +81,8 @@ attributes in custom columns.
    compressed — zstd (with a bundled compression dictionary) or zlib, chosen per
    library in Settings and converted in the background when changed — which keeps
    the file noticeably smaller than the raw text would be. Search reads vectors
-  in RAM-budgeted batches (half of the free RAM) instead of loading the whole
-  index.
+   in RAM-budgeted batches (a quarter of the free RAM) instead of loading the
+   whole index.
 - Databases created by older versions migrate automatically on first start
   after upgrading. On large libraries this one-time migration can take a
   while; *Index status* shows "Migrating search database" until it finishes,
