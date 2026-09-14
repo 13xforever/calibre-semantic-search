@@ -557,7 +557,7 @@ class SemanticSearchAction(InterfaceAction):
             print(f'semantic search: reconcile failed: {e!r}')
 
     def _sync_attr_columns(self):
-        """Mirror the exposed-attribute set into calibre custom columns.
+        """Mirror the enabled attribute set into calibre custom columns.
 
         Runs off the GUI thread: column writes go through the indexer's db proxy,
         which marshals them to the GUI thread (and would deadlock if called from it).

@@ -25,15 +25,49 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertTrue(all(a.enabled for a in s.attributes))
         self.assertEqual(s.search_min_score, 0.2)
 
-    def test_blurb_default_is_internal_only(self):
-        # the blurb ships enabled but without a calibre column (exposed=False)
+    def test_blurb_default_is_plain_text(self):
+        # the blurb ships as plain multi-line text (a calibre comments column — no tag-browser category)
         get, set_ = self._prefs()
         s = utils.load_settings(get)
         blurb = next(a for a in s.attributes if a.name == 'blurb')
         self.assertTrue(blurb.enabled)
-        self.assertFalse(blurb.exposed)
         self.assertEqual(blurb.type, 'text')
-        self.assertNotIn('blurb', [a.name for a in s.exposed_attributes()])
+
+    def test_default_types(self):
+        # single-value defaults are filterable categories; the blurb is plain text
+        s = utils.Settings()
+        by = {a.name: a.type for a in s.attributes}
+        self.assertEqual(by['main_character_gender'], 'category')
+        self.assertEqual(by['pov'], 'category')
+        self.assertEqual(by['blurb'], 'text')
+        self.assertEqual(by['tropes'], 'tags')
+
+    def test_default_languages(self):
+        # the blurb follows the book's language (its former description clause); the rest is left to the model
+        s = utils.Settings()
+        by = {a.name: a.language for a in s.attributes}
+        self.assertEqual(by['blurb'], 'book')
+        self.assertTrue(all(v == '' for k, v in by.items() if k != 'blurb'))
+
+    def test_language_roundtrip(self):
+        get, set_ = self._prefs()
+        s = utils.load_settings(get)
+        s.attributes[0].language = 'Russian'
+        blurb = next(a for a in s.attributes if a.name == 'blurb')
+        blurb.language = ''  # switching the default off must stick
+        utils.save_settings(set_, s)
+        s2 = utils.load_settings(get)
+        self.assertEqual(s2.attributes[0].language, 'Russian')
+        self.assertEqual(next(a for a in s2.attributes if a.name == 'blurb').language, '')
+
+    def test_legacy_blob_without_language_defaults_empty(self):
+        get, set_ = self._prefs()
+        import json as _json
+
+        data = {'attributes': [{'name': 'pov', 'label': 'ss_pov', 'type': 'category', 'description': 'x', 'enabled': True}]}
+        set_(utils.PREF_KEY, _json.dumps(data))
+        s = utils.load_settings(get)
+        self.assertEqual(next(a for a in s.attributes if a.name == 'pov').language, '')
 
     def test_save_load_roundtrip(self):
         get, set_ = self._prefs()
@@ -87,35 +121,26 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertNotIn(s.attributes[0].name, [a.name for a in en])
         self.assertEqual(len(en), len(s.attributes) - 1)
 
-    def test_exposed_roundtrip(self):
+    def test_type_roundtrip(self):
         get, set_ = self._prefs()
         s = utils.load_settings(get)
-        s.attributes[0].exposed = False
+        s.attributes[0].type = 'tags'
         utils.save_settings(set_, s)
         s2 = utils.load_settings(get)
-        self.assertFalse(s2.attributes[0].exposed)
-        self.assertTrue(s2.attributes[1].exposed)
+        self.assertEqual(s2.attributes[0].type, 'tags')
 
-    def test_legacy_json_without_exposed_defaults_true(self):
-        # prefs written before the 'exposed' flag existed must keep mirroring on
+    def test_legacy_blob_with_exposed_key_loads(self):
+        # prefs written before the 'exposed' flag was removed must still load;
+        # the stale key is ignored (column existence now follows 'enabled')
         get, set_ = self._prefs()
         import json as _json
 
-        data = {'attributes': [{'name': 'pov', 'label': 'ss_pov', 'type': 'text', 'description': 'x', 'enabled': True}]}
+        data = {'attributes': [{'name': 'pov', 'label': 'ss_pov', 'type': 'category', 'description': 'x', 'enabled': True, 'exposed': False}]}
         set_(utils.PREF_KEY, _json.dumps(data))
         s = utils.load_settings(get)
         pov = next(a for a in s.attributes if a.name == 'pov')
-        self.assertTrue(pov.exposed)
-
-    def test_exposed_attributes(self):
-        s = utils.Settings()
-        s.attributes[0].enabled = False
-        s.attributes[1].exposed = False
-        names = [a.name for a in s.exposed_attributes()]
-        self.assertNotIn(s.attributes[0].name, names)  # disabled
-        self.assertNotIn(s.attributes[1].name, names)  # not exposed
-        # minus 3: the two above plus blurb, which ships un-exposed by default
-        self.assertEqual(len(names), len(s.attributes) - 3)
+        self.assertTrue(pov.enabled)
+        self.assertEqual(pov.type, 'category')
 
     def test_legacy_saved_gains_new_default_field(self):
         # a settings blob saved before 'blurb' existed must gain it on load,
@@ -131,19 +156,16 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertIn('blurb', names)
         blurb = next(a for a in s.attributes if a.name == 'blurb')
         self.assertTrue(blurb.enabled)
-        self.assertFalse(blurb.exposed)
 
     def test_saved_blurb_toggles_not_overwritten(self):
         get, set_ = self._prefs()
         s = utils.load_settings(get)
         blurb = next(a for a in s.attributes if a.name == 'blurb')
         blurb.enabled = False
-        blurb.exposed = True
         utils.save_settings(set_, s)
         s2 = utils.load_settings(get)
         blurb2 = next(a for a in s2.attributes if a.name == 'blurb')
         self.assertFalse(blurb2.enabled)  # defaults must not clobber saved flags
-        self.assertTrue(blurb2.exposed)
 
 
 class _WheelBuilder:

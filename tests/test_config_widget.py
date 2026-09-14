@@ -70,15 +70,30 @@ def _install_stubs():
             self.text = t
 
     class QComboBox(_W):
+        InsertPolicy = types.SimpleNamespace(NoInsert=0)
+
         def __init__(self):
             self._current = ''
+            self._items = []
             self.enabled = True
             self.currentTextChanged = _Sig()
 
         def addItems(self, items):
-            pass
+            self._items.extend(items)
+            if not self._current and self._items:
+                self._current = self._items[0]  # like Qt: the first added item is selected
+
+        def count(self):
+            return len(self._items)
+
+        def itemText(self, i):
+            return self._items[i]
 
         def setCurrentText(self, t):
+            self._current = t
+
+        def setEditText(self, t):
+            # like an editable combo in real Qt: the edit text becomes the current text
             self._current = t
 
         def currentText(self):
@@ -397,7 +412,7 @@ class TestZstandardUninstallGate(unittest.TestCase):
 
 
 class TestAttrTableCollect(unittest.TestCase):
-    """The attribute table's Add-column checkbox and Type dropdown feed the saved schema."""
+    """The attribute table's Enabled checkbox and Type dropdown feed the saved schema."""
 
     def setUp(self):
         self._saved = (cfgw.dep_in_root, cfgw.external_deps_disabled, cfgw.lancedb_status, cfgw.zstandard_status)
@@ -418,30 +433,63 @@ class TestAttrTableCollect(unittest.TestCase):
         w._collect_and_accept()
         attrs = w.settings().attributes
         self.assertEqual(len(attrs), len(defaults))
-        # checkbox states round-trip the defaults (blurb ships un-exposed)
-        self.assertEqual([a.exposed for a in attrs], [a.exposed for a in defaults])
+        # checkbox states, types and languages round-trip the defaults
+        self.assertEqual([a.enabled for a in attrs], [a.enabled for a in defaults])
         self.assertEqual([a.type for a in attrs], [a.type for a in defaults])
+        self.assertEqual([a.language for a in attrs], [a.language for a in defaults])
 
-    def test_exposed_checkbox_and_type_combo(self):
+    def test_enabled_checkbox_and_type_combo(self):
         w = self._widget()
-        # un-expose the first field and switch its type via the dropdown
-        w.attr_table.item(0, 1).setCheckState(cfgw.Qt.CheckState.Unchecked)
-        w.attr_table.cellWidget(0, 3).setCurrentText('tags')
+        # disable the first field and switch its type via the dropdown
+        w.attr_table.item(0, 0).setCheckState(cfgw.Qt.CheckState.Unchecked)
+        w.attr_table.cellWidget(0, 2).setCurrentText('tags')
         w._collect_and_accept()
         a = w.settings().attributes[0]
-        self.assertFalse(a.exposed)
+        self.assertFalse(a.enabled)
         self.assertEqual(a.type, 'tags')
         # the other rows are untouched
-        self.assertTrue(w.settings().attributes[1].exposed)
+        self.assertTrue(w.settings().attributes[1].enabled)
+
+    def test_type_combo_items(self):
+        w = self._widget()
+        combo = w.attr_table.cellWidget(0, 2)
+        items = [combo.itemText(i) for i in range(combo.count())]
+        self.assertEqual(items, ['text', 'category', 'tags'])
+
+    def test_language_combo_items_and_blurb_default(self):
+        w = self._widget()
+        combo = w.attr_table.cellWidget(0, 3)
+        items = [combo.itemText(i) for i in range(combo.count())]
+        self.assertEqual(items, ['Default', 'Match book'])
+        # the blurb row ships with match-book selected
+        row = next(r for r in range(w.attr_table.rowCount()) if w.attr_table.item(r, 1).text() == 'blurb')
+        self.assertEqual(w.attr_table.cellWidget(row, 3).currentText(), 'Match book')
+
+    def test_language_collect_mappings(self):
+        # typed free text is kept as a forced language name
+        w = self._widget()
+        w.attr_table.cellWidget(0, 3).setCurrentText('russian')
+        w._collect_and_accept()
+        self.assertEqual(w.settings().attributes[0].language, 'russian')
+        # the presets map to their sentinels
+        w2 = self._widget()
+        w2.attr_table.cellWidget(0, 3).setCurrentText('Match book')
+        w2._collect_and_accept()
+        self.assertEqual(w2.settings().attributes[0].language, 'book')
+        w3 = self._widget()
+        w3.attr_table.cellWidget(0, 3).setCurrentText('Default')
+        w3._collect_and_accept()
+        self.assertEqual(w3.settings().attributes[0].language, '')
 
     def test_add_attr_defaults(self):
         w = self._widget()
         n = w.attr_table.rowCount()
         w._add_attr()
         self.assertEqual(w.attr_table.rowCount(), n + 1)
-        self.assertEqual(w.attr_table.item(n, 2).text(), 'new_field')
-        self.assertEqual(w.attr_table.item(n, 1).checkState(), cfgw.Qt.CheckState.Checked)
-        self.assertEqual(w.attr_table.cellWidget(n, 3).currentText(), 'text')
+        self.assertEqual(w.attr_table.item(n, 1).text(), 'new_field')
+        self.assertEqual(w.attr_table.item(n, 0).checkState(), cfgw.Qt.CheckState.Checked)
+        self.assertEqual(w.attr_table.cellWidget(n, 2).currentText(), 'text')
+        self.assertEqual(w.attr_table.cellWidget(n, 3).currentText(), 'Default')
 
 
 if __name__ == '__main__':

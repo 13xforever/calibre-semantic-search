@@ -32,10 +32,10 @@ class EmbedSettings:
 class AttrField:
     name: str
     label: str
-    type: str  # 'text' or 'tags'
+    type: str  # 'text' (plain multi-line, comments column) | 'category' (single value, tag-browser category) | 'tags' (multi-value category)
     description: str
     enabled: bool = True
-    exposed: bool = True  # mirror into a calibre custom column (False = stored internally only)
+    language: str = ''  # '' = no instruction | 'book' = the book's original language | any other string is used verbatim as a language name in the prompt
 
     def clone(self) -> 'AttrField':
         return AttrField(**asdict(self))
@@ -45,7 +45,7 @@ DEFAULT_ATTRIBUTES = (
     AttrField(
         'main_character_gender',
         'ss_gender',
-        'text',
+        'category',
         "Gender of the main character(s)/POV character(s), e.g. 'female', 'male', 'non-binary', or 'multiple' if there are several protagonists.",
     ),
     AttrField(
@@ -62,7 +62,7 @@ DEFAULT_ATTRIBUTES = (
     ),
     AttrField('tropes', 'ss_tropes', 'tags', "Notable tropes, e.g. 'chosen one', 'found family', 'reincarnation', 'island survival'."),
     AttrField('themes', 'ss_themes', 'tags', "Major themes, e.g. 'identity', 'grief', 'power and corruption', 'coming of age'."),
-    AttrField('pov', 'ss_pov', 'text', "Narrative point of view, e.g. 'first person', 'third person limited', 'omniscient', 'unreliable narrator'."),
+    AttrField('pov', 'ss_pov', 'category', "Narrative point of view, e.g. 'first person', 'third person limited', 'omniscient', 'unreliable narrator'."),
     AttrField(
         'content_warnings',
         'ss_warnings',
@@ -73,9 +73,9 @@ DEFAULT_ATTRIBUTES = (
         'blurb',
         'ss_blurb',
         'text',
-        "A spoiler-free marketing blurb in the style of a publisher's back cover, written in the language of the book: 1-3 short paragraphs covering the premise, the protagonist(s) and the central conflict or stakes. Never reveal plot twists, outcomes, deaths or how it ends.",
-        enabled=True,
-        exposed=False,
+        "A spoiler-free marketing blurb in the style of a publisher's back cover: 1-3 short paragraphs covering the premise, the protagonist(s) and the central conflict or stakes. Never reveal plot twists, outcomes, deaths or how it ends.",
+        True,
+        'book',
     ),
 )
 
@@ -97,10 +97,6 @@ class Settings:
 
     def enabled_attributes(self) -> list[AttrField]:
         return [a for a in self.attributes if a.enabled]
-
-    def exposed_attributes(self) -> list[AttrField]:
-        """Fields that get a calibre custom column: extracted AND mirrored."""
-        return [a for a in self.attributes if a.enabled and a.exposed]
 
 
 def _settings_from_dict(data: dict[str, Any]) -> Settings:

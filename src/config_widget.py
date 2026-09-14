@@ -196,24 +196,27 @@ HELP_AUTO_ATTR = _(
 )
 
 HELP_ATTR_ENABLED = _(
-    'Include this field in attribute extraction. Its calibre custom column is created/updated automatically.'
-)
-HELP_ATTR_COLUMN = _(
-    "Also store this field in a calibre custom column, so its values are visible and filterable in "
-    "calibre's main view.\n"
-    'Unchecking removes the column from existing libraries; the values stay stored internally and are '
-    'written back automatically if you re-check it.'
+    'Include this field in attribute extraction and mirror its values into a calibre custom column.\n'
+    'Disabling removes the column from existing libraries; the values stay stored internally and are '
+    'written back automatically if you re-enable it.'
 )
 HELP_ATTR_NAME = _(
     "Internal name of the field (lowercase letters, digits, underscores). Determines the calibre "
     "custom column (label 'ss_...') where values are stored."
 )
 HELP_ATTR_TYPE = _(
-    "text = single value (e.g. 'first person'). tags = multi-value list, stored like #tags so you can "
-    'filter on individual values.'
+    "text = plain multi-line text, like the Description field: shown in Edit metadata and the Book details "
+    "panel, but not a Tag browser category.\n"
+    "category = single value (e.g. 'first person'), shown as a filterable Tag browser category.\n"
+    "tags = multi-value list, stored like #tags so you can filter on individual values."
 )
 HELP_ATTR_DESC = _(
     'Shown to the LLM as guidance for what to extract. Be specific about the expected format and give examples.'
+)
+HELP_ATTR_LANGUAGE = _(
+    "Language of the extracted values. 'Default' lets the model choose (it tends to follow the field "
+    "description, i.e. English). 'Match book' forces the original language of the book text. "
+    "You can also type any language name to force it, e.g. 'Russian'. Applies on (re-)extraction."
 )
 HELP_ATTR_TABLE = _(
     "Attribute fields extracted by the LLM into calibre custom columns. Toggle 'Enabled', edit names, "
@@ -355,17 +358,15 @@ class SettingsWidget(QDialog):
         ctx_row.addStretch(1)
         av.addLayout(ctx_row)
         self.attr_table = QTableWidget(len(self.s.attributes), 5)
-        self.attr_table.setHorizontalHeaderLabels([_('Enabled'), _('Add column'), _('Name'), _('Type'), _('Description')])
+        self.attr_table.setHorizontalHeaderLabels([_('Enabled'), _('Name'), _('Type'), _('Language'), _('Description')])
         self.attr_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         for r, a in enumerate(self.s.attributes):
             cb = QTableWidgetItem()
             cb.setCheckState(Qt.CheckState.Unchecked if not a.enabled else Qt.CheckState.Checked)
             self.attr_table.setItem(r, 0, cb)
-            ec = QTableWidgetItem()
-            ec.setCheckState(Qt.CheckState.Unchecked if not a.exposed else Qt.CheckState.Checked)
-            self.attr_table.setItem(r, 1, ec)
-            self.attr_table.setItem(r, 2, QTableWidgetItem(a.name))
-            self.attr_table.setCellWidget(r, 3, self._attr_type_combo(a.type))
+            self.attr_table.setItem(r, 1, QTableWidgetItem(a.name))
+            self.attr_table.setCellWidget(r, 2, self._attr_type_combo(a.type))
+            self.attr_table.setCellWidget(r, 3, self._attr_language_combo(a.language))
             self.attr_table.setItem(r, 4, QTableWidgetItem(a.description))
         av.addWidget(self.attr_table, 1)
         btns = QHBoxLayout()
@@ -429,7 +430,7 @@ class SettingsWidget(QDialog):
         B(HELP_MAX_CHUNKS, self.i_maxchunks, f2.labelForField(self.i_maxchunks))
         B(HELP_MIN_SCORE, self.i_min_score, f2.labelForField(self.i_min_score))
         B(HELP_ATTR_MODE, self.i_attrmode, f2.labelForField(self.i_attrmode))
-        for col, key in enumerate((HELP_ATTR_ENABLED, HELP_ATTR_COLUMN, HELP_ATTR_NAME, HELP_ATTR_TYPE, HELP_ATTR_DESC)):
+        for col, key in enumerate((HELP_ATTR_ENABLED, HELP_ATTR_NAME, HELP_ATTR_TYPE, HELP_ATTR_LANGUAGE, HELP_ATTR_DESC)):
             item = self.attr_table.horizontalHeaderItem(col)
             if item is not None:
                 item.setToolTip(key)
@@ -463,9 +464,21 @@ class SettingsWidget(QDialog):
 
     def _attr_type_combo(self, type_str):
         combo = QComboBox()
-        combo.addItems(['text', 'tags'])
+        combo.addItems(['text', 'category', 'tags'])
         combo.setEditable(False)
-        combo.setCurrentText(type_str if type_str in ('text', 'tags') else 'text')
+        combo.setCurrentText(type_str if type_str in ('text', 'category', 'tags') else 'text')
+        return combo
+
+    def _attr_language_combo(self, language):
+        # editable: besides the two presets the user can type any language name
+        combo = QComboBox()
+        combo.addItems(['Default', 'Match book'])
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        if language == 'book':
+            combo.setCurrentText('Match book')
+        elif language:
+            combo.setEditText(language)
         return combo
 
     def _add_attr(self):
@@ -474,11 +487,9 @@ class SettingsWidget(QDialog):
         cb = QTableWidgetItem()
         cb.setCheckState(Qt.CheckState.Checked)
         self.attr_table.setItem(r, 0, cb)
-        ec = QTableWidgetItem()
-        ec.setCheckState(Qt.CheckState.Checked)
-        self.attr_table.setItem(r, 1, ec)
-        self.attr_table.setItem(r, 2, QTableWidgetItem('new_field'))
-        self.attr_table.setCellWidget(r, 3, self._attr_type_combo('text'))
+        self.attr_table.setItem(r, 1, QTableWidgetItem('new_field'))
+        self.attr_table.setCellWidget(r, 2, self._attr_type_combo('text'))
+        self.attr_table.setCellWidget(r, 3, self._attr_language_combo(''))
         self.attr_table.setItem(r, 4, QTableWidgetItem(''))
 
     def _del_attr(self):
@@ -670,21 +681,29 @@ class SettingsWidget(QDialog):
         s.auto_extract_attributes = bool(self.e_auto_attr.isChecked())
         attrs = []
         for r in range(self.attr_table.rowCount()):
-            name = (self.attr_table.item(r, 2).text() if self.attr_table.item(r, 2) else '').strip().lower()
+            name = (self.attr_table.item(r, 1).text() if self.attr_table.item(r, 1) else '').strip().lower()
             name = ''.join(c if c.isalnum() or c == '_' else '_' for c in name)
             if not name:
                 continue
-            combo = self.attr_table.cellWidget(r, 3)
+            combo = self.attr_table.cellWidget(r, 2)
             typ = (combo.currentText() if combo is not None else 'text').strip().lower()
-            if typ not in ('text', 'tags'):
+            if typ not in ('text', 'category', 'tags'):
                 typ = 'text'
+            lang_combo = self.attr_table.cellWidget(r, 3)
+            lang_raw = (lang_combo.currentText() if lang_combo is not None else '').strip()
+            lang_cf = lang_raw.casefold()
+            if lang_cf in ('', 'default'):
+                lang = ''
+            elif lang_cf in ('match book', 'book'):
+                lang = 'book'
+            else:
+                lang = lang_raw  # a forced language name, kept as typed
             desc = (self.attr_table.item(r, 4).text() if self.attr_table.item(r, 4) else '').strip()
             enabled = bool(self.attr_table.item(r, 0) and self.attr_table.item(r, 0).checkState() == Qt.CheckState.Checked)
-            exposed = bool(self.attr_table.item(r, 1) and self.attr_table.item(r, 1).checkState() == Qt.CheckState.Checked)
             # preserve label from existing schema when possible
             old = next((a for a in self.s.attributes if a.name == name), None)
             label = old.label if old else ('ss_' + name[:30])
-            attrs.append(AttrField(name=name, label=label, type=typ, description=desc, enabled=enabled, exposed=exposed))
+            attrs.append(AttrField(name=name, label=label, type=typ, description=desc, enabled=enabled, language=lang))
         s.attributes = attrs or [a.clone() for a in self.s.attributes]
         self._result = s
         self.accept()

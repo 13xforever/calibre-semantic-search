@@ -29,17 +29,69 @@ def human_name(name: str) -> str:
     return name.replace('_', ' ').title()
 
 
-def ensure_columns(new_api, settings) -> dict[str, str]:
-    """Ensure a custom column exists for every exposed attribute.
+def _column_spec(f) -> tuple[str, bool]:
+    """Calibre column (datatype, is_multiple) for an attribute field."""
+    if f.type == 'tags':
+        return 'text', True  # the same mechanism calibre uses for #tags
+    if f.type == 'text':
+        return 'comments', False  # plain multi-line like #description; no tag-browser category
+    return 'text', False  # category: single-value normalized text
 
-    Returns {field.name: '#label'}. Multi-value ('tags') fields use datatype
-    'text' with is_multiple=True (the same mechanism calibre uses for #tags).
+
+def _value_for_type(value, field_type):
+    """Shape a stored value for the target field type (list for tags, string otherwise)."""
+    if isinstance(value, (list, tuple)):
+        parts = [str(x).strip() for x in value if str(x).strip()]
+    else:
+        s = str(value).strip()
+        parts = [s] if s else []
+    if field_type == 'tags':
+        return parts or None
+    return ', '.join(parts) or None
+
+
+def _convert_column(api, f, datatype, is_multiple):
+    """Recreate a column with a different calibre type, preserving its values."""
+    old = {}
+    try:
+        for bid in api.all_ids():
+            v = api.get_custom(bid, label=f.label, index_is_id=True)
+            if not v:
+                continue
+            cv = _value_for_type(v, f.type)
+            if cv:
+                old[bid] = cv
+    except Exception as e:
+        print(f'semantic search: could not read column {f.label} for conversion: {e!r}')
+    try:
+        api.delete_custom_column(label=f.label)
+        api.create_custom_column(f.label, human_name(f.name), datatype, is_multiple)
+        if old:
+            api.set_field(column_key(f.label), old)
+    except Exception as e:
+        print(f'semantic search: could not convert column {f.label} to {datatype}: {e!r}')
+
+
+def ensure_columns(new_api, settings) -> dict[str, str]:
+    """Ensure a custom column of the right type exists for every enabled attribute.
+
+    Returns {field.name: '#label'}. 'tags' fields use datatype 'text' with
+    is_multiple=True (the same mechanism calibre uses for #tags); 'category'
+    fields use single-value 'text'; 'text' fields use datatype 'comments'
+    (plain multi-line, like #description — no tag-browser category). A column
+    whose stored type no longer matches the field is converted in place with
+    its values copied across.
     """
     out = {}
     existing = new_api.backend.custom_column_label_map
-    for f in settings.exposed_attributes():
-        if f.label not in existing:
-            new_api.create_custom_column(f.label, human_name(f.name), 'text', f.type == 'tags')
+    for f in settings.enabled_attributes():
+        datatype, is_multiple = _column_spec(f)
+        meta = existing.get(f.label)
+        if meta is None:
+            new_api.create_custom_column(f.label, human_name(f.name), datatype, is_multiple)
+            existing = new_api.backend.custom_column_label_map
+        elif meta['datatype'] != datatype or bool(meta['is_multiple']) != is_multiple:
+            _convert_column(new_api, f, datatype, is_multiple)
             existing = new_api.backend.custom_column_label_map
         out[f.name] = column_key(f.label)
     return out
@@ -48,15 +100,16 @@ def ensure_columns(new_api, settings) -> dict[str, str]:
 def sync_attribute_columns(api, store, settings) -> None:
     """Make the library's custom columns match the attribute schema.
 
-    Exposed fields get their column created if needed and backfilled from the
-    plugin store (attrs_raw is the source of truth, so no LLM calls are made).
-    Configured fields whose column was switched off have their column deleted.
-    Best-effort: a per-operation failure is logged, not raised. Idempotent —
-    a no-op once the columns already match the settings.
+    Enabled fields get their column created (or converted to the right type) if
+    needed and backfilled from the plugin store (attrs_raw is the source of
+    truth, so no LLM calls are made). Columns of disabled fields are deleted —
+    their values remain in the store and are restored when the field is
+    re-enabled. Best-effort: a per-operation failure is logged, not raised.
+    Idempotent — a no-op once the columns already match the settings.
     """
     existing = api.backend.custom_column_label_map
     for f in settings.attributes:
-        if f.exposed or f.label not in existing:
+        if f.enabled or f.label not in existing:
             continue
         try:
             api.delete_custom_column(label=f.label)
@@ -64,12 +117,12 @@ def sync_attribute_columns(api, store, settings) -> None:
             print(f'semantic search: could not delete column {f.label}: {e!r}')
         else:
             existing = api.backend.custom_column_label_map
-    exposed = settings.exposed_attributes()
-    if not exposed:
+    enabled = settings.enabled_attributes()
+    if not enabled:
         return
     colmap = ensure_columns(api, settings)
     stored = store.all_attrs()
-    for f in exposed:
+    for f in enabled:
         mapping = {}
         for bid, values in stored.items():
             v = values.get(f.name)
@@ -243,14 +296,23 @@ def normalize_tags(tags) -> list[str]:
     return [best[k] for k in order]
 
 
+def _language_note(f) -> str:
+    """Per-field prompt note forcing the value language ('' = no instruction)."""
+    if not f.language:
+        return ''
+    if f.language == 'book':
+        return ' Write all values in the original language of the book text.'
+    return f' Write all values in {f.language}.'
+
+
 def _prompt_for(text: str, fields) -> str:
     lines = []
     for f in fields:
         if f.type == 'tags':
-            lines.append(f"- {f.name} (a comma-separated list of tags): {f.description}")
+            lines.append(f"- {f.name} (a comma-separated list of tags): {f.description}{_language_note(f)}")
         else:
             # no length hint: the description carries the format (fields may be prose)
-            lines.append(f"- {f.name}: {f.description}")
+            lines.append(f"- {f.name}: {f.description}{_language_note(f)}")
     return (
         'Read the book text below and extract its attributes.\n\n'
         + '\n'.join(lines)
@@ -284,7 +346,8 @@ def _reduce_prompt(pending, max_tok):
             'For prose fields, write one cohesive final version; do not concatenate or quote the partials.'
         ]
         for f, _ in pending:
-            lines.append(f"- {f.name}: {f.description}")
+            # the note keeps merged prose in the field's target language (partials already are)
+            lines.append(f"- {f.name}: {f.description}{_language_note(f)}")
             for i, v in enumerate(keep[f.name], 1):
                 lines.append(f'  portion {i}: {v}')
         return '\n'.join(lines) + '\n\nReturn only the structured data.'
@@ -408,8 +471,8 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
         colmap = ensure_columns(new_api, settings)
         updates: dict[str, dict[int, Any]] = {}
         for f in fields:
-            if not f.exposed or f.name not in colmap:
-                continue  # stored in attrs_raw only, no calibre column
+            if f.name not in colmap:
+                continue  # defensive: enabled fields always have a column
             key = colmap[f.name]
             val = values.get(f.name)
             if f.type == 'tags':

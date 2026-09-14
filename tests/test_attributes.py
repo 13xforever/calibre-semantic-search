@@ -114,8 +114,11 @@ _FIELDS = [utils.AttrField('gender', 'ss_gender', 'text', 'g'), utils.AttrField(
 
 class FakeApi:
     def __init__(self):
-        self.columns = {}
+        self.columns = {}  # label -> {'label', 'datatype', 'is_multiple'}
         self.fields = {}
+        self.created = []  # (label, name, datatype, is_multiple), in creation order
+        self.deleted = []  # labels, in deletion order
+        self.book_values = {}  # label -> {book_id: value}, served by get_custom
 
     @property
     def backend(self):
@@ -127,16 +130,27 @@ class FakeApi:
         return b
 
     def create_custom_column(self, label, name, datatype, is_multiple):
-        self.columns[label] = {'label': label}
+        self.columns[label] = {'label': label, 'datatype': datatype, 'is_multiple': is_multiple}
+        self.created.append((label, name, datatype, is_multiple))
 
     def delete_custom_column(self, label=None, num=None):
         if label is not None and label in self.columns:
             del self.columns[label]
+            self.deleted.append(label)
         elif label is not None:
             raise ValueError('No such column')
 
     def set_field(self, key, mapping):
         self.fields.setdefault(key, {}).update(mapping)
+
+    def all_ids(self):
+        ids = set()
+        for values in self.book_values.values():
+            ids.update(values)
+        return sorted(ids)
+
+    def get_custom(self, idx, label=None, num=None, index_is_id=False):
+        return self.book_values.get(label, {}).get(idx)
 
 
 class TestNormalize(unittest.TestCase):
@@ -365,19 +379,35 @@ class TestExtract(unittest.TestCase):
         attributes.extract_book_attributes(3, api, store, settings, llm=llm, progress_cb=lambda d, t: calls.append((d, t)))
         self.assertEqual(calls, [])
 
-    def test_extraction_stores_but_skips_unexposed_column(self):
+    def test_extraction_mirrors_all_enabled_fields(self):
         store = FakeStore()
         api = FakeApi()
         llm = FakeLLM({'gender': 'female', 'tropes': ['slow burn']})
         settings = utils.Settings()
         settings.attributes = [f.clone() for f in _FIELDS]
-        settings.attributes[1].exposed = False  # tropes: stored internally only
         attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
         values = attributes.extract_book_attributes(20, api, store, settings, llm=llm)
-        # source of truth gets everything...
+        # source of truth gets everything and every enabled field is mirrored into a column
         self.assertEqual(values['gender'], 'female')
         self.assertEqual(store.attrs[20]['tropes'], ['slow burn'])
-        # ...but only the exposed field is mirrored into a column
+        self.assertEqual(sorted(api.columns), ['ss_gender', 'ss_tropes'])
+        self.assertEqual(api.fields['#ss_gender'], {20: 'female'})
+        self.assertEqual(api.fields['#ss_tropes'], {20: ['slow burn']})
+
+    def test_extraction_skips_disabled_fields(self):
+        store = FakeStore()
+        api = FakeApi()
+        llm = FakeLLM({'gender': 'female', 'tropes': ['slow burn']})
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.attributes[1].enabled = False  # tropes: disabled, no column
+        attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
+        values = attributes.extract_book_attributes(20, api, store, settings, llm=llm)
+        # the disabled field is not extracted or stored at all...
+        self.assertEqual(values['gender'], 'female')
+        self.assertNotIn('tropes', values)
+        self.assertNotIn('tropes', store.attrs[20])
+        # ...and gets no column either
         self.assertIn('ss_gender', api.columns)
         self.assertNotIn('ss_tropes', api.columns)
         self.assertEqual(api.fields['#ss_gender'], {20: 'female'})
@@ -466,12 +496,12 @@ class TestFulltextReduce(unittest.TestCase):
 class TestSyncColumns(unittest.TestCase):
     """sync_attribute_columns converges the library's columns on the schema."""
 
-    def _settings(self, gender_exposed=True, tropes_exposed=True):
+    def _settings(self, gender_enabled=True, tropes_enabled=True):
         s = utils.Settings()
-        g = utils.AttrField('gender', 'ss_gender', 'text', 'g')
+        g = utils.AttrField('gender', 'ss_gender', 'category', 'g')
         t = utils.AttrField('tropes', 'ss_tropes', 'tags', 't')
-        t.exposed = tropes_exposed
-        g.exposed = gender_exposed
+        g.enabled = gender_enabled
+        t.enabled = tropes_enabled
         s.attributes = [g, t]
         return s
 
@@ -481,26 +511,29 @@ class TestSyncColumns(unittest.TestCase):
         store.attrs[2] = {'gender': '', 'tropes': []}  # empty values are skipped
         api = FakeApi()
         attributes.sync_attribute_columns(api, store, self._settings())
+        # category -> single-value text; tags -> multi-value text (calibre's #tags mechanism)
+        self.assertEqual(api.created, [('ss_gender', 'Gender', 'text', False), ('ss_tropes', 'Tropes', 'text', True)])
         self.assertEqual(sorted(api.columns), ['ss_gender', 'ss_tropes'])
         self.assertEqual(api.fields['#ss_gender'], {1: 'female'})
         self.assertEqual(api.fields['#ss_tropes'], {1: ['slow burn']})
 
-    def test_deletes_columns_of_unexposed_fields(self):
+    def test_deletes_columns_of_disabled_fields(self):
         store = FakeStore()
         store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
         api = FakeApi()
-        api.columns['ss_gender'] = {'label': 'ss_gender'}
-        api.columns['ss_tropes'] = {'label': 'ss_tropes'}
-        attributes.sync_attribute_columns(api, store, self._settings(gender_exposed=False, tropes_exposed=False))
+        api.columns['ss_gender'] = {'label': 'ss_gender', 'datatype': 'text', 'is_multiple': False}
+        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'datatype': 'text', 'is_multiple': True}
+        attributes.sync_attribute_columns(api, store, self._settings(gender_enabled=False, tropes_enabled=False))
         self.assertEqual(api.columns, {})
+        self.assertEqual(api.deleted, ['ss_gender', 'ss_tropes'])
         self.assertEqual(api.fields, {})
 
-    def test_mixed_exposure(self):
+    def test_mixed_enabled(self):
         store = FakeStore()
         store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
         api = FakeApi()
-        api.columns['ss_tropes'] = {'label': 'ss_tropes'}  # stale column of the un-exposed field
-        attributes.sync_attribute_columns(api, store, self._settings(tropes_exposed=False))
+        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'datatype': 'text', 'is_multiple': True}  # stale column of the disabled field
+        attributes.sync_attribute_columns(api, store, self._settings(tropes_enabled=False))
         self.assertNotIn('ss_tropes', api.columns)  # deleted
         self.assertIn('ss_gender', api.columns)  # created
         self.assertEqual(api.fields['#ss_gender'], {1: 'female'})
@@ -510,13 +543,97 @@ class TestSyncColumns(unittest.TestCase):
         store = FakeStore()
         store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
         api = FakeApi()
-        api.columns['ss_gender'] = {'label': 'ss_gender'}
-        api.columns['ss_tropes'] = {'label': 'ss_tropes'}
+        api.columns['ss_gender'] = {'label': 'ss_gender', 'datatype': 'text', 'is_multiple': False}
+        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'datatype': 'text', 'is_multiple': True}
         attributes.sync_attribute_columns(api, store, self._settings())
         # re-running must not duplicate or drop anything
         attributes.sync_attribute_columns(api, store, self._settings())
         self.assertEqual(sorted(api.columns), ['ss_gender', 'ss_tropes'])
+        self.assertEqual(api.created, [])
+        self.assertEqual(api.deleted, [])
         self.assertEqual(api.fields['#ss_gender'], {1: 'female'})
+
+
+class TestColumnConversion(unittest.TestCase):
+    """ensure_columns converts a column whose stored calibre type no longer matches the field."""
+
+    def _settings(self, name='blurb', label='ss_blurb', ftype='text'):
+        s = utils.Settings()
+        s.attributes = [utils.AttrField(name, label, ftype, 'd')]
+        return s
+
+    def test_text_field_creates_comments_column(self):
+        api = FakeApi()
+        colmap = attributes.ensure_columns(api, self._settings())
+        self.assertEqual(colmap['blurb'], '#ss_blurb')
+        self.assertEqual(api.created, [('ss_blurb', 'Blurb', 'comments', False)])
+
+    def test_category_field_creates_single_text_column(self):
+        api = FakeApi()
+        attributes.ensure_columns(api, self._settings('pov', 'ss_pov', 'category'))
+        self.assertEqual(api.created, [('ss_pov', 'Pov', 'text', False)])
+
+    def test_matching_column_left_alone(self):
+        api = FakeApi()
+        api.columns['ss_blurb'] = {'label': 'ss_blurb', 'datatype': 'comments', 'is_multiple': False}
+        attributes.ensure_columns(api, self._settings())
+        self.assertEqual(api.created, [])
+        self.assertEqual(api.deleted, [])
+
+    def test_text_column_converted_to_comments_values_preserved(self):
+        # the pre-rename default: ss_blurb existed as a single-value text column
+        api = FakeApi()
+        api.columns['ss_blurb'] = {'label': 'ss_blurb', 'datatype': 'text', 'is_multiple': False}
+        api.book_values['ss_blurb'] = {1: 'A storm is coming.', 2: ''}
+        attributes.ensure_columns(api, self._settings())
+        self.assertEqual(api.deleted, ['ss_blurb'])
+        self.assertEqual(api.created, [('ss_blurb', 'Blurb', 'comments', False)])
+        self.assertEqual(api.fields['#ss_blurb'], {1: 'A storm is coming.'})  # empty value dropped
+
+    def test_tags_column_converted_to_category_joins_values(self):
+        api = FakeApi()
+        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'datatype': 'text', 'is_multiple': True}
+        api.book_values['ss_tropes'] = {1: ['slow burn', 'found family'], 2: []}
+        attributes.ensure_columns(api, self._settings('tropes', 'ss_tropes', 'category'))
+        self.assertEqual(api.created, [('ss_tropes', 'Tropes', 'text', False)])
+        self.assertEqual(api.fields['#ss_tropes'], {1: 'slow burn, found family'})
+
+    def test_category_column_converted_to_tags_splits_single_value(self):
+        api = FakeApi()
+        api.columns['ss_pov'] = {'label': 'ss_pov', 'datatype': 'text', 'is_multiple': False}
+        api.book_values['ss_pov'] = {1: 'first person'}
+        attributes.ensure_columns(api, self._settings('pov', 'ss_pov', 'tags'))
+        self.assertEqual(api.created, [('ss_pov', 'Pov', 'text', True)])
+        self.assertEqual(api.fields['#ss_pov'], {1: ['first person']})
+
+
+class TestLanguageNote(unittest.TestCase):
+    """The per-field language setting becomes a prompt instruction."""
+
+    def _field(self, lang=''):
+        return utils.AttrField('blurb', 'ss_blurb', 'text', 'A short summary.', True, lang)
+
+    def test_default_adds_no_note(self):
+        p = attributes._prompt_for('TEXT', [self._field()])
+        self.assertNotIn('Write all values in', p)
+
+    def test_book_language_note(self):
+        p = attributes._prompt_for('TEXT', [self._field('book')])
+        self.assertIn('Write all values in the original language of the book text.', p)
+
+    def test_explicit_language_note(self):
+        p = attributes._prompt_for('TEXT', [self._field('Russian')])
+        self.assertIn('Write all values in Russian.', p)
+
+    def test_tags_field_gets_note_too(self):
+        f = utils.AttrField('tropes', 'ss_tropes', 'tags', 'Notable tropes.', True, 'book')
+        p = attributes._prompt_for('TEXT', [f])
+        self.assertIn('Write all values in the original language of the book text.', p)
+
+    def test_reduce_prompt_keeps_language(self):
+        # merged prose must stay in the field's target language
+        p = attributes._reduce_prompt([(self._field('Russian'), ['a', 'b'])], 4000)
+        self.assertIn('Write all values in Russian.', p)
 
 
 if __name__ == '__main__':

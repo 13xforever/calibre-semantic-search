@@ -91,7 +91,7 @@ class FakeWriter:
         return b
 
     def create_custom_column(self, label, name, datatype, is_multiple):
-        self.columns[label] = {'label': label}
+        self.columns[label] = {'label': label, 'datatype': datatype, 'is_multiple': is_multiple}
 
     def set_field(self, key, mapping):
         self.fields.setdefault(key, {}).update(mapping)
