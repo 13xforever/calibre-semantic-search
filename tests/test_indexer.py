@@ -260,6 +260,17 @@ class TestForcedAttrExtraction(unittest.TestCase):
         self.assertEqual(ix._attr_phase_books(settings), [1])
         vs.close()
 
+    def test_phase_books_forced_front_pending_newest_first(self):
+        vs, ix, settings, *_ = self._make()
+        for bid in (1, 5, 3):
+            _index_book(vs, bid)  # no attrs stored -> pending
+        _index_book(vs, 9)
+        vs.set_attrs(9, {'gender': 'f', 'tropes': []})  # complete -> not pending
+        self.assertEqual(ix._attr_phase_books(settings), [5, 3, 1])
+        ix.request_attributes(9)
+        self.assertEqual(ix._attr_phase_books(settings), [9, 5, 3, 1])
+        vs.close()
+
     def test_process_drops_forced_book_on_success(self):
         vs, ix, settings, statuses, done = self._make()
         _index_book(vs, 7)

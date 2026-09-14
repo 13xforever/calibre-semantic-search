@@ -227,7 +227,8 @@ class TestVectorStore(_SearchBookMixin, unittest.TestCase):
         s = self.s
         s.add_dirty(1, 'added')
         s.add_dirty(2, 'changed')
-        self.assertEqual(sorted(s.dirty_book_ids()), [1, 2])
+        # newest first: descending book id (calibre assigns ids in insertion order)
+        self.assertEqual(s.dirty_book_ids(), [2, 1])
         s.remove_dirty(1)
         self.assertEqual(s.dirty_book_ids(), [2])
 
@@ -270,7 +271,7 @@ class TestVectorStore(_SearchBookMixin, unittest.TestCase):
     def test_add_dirty_many(self):
         s = self.s
         s.add_dirty_many([1, 2, 3], 'reindex')
-        self.assertEqual(sorted(s.dirty_book_ids()), [1, 2, 3])
+        self.assertEqual(s.dirty_book_ids(), [3, 2, 1])
         # same upsert semantics as add_dirty: no duplicates, reason updated
         s.add_dirty(2, 'changed')
         self.assertEqual(sorted(s.dirty_book_ids()), [1, 2, 3])

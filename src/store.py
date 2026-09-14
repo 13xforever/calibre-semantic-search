@@ -626,8 +626,9 @@ class MetaStore:
             self.conn.commit()
 
     def dirty_book_ids(self):
+        """Queued book ids, newest first (descending id: calibre assigns ids in insertion order)."""
         with self._lock:
-            rows = self.conn.execute('SELECT book_id FROM dirty').fetchall()
+            rows = self.conn.execute('SELECT book_id FROM dirty ORDER BY book_id DESC').fetchall()
         return [r[0] for r in rows]
 
     def remove_dirty(self, book_id: int):

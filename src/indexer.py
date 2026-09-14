@@ -200,11 +200,15 @@ class Indexer(threading.Thread):
         return [b for b in pending_attribute_books(self.store, settings) if b not in failed]
 
     def _attr_phase_books(self, settings) -> list[int]:
-        """Books for the next attribute phase: normal pending books plus forced re-extractions."""
+        """Books for the next attribute phase.
+
+        Forced re-extractions (explicit user requests) go first; the normal pending
+        books follow newest-first (descending book id).
+        """
         attr_pending = self._pending_attr_books(settings)
         with self._forced_lock:
-            forced = [b for b in sorted(self._forced_attrs) if b not in attr_pending]
-        return attr_pending + forced
+            forced = [b for b in sorted(self._forced_attrs, reverse=True) if b not in attr_pending]
+        return forced + sorted(attr_pending, reverse=True)
 
     def _drop_forced(self, book_id):
         with self._forced_lock:
