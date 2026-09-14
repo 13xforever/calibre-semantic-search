@@ -67,6 +67,9 @@ def _install_stubs():
             self.data = value
 
     qtcore.QTableWidgetItem = _Item
+    qtcore.QTableWidget.currentCellChanged = _Sig()  # real QTableView emits it; instances connect in __init__
+    qtcore.QTableWidget.selectRow = lambda self, r: None
+    qtcore.QAbstractItemView.ScrollHint = types.SimpleNamespace(EnsureVisible=0, PositionAtTop=1, PositionAtCenter=2)
     _sys.modules['qt.core'] = qtcore
 
     cal = types.ModuleType('calibre')
@@ -158,6 +161,9 @@ class _Table:
         self.header = _Header()
         self._current_cell = None
         self._current_row = -1
+        self.focused = False
+        self.selected_rows = []
+        self.scrolled_to = None
 
     def horizontalHeader(self):
         return self.header
@@ -189,6 +195,19 @@ class _Table:
 
     def currentRow(self):
         return self._current_row
+
+    def setFocus(self):
+        self.focused = True
+
+    def selectRow(self, r):
+        self.selected_rows.append(r)
+
+    def scrollToItem(self, item, hint=None):
+        for r, row_items in enumerate(self.grid):
+            for c, it in enumerate(row_items):
+                if it is item:
+                    self.scrolled_to = (r, c)
+                    return
 
 
 class _Store:
@@ -548,6 +567,39 @@ class TestBackNavigation(unittest.TestCase):
         self.assertFalse(e.accepted)
 
 
+class TestRowSelectionFollowsCursor(unittest.TestCase):
+    """Tab focus lands on a single cell; the whole current row must stay selected."""
+
+    def _table(self):
+        t = dialog._ResultsTable(0, 3)
+        t.selected_rows = []
+        t.selectRow = lambda r: t.selected_rows.append(r)
+        return t
+
+    def test_focus_in_landing_selects_full_row(self):
+        # calibre's Qt binding marshals the signal as (row, col, prev_row, prev_col) ints
+        t = self._table()
+        t.currentCellChanged.emit(0, 0, -1, -1)
+        self.assertEqual(t.selected_rows, [0])
+
+    def test_cursor_movement_keeps_row_selected(self):
+        t = self._table()
+        for row in (3, 7):
+            t.currentCellChanged.emit(row, 0, row - 1, 0)
+        self.assertEqual(t.selected_rows, [3, 7])
+
+    def test_qmodelindex_shape_is_handled_too(self):
+        # stock PyQt marshals the signal as (QModelIndex, QModelIndex)
+        t = self._table()
+        t.currentCellChanged.emit(types.SimpleNamespace(row=lambda: 5), None)
+        self.assertEqual(t.selected_rows, [5])
+
+    def test_invalid_index_selects_nothing(self):
+        t = self._table()
+        t.currentCellChanged.emit(-1, -1, -1, -1)
+        self.assertEqual(t.selected_rows, [])
+
+
 class TestWorkerLifetime(unittest.TestCase):
     """Regression: clearing self.worker on results used to drop the last reference to the
     QThread while it was still running, aborting calibre with 'QThread: Destroyed while
@@ -711,6 +763,37 @@ class TestDrillDown(unittest.TestCase):
         stale_gen = d._gen - 1
         dialog.SemanticSearchDialog._on_book_results(d, [_result(1)], stale_gen)
         self.assertIsNone(d.matches)
+
+    def test_book_results_focus_first_row(self):
+        d = _make_dialog(api=_FakeApi())
+        _searched(d, [_result(1)])
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.drill_into(d)
+        dialog.SemanticSearchDialog._on_book_results(d, [_result(1), _result(1)], d._gen)
+        self.assertTrue(d.table.focused)
+        self.assertEqual(d.table._current_cell, (0, 0))
+
+    def test_empty_book_results_do_not_focus(self):
+        d = _make_dialog(api=_FakeApi())
+        _searched(d, [_result(1)])
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.drill_into(d)
+        d.table.focused = False
+        d.table._current_cell = None
+        dialog.SemanticSearchDialog._on_book_results(d, [], d._gen)
+        self.assertFalse(d.table.focused)
+        self.assertIsNone(d.table._current_cell)
+
+    def test_go_back_scrolls_to_restored_row(self):
+        d = _make_dialog(api=_FakeApi())
+        _searched(d, [_result(i) for i in range(50)])
+        d.table.setCurrentCell(40, 0)
+        dialog.SemanticSearchDialog.drill_into(d)
+        dialog.SemanticSearchDialog._on_book_results(d, [_result(1)] * 30, d._gen)
+        d.table.setCurrentCell(25, 0)
+        dialog.SemanticSearchDialog.go_back(d)
+        self.assertEqual(d.table._current_cell, (40, 0))
+        self.assertEqual(d.table.scrolled_to, (40, 0))
 
     def test_go_back_in_books_view_is_noop(self):
         # Backspace/Alt+Left land here too; without a drill-down nothing may change

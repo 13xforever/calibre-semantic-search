@@ -104,7 +104,22 @@ class _ResultsTable(QTableWidget):
     Qt's default for Home/End moves the current *cell* instead (Home -> first column,
     End -> last column, Ctrl+... -> corner cells), which is invisible under SelectRows;
     rows are the unit of interaction here, so all four should select the first/last row.
+    The whole current row stays selected at all times (a Tab focus-in would otherwise
+    highlight a single cell).
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Tab focus lands on a single cell (the view highlights just that cell); rows are
+        # the unit of interaction, so keep the whole current row selected.
+        self.currentCellChanged.connect(self._select_current_row)
+
+    def _select_current_row(self, current, *rest):
+        # calibre's Qt binding marshals currentCellChanged as (row, col, prev_row, prev_col)
+        # ints rather than (QModelIndex, QModelIndex); either way the row comes first.
+        row = current.row() if hasattr(current, 'row') else current
+        if row >= 0:
+            self.selectRow(row)
 
     def keyPressEvent(self, e):
         mods = e.modifiers()
@@ -299,6 +314,10 @@ class SemanticSearchDialog(QDialog):
         self._sort_state['matches'] = [2, False]  # search_book returns score-descending
         self._update_view_chrome()
         self._render_table()
+        if results:
+            # land on the first match so arrow keys / Enter work immediately
+            self.table.setFocus()
+            self.table.setCurrentCell(0, 0)
 
     def _on_book_failed(self, msg, gen):
         if gen != self._gen or self._active_book_id is None:
@@ -320,6 +339,9 @@ class SemanticSearchDialog(QDialog):
         row = min(self._book_cursor, max(0, len(self.books) - 1))
         if row >= 0:
             self.table.setCurrentCell(row, 0)
+            # setCurrentCell does not reliably re-scroll after a same-size re-render, so
+            # make the restored row visible explicitly.
+            self.table.scrollToItem(self.table.item(row, 0), QAbstractItemView.ScrollHint.EnsureVisible)
 
     def _on_failed(self, msg, gen):
         if gen != self._gen:
