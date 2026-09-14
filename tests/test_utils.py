@@ -21,9 +21,19 @@ class TestSettingsRoundtrip(unittest.TestCase):
         get, set_ = self._prefs()
         s = utils.load_settings(get)
         self.assertEqual(s.embed.base_url, 'http://localhost:11434')
-        self.assertEqual(len(s.attributes), 7)
+        self.assertEqual(len(s.attributes), 8)
         self.assertTrue(all(a.enabled for a in s.attributes))
         self.assertEqual(s.search_min_score, 0.2)
+
+    def test_blurb_default_is_internal_only(self):
+        # the blurb ships enabled but without a calibre column (exposed=False)
+        get, set_ = self._prefs()
+        s = utils.load_settings(get)
+        blurb = next(a for a in s.attributes if a.name == 'blurb')
+        self.assertTrue(blurb.enabled)
+        self.assertFalse(blurb.exposed)
+        self.assertEqual(blurb.type, 'text')
+        self.assertNotIn('blurb', [a.name for a in s.exposed_attributes()])
 
     def test_save_load_roundtrip(self):
         get, set_ = self._prefs()
@@ -104,7 +114,36 @@ class TestSettingsRoundtrip(unittest.TestCase):
         names = [a.name for a in s.exposed_attributes()]
         self.assertNotIn(s.attributes[0].name, names)  # disabled
         self.assertNotIn(s.attributes[1].name, names)  # not exposed
-        self.assertEqual(len(names), len(s.attributes) - 2)
+        # minus 3: the two above plus blurb, which ships un-exposed by default
+        self.assertEqual(len(names), len(s.attributes) - 3)
+
+    def test_legacy_saved_gains_new_default_field(self):
+        # a settings blob saved before 'blurb' existed must gain it on load,
+        # appended after the user's own entries with default flags
+        get, set_ = self._prefs()
+        import json as _json
+
+        data = {'attributes': [{'name': 'pov', 'label': 'ss_pov', 'type': 'text', 'description': 'x', 'enabled': True}]}
+        set_(utils.PREF_KEY, _json.dumps(data))
+        s = utils.load_settings(get)
+        names = [a.name for a in s.attributes]
+        self.assertEqual(names[0], 'pov')  # saved entries keep their order first
+        self.assertIn('blurb', names)
+        blurb = next(a for a in s.attributes if a.name == 'blurb')
+        self.assertTrue(blurb.enabled)
+        self.assertFalse(blurb.exposed)
+
+    def test_saved_blurb_toggles_not_overwritten(self):
+        get, set_ = self._prefs()
+        s = utils.load_settings(get)
+        blurb = next(a for a in s.attributes if a.name == 'blurb')
+        blurb.enabled = False
+        blurb.exposed = True
+        utils.save_settings(set_, s)
+        s2 = utils.load_settings(get)
+        blurb2 = next(a for a in s2.attributes if a.name == 'blurb')
+        self.assertFalse(blurb2.enabled)  # defaults must not clobber saved flags
+        self.assertTrue(blurb2.exposed)
 
 
 class _WheelBuilder:

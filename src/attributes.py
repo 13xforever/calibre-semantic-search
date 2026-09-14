@@ -89,16 +89,18 @@ def sync_attribute_columns(api, store, settings) -> None:
                 print(f'semantic search: could not backfill column {f.label}: {e!r}')
 
 
-def build_schema_class(fields):
+def build_schema_class(fields, doc=None):
     """Build a dynamic structured-output schema class for the given fields.
 
     Calibre's structured-output parser instantiates the class via ``cls(**parsed_json)``
-    (see calibre.ai.structured.instantiate) and introspects its annotations/defaults, so
+    (see calibre.ai.structured.instantiate) and introspects the annotations/defaults, so
     it must be a dataclass: that gives us both the keyword-accepting __init__ and the
     field metadata calibre reads for types and defaults.
     """
     import dataclasses
 
+    if doc is None:
+        doc = 'Extract the following attributes about a book. Use only information actually present in the text; leave fields null when not determinable.'
     anns: dict[str, Any] = {}
     ns: dict[str, Any] = {'__doc__': 'Attributes extracted from a book.'}
     for f in fields:
@@ -112,7 +114,7 @@ def build_schema_class(fields):
     try:
         from calibre.ai.structured import Doc
 
-        ns['doc'] = Doc('Extract the following attributes about a book. Use only information actually present in the text; leave fields null when not determinable.')
+        ns['doc'] = Doc(doc)
     except ImportError:
         pass
     return dataclasses.dataclass(type('BookAttributes', (), ns))
@@ -244,8 +246,11 @@ def normalize_tags(tags) -> list[str]:
 def _prompt_for(text: str, fields) -> str:
     lines = []
     for f in fields:
-        kind = 'a comma-separated list of tags' if f.type == 'tags' else 'a short phrase or sentence'
-        lines.append(f"- {f.name} ({kind}): {f.description}")
+        if f.type == 'tags':
+            lines.append(f"- {f.name} (a comma-separated list of tags): {f.description}")
+        else:
+            # no length hint: the description carries the format (fields may be prose)
+            lines.append(f"- {f.name}: {f.description}")
     return (
         'Read the book text below and extract its attributes.\n\n'
         + '\n'.join(lines)
@@ -253,6 +258,87 @@ def _prompt_for(text: str, fields) -> str:
         + '\n\n--- BOOK TEXT ---\n'
         + text
     )
+
+
+def _distinct_values(values):
+    """Dedupe case-insensitively, keeping first-seen spelling and order."""
+    seen = set()
+    out = []
+    for v in values:
+        k = v.casefold()
+        if k not in seen:
+            seen.add(k)
+            out.append(v)
+    return out
+
+
+def _reduce_prompt(pending, max_tok):
+    """Render the reduce prompt; over the token budget, drop middle portions
+    (first and last of each field kept) until it fits."""
+    keep = {f.name: list(vals) for f, vals in pending}
+
+    def render():
+        lines = [
+            'The partial values below were extracted in order from consecutive portions of the same book. Merge them into one final value for each field. '
+            'Where portions disagree about a fact, prefer the earliest value unless a later one clearly corrects it. '
+            'For prose fields, write one cohesive final version; do not concatenate or quote the partials.'
+        ]
+        for f, _ in pending:
+            lines.append(f"- {f.name}: {f.description}")
+            for i, v in enumerate(keep[f.name], 1):
+                lines.append(f'  portion {i}: {v}')
+        return '\n'.join(lines) + '\n\nReturn only the structured data.'
+
+    while estimate_tokens(render()) > max_tok:
+        targets = [n for n in keep if len(keep[n]) > 2]
+        if not targets:
+            break
+        n = max(targets, key=lambda n: len(keep[n]))
+        keep[n].pop(len(keep[n]) // 2)
+    return render()
+
+
+def _merge_fulltext_partials(fields, partials, llm, max_tok):
+    """Merge per-group partials into final values.
+
+    Tags union without an LLM call. Text fields with a single distinct value use it
+    directly; when groups disagree, one reduce call over the ordered partials
+    produces the final value (a null reduce result falls back to the first partial).
+    """
+    by_field: dict[str, list] = {}
+    for p in partials:
+        if p is None:
+            continue
+        for f in fields:
+            nv = _normalize_value(getattr(p, f.name, None), f.type)
+            if nv:
+                by_field.setdefault(f.name, []).append(nv)
+    values: dict[str, Any] = {}
+    pending = []
+    for f in fields:
+        vals = by_field.get(f.name) or []
+        if f.type == 'tags':
+            merged = []
+            for sub in vals:
+                for v in sub:
+                    if v not in merged:
+                        merged.append(v)
+            values[f.name] = merged
+        else:
+            distinct = _distinct_values(vals)
+            if len(distinct) <= 1:
+                values[f.name] = distinct[0] if distinct else ''
+            else:
+                pending.append((f, distinct))
+    if pending:
+        schema = build_schema_class([f for f, _ in pending], doc='Merge the partial attribute values into one final value per field.')
+        res = llm.generate_structured_output(_reduce_prompt(pending, max_tok), schema, 'You are merging partial book attribute extractions into final values. Use only information present in the partials.')
+        if res.exception is not None:
+            raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
+        for f, distinct in pending:
+            r = _normalize_value(getattr(res.data, f.name, None) if res.data is not None else None, 'text')
+            values[f.name] = r or distinct[0]
+    return values
 
 
 def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, progress_cb=None):
@@ -289,22 +375,7 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
             if res.exception is not None:
                 raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
             partials.append(res.data)
-        # reduce: merge partials (later non-null wins for text; union for tags)
-        merged: dict[str, Any] = {}
-        for p in partials:
-            if p is None:
-                continue
-            for f in fields:
-                v = getattr(p, f.name, None)
-                nv = _normalize_value(v, f.type)
-                if not nv:
-                    continue
-                cur = merged.get(f.name)
-                if f.type == 'tags':
-                    merged[f.name] = list(dict.fromkeys((cur or []) + nv))
-                else:
-                    merged[f.name] = nv  # keep last non-empty
-        values = merged
+        values = _merge_fulltext_partials(fields, partials, llm, max_tok)
     else:
         text = sample_text(chunks, max_tokens=max_tok)
         res = llm.generate_structured_output(_prompt_for(text, fields), schema, 'You are extracting book attributes. Use only information actually present in the text.')

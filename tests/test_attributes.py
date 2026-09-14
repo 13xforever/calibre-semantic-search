@@ -84,6 +84,31 @@ class FakeLLMSequence(FakeLLM):
         return SimpleNamespace(data=SimpleNamespace(**{f.name: data.get(f.name) for f in _FIELDS}), exception=None, error_details='')
 
 
+class ScriptedLLM(FakeLLM):
+    """Serves queued responses in order (one dict per call), recording each call's
+    prompt and schema. `fail_on` (1-based call number) makes that call raise."""
+
+    def __init__(self, responses=None, data=None, fail_on=None):
+        super().__init__(data)
+        self.responses = list(responses) if responses is not None else []
+        self.i = 0
+        self.fail_on = fail_on
+        self.prompts = []
+        self.schemas = []
+
+    def generate_structured_output(self, prompt, schema, instructions=''):
+        from types import SimpleNamespace
+
+        self.calls += 1
+        self.prompts.append(prompt)
+        self.schemas.append(schema)
+        if self.fail_on is not None and self.calls == self.fail_on:
+            return SimpleNamespace(data=None, exception=RuntimeError('boom'), error_details='boom')
+        raw = self.responses[self.i % len(self.responses)] if self.responses else self.data
+        self.i += 1
+        return SimpleNamespace(data=SimpleNamespace(**raw), exception=None, error_details='')
+
+
 _FIELDS = [utils.AttrField('gender', 'ss_gender', 'text', 'g'), utils.AttrField('tropes', 'ss_tropes', 'tags', 't')]
 
 
@@ -357,6 +382,85 @@ class TestExtract(unittest.TestCase):
         self.assertNotIn('ss_tropes', api.columns)
         self.assertEqual(api.fields['#ss_gender'], {20: 'female'})
         self.assertNotIn('#ss_tropes', api.fields)
+
+
+class TestFulltextReduce(unittest.TestCase):
+    """fulltext mode merges disagreeing text partials with one reduce LLM call."""
+
+    def _settings(self, context_tokens=3000):
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.attr_mode = 'fulltext'
+        # 3000 tokens -> ~6916 char budget, so [5000,5000,100] splits into 2 groups
+        settings.attr_context_tokens = context_tokens
+        attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
+        return settings
+
+    def test_identical_text_partials_skip_reduce(self):
+        store, api = FakeStore(), FakeApi()
+        llm = ScriptedLLM([{'gender': 'first person', 'tropes': ['x']}, {'gender': 'first person', 'tropes': ['y']}])
+        values = attributes.extract_book_attributes(1, api, store, self._settings(), llm=llm)
+        self.assertEqual(llm.calls, 2)  # map only, no reduce
+        self.assertEqual(values['gender'], 'first person')
+
+    def test_case_variant_partials_skip_reduce_keeps_first_spelling(self):
+        store, api = FakeStore(), FakeApi()
+        llm = ScriptedLLM([{'gender': 'First Person', 'tropes': ['x']}, {'gender': 'first person', 'tropes': ['y']}])
+        values = attributes.extract_book_attributes(2, api, store, self._settings(), llm=llm)
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(values['gender'], 'First Person')
+
+    def test_disagreeing_partials_run_one_reduce_call(self):
+        store, api = FakeStore(), FakeApi()
+        llm = ScriptedLLM([
+            {'gender': 'first person', 'tropes': ['x']},
+            {'gender': 'third person limited', 'tropes': ['y']},
+            {'gender': 'merged pov'},
+        ])
+        values = attributes.extract_book_attributes(3, api, store, self._settings(), llm=llm)
+        self.assertEqual(llm.calls, 3)
+        self.assertEqual(values['gender'], 'merged pov')
+        prompt = llm.prompts[2]
+        # both partials in book order, with the field description
+        self.assertLess(prompt.index('first person'), prompt.index('third person limited'))
+        self.assertIn(_FIELDS[0].description, prompt)
+        # the reduce schema carries only the disagreeing field
+        self.assertEqual(set(llm.schemas[2].__annotations__), {'gender'})
+
+    def test_reduce_failure_raises(self):
+        store, api = FakeStore(), FakeApi()
+        llm = ScriptedLLM(
+            [
+                {'gender': 'first person', 'tropes': ['x']},
+                {'gender': 'third person limited', 'tropes': ['y']},
+                {'gender': 'unreachable'},
+            ],
+            fail_on=3,
+        )
+        with self.assertRaises(RuntimeError):
+            attributes.extract_book_attributes(4, api, store, self._settings(), llm=llm)
+
+    def test_reduce_null_falls_back_to_first_partial(self):
+        store, api = FakeStore(), FakeApi()
+        llm = ScriptedLLM([{'gender': 'first person', 'tropes': ['x']}, {'gender': 'third person limited', 'tropes': ['y']}, {}])
+        values = attributes.extract_book_attributes(5, api, store, self._settings(), llm=llm)
+        self.assertEqual(llm.calls, 3)
+        self.assertEqual(values['gender'], 'first person')
+
+    def test_over_budget_drops_middle_portions(self):
+        store, api = FakeStore(), FakeApi()
+        settings = self._settings(context_tokens=1500)  # max_tok = 476
+        attributes._chunks_for_book = lambda s, bid: ['x' * 1000] * 8  # 8 groups of ~286 tokens
+        parts = [f'partial number {i} ' + 'x' * 350 for i in range(8)]
+        llm = ScriptedLLM([{'gender': p, 'tropes': [f't{i}']} for i, p in enumerate(parts)] + [{'gender': 'final merged'}])
+        values = attributes.extract_book_attributes(6, api, store, settings, llm=llm)
+        self.assertEqual(llm.calls, 9)
+        self.assertEqual(values['gender'], 'final merged')
+        prompt = llm.prompts[8]
+        n_portions = prompt.count('  portion ')
+        self.assertLess(n_portions, 8)
+        self.assertIn(parts[0], prompt)  # first kept
+        self.assertIn(parts[7], prompt)  # last kept
 
 
 class TestSyncColumns(unittest.TestCase):

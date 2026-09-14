@@ -69,6 +69,14 @@ DEFAULT_ATTRIBUTES = (
         'tags',
         "Content warnings for sensitive material, e.g. 'violence', 'self-harm', 'abuse', 'suicide'. Only include if actually present.",
     ),
+    AttrField(
+        'blurb',
+        'ss_blurb',
+        'text',
+        "A spoiler-free marketing blurb in the style of a publisher's back cover, written in the language of the book: 1-3 short paragraphs covering the premise, the protagonist(s) and the central conflict or stakes. Never reveal plot twists, outcomes, deaths or how it ends.",
+        enabled=True,
+        exposed=False,
+    ),
 )
 
 
@@ -123,7 +131,10 @@ def _settings_from_dict(data: dict[str, Any]) -> Settings:
                     setattr(base, f.name, item[f.name])
             merged.append(base)
         if merged:
-            ans.attributes = merged
+            # default fields added after this blob was saved (e.g. 'blurb') are
+            # appended so existing users gain them; saved values always win above
+            have = {a.name for a in merged}
+            ans.attributes = merged + [a.clone() for a in ans.attributes if a.name not in have]
     return ans
 
 

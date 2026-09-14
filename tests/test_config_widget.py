@@ -418,7 +418,8 @@ class TestAttrTableCollect(unittest.TestCase):
         w._collect_and_accept()
         attrs = w.settings().attributes
         self.assertEqual(len(attrs), len(defaults))
-        self.assertTrue(all(a.exposed for a in attrs))
+        # checkbox states round-trip the defaults (blurb ships un-exposed)
+        self.assertEqual([a.exposed for a in attrs], [a.exposed for a in defaults])
         self.assertEqual([a.type for a in attrs], [a.type for a in defaults])
 
     def test_exposed_checkbox_and_type_combo(self):
