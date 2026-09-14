@@ -9,7 +9,7 @@ Public API (used by indexer/dialog/attributes):
       search_book(query_vec, book_id, min_score=0.0, model=None) -> list[SearchResult]
       book_chunks_text(book_id) -> list[str]
      get_meta / set_meta / delete_meta / meta_keys(prefix)
-     set_attrs / get_attrs / clear_attrs / attr_book_ids / attrs_fields
+      set_attrs / get_attrs / all_attrs / clear_attrs / attr_book_ids / attrs_fields
     set_failed / clear_failed / wipe_failed / failed_book_ids / failed_entries
     cleanup_stale_models(current_model=None)
     close
@@ -727,6 +727,20 @@ class MetaStore:
         except Exception:
             return {}
         return data if isinstance(data, dict) else {}
+
+    def all_attrs(self) -> dict:
+        """{book_id: values dict} for every book with stored attributes (one query)."""
+        with self._lock:
+            rows = self.conn.execute('SELECT book_id, json FROM attrs_raw').fetchall()
+        out = {}
+        for bid, raw in rows:
+            try:
+                data = json.loads(raw or '{}')
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                out[bid] = data
+        return out
 
     def clear_attrs(self, book_id: int):
         with self._lock:
@@ -1959,6 +1973,9 @@ class VectorStore:
 
     def get_attrs(self, book_id):
         return self.meta.get_attrs(book_id)
+
+    def all_attrs(self):
+        return self.meta.all_attrs()
 
     def clear_attrs(self, book_id):
         self.meta.clear_attrs(book_id)

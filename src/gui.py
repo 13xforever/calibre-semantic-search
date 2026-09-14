@@ -70,9 +70,9 @@ class _GuiDbProxy:
 
     The real new_api is resolved lazily via a getter so the proxy stays valid
     across library switches. calibre's newAPI is not safe to write from a worker
-    thread, so create_custom_column and set_field are marshalled to the GUI thread
-    synchronously; everything else (reads such as backend.custom_column_label_map)
-    passes straight through.
+    thread, so create_custom_column, delete_custom_column and set_field are
+    marshalled to the GUI thread synchronously; everything else (reads such as
+    backend.custom_column_label_map) passes straight through.
     '''
 
     def __init__(self, action, get_real):
@@ -90,6 +90,9 @@ class _GuiDbProxy:
 
     def create_custom_column(self, *a, **k):
         self._action._run_db_write('create_custom_column', a, k)
+
+    def delete_custom_column(self, *a, **k):
+        self._action._run_db_write('delete_custom_column', a, k)
 
     def set_field(self, *a, **k):
         self._action._run_db_write('set_field', a, k)
@@ -549,8 +552,30 @@ class SemanticSearchAction(InterfaceAction):
         try:
             if self.indexer is not None:
                 self.indexer.reconcile()
+            self._sync_attr_columns()
         except Exception as e:
             print(f'semantic search: reconcile failed: {e!r}')
+
+    def _sync_attr_columns(self):
+        """Mirror the exposed-attribute set into calibre custom columns.
+
+        Runs off the GUI thread: column writes go through the indexer's db proxy,
+        which marshals them to the GUI thread (and would deadlock if called from it).
+        Idempotent — a no-op once the columns already match the settings.
+        """
+        if self.store is None or self.indexer is None:
+            return
+        try:
+            from .attributes import sync_attribute_columns
+
+            sync_attribute_columns(self.indexer.attr_writer, self.store, self.get_settings())
+        except Exception as e:
+            print(f'semantic search: attribute column sync failed: {e!r}')
+
+    def _sync_attr_columns_async(self):
+        t = threading.Thread(target=self._sync_attr_columns, name='SSAttrColumns', daemon=True)
+        self._attr_sync_thread = t
+        t.start()
 
     def shutting_down(self):
         try:
@@ -658,22 +683,27 @@ class SemanticSearchAction(InterfaceAction):
         )
         if w.exec() == 1:
             save_settings(gprefs, w.settings())
-            self._apply_library_storage(w)
+            restarted = self._apply_library_storage(w)
             if self.store is None and self._blocked_dep is not None:
                 # a package may have been (re)installed in the dialog: retry the open
                 # so a blocked library comes back without switching libraries first
                 self._start_for_library()
+            elif not restarted:
+                # library stays open: apply attribute-column exposure now (the
+                # startup reconcile does the same, as a safety net)
+                self._sync_attr_columns_async()
 
     def _apply_library_storage(self, w):
         """Apply the backend/compression chosen in settings to the current library.
 
         The choices are written per-library (meta keys) and take effect on the next
         open; if data must move or be re-compressed, that runs in the background
-        before indexing starts.
+        before indexing starts. Returns True when the library was restarted to
+        apply a change (False = nothing to apply, or already handled elsewhere).
         """
         choice = w.backend_choice()
         if choice is None:
-            return  # no library context: only the global defaults changed
+            return False  # no library context: only the global defaults changed
         cur_backend = self.store.want_backend if self.store is not None else self._blocked_want
         codec = w.codec_choice()
         cur_codec = self.store.stored_codec() if self.store is not None else ('zstd' if self._blocked_dep == 'zstandard' else None)
@@ -682,7 +712,7 @@ class SemanticSearchAction(InterfaceAction):
         # the chunks are stored with, so a different value means a conversion
         codec_changed = choice == 'sqlite' and codec is not None and codec != cur_codec
         if not backend_changed and not codec_changed:
-            return
+            return False
         ft = getattr(self, '_finalize_thread', None)
         if ft is not None and ft.is_alive():
             from calibre.gui2 import info_dialog
@@ -693,7 +723,7 @@ class SemanticSearchAction(InterfaceAction):
                 'A database migration is already running. The storage change will apply after it finishes (or on the next restart).',
                 show=True,
             )
-            return
+            return False
         try:
             if self.store is not None:
                 if backend_changed:
@@ -722,8 +752,9 @@ class SemanticSearchAction(InterfaceAction):
             from calibre.gui2 import error_dialog
 
             error_dialog(self.gui, 'Semantic search', f'Could not change this library\'s storage settings:\n{e}', show=True)
-            return
+            return False
         self._start_for_library()  # reopens and runs the migration in the background
+        return True
 
     def open_dialog(self):
         if not self._ensure_started():

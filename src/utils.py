@@ -35,6 +35,7 @@ class AttrField:
     type: str  # 'text' or 'tags'
     description: str
     enabled: bool = True
+    exposed: bool = True  # mirror into a calibre custom column (False = stored internally only)
 
     def clone(self) -> 'AttrField':
         return AttrField(**asdict(self))
@@ -88,6 +89,10 @@ class Settings:
 
     def enabled_attributes(self) -> list[AttrField]:
         return [a for a in self.attributes if a.enabled]
+
+    def exposed_attributes(self) -> list[AttrField]:
+        """Fields that get a calibre custom column: extracted AND mirrored."""
+        return [a for a in self.attributes if a.enabled and a.exposed]
 
 
 def _settings_from_dict(data: dict[str, Any]) -> Settings:

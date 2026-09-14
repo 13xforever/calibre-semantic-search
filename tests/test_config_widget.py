@@ -92,6 +92,20 @@ def _install_stubs():
             self._current = t
             self.currentTextChanged.emit(t)
 
+    class QLineEdit(_W):
+        def __init__(self, text=''):
+            self._text = text
+
+        def text(self):
+            return self._text
+
+    class QPlainTextEdit(_W):
+        def __init__(self, text=''):
+            self._text = text
+
+        def toPlainText(self):
+            return self._text
+
     class QFormLayout(_W):
         FieldGrowthPolicy = types.SimpleNamespace(ExpandingFieldsGrow=1)
 
@@ -103,6 +117,7 @@ def _install_stubs():
         def __init__(self, rows=0, cols=0):
             self._cols = cols
             self._grid = [[None] * cols for _ in range(rows)]
+            self._cells = {}
 
         def horizontalHeader(self):
             return _Header()
@@ -114,6 +129,12 @@ def _install_stubs():
 
         def item(self, r, c):
             return self._grid[r][c]
+
+        def setCellWidget(self, r, c, w):
+            self._cells[(r, c)] = w
+
+        def cellWidget(self, r, c):
+            return self._cells.get((r, c))
 
         def rowCount(self):
             return len(self._grid)
@@ -139,11 +160,13 @@ def _install_stubs():
             self.accepted = _Sig()
             self.rejected = _Sig()
 
-    for name in ('QCheckBox', 'QDoubleSpinBox', 'QGridLayout', 'QHBoxLayout', 'QLineEdit',
-                 'QMessageBox', 'QPlainTextEdit', 'QSpinBox', 'QTabWidget', 'QTextEdit',
+    for name in ('QCheckBox', 'QDoubleSpinBox', 'QGridLayout', 'QHBoxLayout',
+                 'QMessageBox', 'QSpinBox', 'QTabWidget', 'QTextEdit',
                  'QVBoxLayout', 'QWidget'):
         setattr(qtcore, name, type(name, (_W,), {}))
 
+    qtcore.QLineEdit = QLineEdit
+    qtcore.QPlainTextEdit = QPlainTextEdit
     qtcore.QDialog = QDialog
     qtcore.QObject = QObject
     qtcore.QThread = QThread
@@ -371,6 +394,53 @@ class TestZstandardUninstallGate(unittest.TestCase):
         w = self._widget({'zstandard', 'lancedb'}, lib_backend='lancedb', lib_codec=None)
         self.assertFalse(w._dep_rows['lancedb']['button'].enabled)
         self.assertTrue(self._zstd_row(w)['button'].enabled)
+
+
+class TestAttrTableCollect(unittest.TestCase):
+    """The attribute table's Add-column checkbox and Type dropdown feed the saved schema."""
+
+    def setUp(self):
+        self._saved = (cfgw.dep_in_root, cfgw.external_deps_disabled, cfgw.lancedb_status, cfgw.zstandard_status)
+        cfgw.external_deps_disabled = lambda: False
+        cfgw.lancedb_status = lambda: (True, 'stub')
+        cfgw.zstandard_status = lambda: (True, 'stub')
+
+    def tearDown(self):
+        cfgw.dep_in_root, cfgw.external_deps_disabled, cfgw.lancedb_status, cfgw.zstandard_status = self._saved
+
+    def _widget(self):
+        cfgw.dep_in_root = lambda dep: False
+        return cfgw.SettingsWidget(utils.Settings())
+
+    def test_defaults_collected(self):
+        w = self._widget()
+        defaults = utils.Settings().attributes
+        w._collect_and_accept()
+        attrs = w.settings().attributes
+        self.assertEqual(len(attrs), len(defaults))
+        self.assertTrue(all(a.exposed for a in attrs))
+        self.assertEqual([a.type for a in attrs], [a.type for a in defaults])
+
+    def test_exposed_checkbox_and_type_combo(self):
+        w = self._widget()
+        # un-expose the first field and switch its type via the dropdown
+        w.attr_table.item(0, 1).setCheckState(cfgw.Qt.CheckState.Unchecked)
+        w.attr_table.cellWidget(0, 3).setCurrentText('tags')
+        w._collect_and_accept()
+        a = w.settings().attributes[0]
+        self.assertFalse(a.exposed)
+        self.assertEqual(a.type, 'tags')
+        # the other rows are untouched
+        self.assertTrue(w.settings().attributes[1].exposed)
+
+    def test_add_attr_defaults(self):
+        w = self._widget()
+        n = w.attr_table.rowCount()
+        w._add_attr()
+        self.assertEqual(w.attr_table.rowCount(), n + 1)
+        self.assertEqual(w.attr_table.item(n, 2).text(), 'new_field')
+        self.assertEqual(w.attr_table.item(n, 1).checkState(), cfgw.Qt.CheckState.Checked)
+        self.assertEqual(w.attr_table.cellWidget(n, 3).currentText(), 'text')
 
 
 if __name__ == '__main__':

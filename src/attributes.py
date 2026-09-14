@@ -30,19 +30,63 @@ def human_name(name: str) -> str:
 
 
 def ensure_columns(new_api, settings) -> dict[str, str]:
-    """Ensure a custom column exists for every enabled attribute.
+    """Ensure a custom column exists for every exposed attribute.
 
     Returns {field.name: '#label'}. Multi-value ('tags') fields use datatype
     'text' with is_multiple=True (the same mechanism calibre uses for #tags).
     """
     out = {}
     existing = new_api.backend.custom_column_label_map
-    for f in settings.enabled_attributes():
+    for f in settings.exposed_attributes():
         if f.label not in existing:
             new_api.create_custom_column(f.label, human_name(f.name), 'text', f.type == 'tags')
             existing = new_api.backend.custom_column_label_map
         out[f.name] = column_key(f.label)
     return out
+
+
+def sync_attribute_columns(api, store, settings) -> None:
+    """Make the library's custom columns match the attribute schema.
+
+    Exposed fields get their column created if needed and backfilled from the
+    plugin store (attrs_raw is the source of truth, so no LLM calls are made).
+    Configured fields whose column was switched off have their column deleted.
+    Best-effort: a per-operation failure is logged, not raised. Idempotent —
+    a no-op once the columns already match the settings.
+    """
+    existing = api.backend.custom_column_label_map
+    for f in settings.attributes:
+        if f.exposed or f.label not in existing:
+            continue
+        try:
+            api.delete_custom_column(label=f.label)
+        except Exception as e:
+            print(f'semantic search: could not delete column {f.label}: {e!r}')
+        else:
+            existing = api.backend.custom_column_label_map
+    exposed = settings.exposed_attributes()
+    if not exposed:
+        return
+    colmap = ensure_columns(api, settings)
+    stored = store.all_attrs()
+    for f in exposed:
+        mapping = {}
+        for bid, values in stored.items():
+            v = values.get(f.name)
+            if f.type == 'tags':
+                v = [str(x).strip() for x in (v or []) if str(x).strip()]
+                if not v:
+                    continue
+            else:
+                v = '' if v is None else str(v).strip()
+                if not v:
+                    continue
+            mapping[bid] = v
+        if mapping:
+            try:
+                api.set_field(colmap[f.name], mapping)
+            except Exception as e:
+                print(f'semantic search: could not backfill column {f.label}: {e!r}')
 
 
 def build_schema_class(fields):
@@ -293,6 +337,8 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
         colmap = ensure_columns(new_api, settings)
         updates: dict[str, dict[int, Any]] = {}
         for f in fields:
+            if not f.exposed or f.name not in colmap:
+                continue  # stored in attrs_raw only, no calibre column
             key = colmap[f.name]
             val = values.get(f.name)
             if f.type == 'tags':

@@ -51,6 +51,9 @@ class FakeStore:
     def get_attrs(self, book_id):
         return self.attrs.get(book_id, {})
 
+    def all_attrs(self):
+        return {k: dict(v) for k, v in self.attrs.items()}
+
     # attributes._chunks_for_book pokes at store.conn; emulate via monkeypatch in tests
 
 
@@ -100,6 +103,12 @@ class FakeApi:
 
     def create_custom_column(self, label, name, datatype, is_multiple):
         self.columns[label] = {'label': label}
+
+    def delete_custom_column(self, label=None, num=None):
+        if label is not None and label in self.columns:
+            del self.columns[label]
+        elif label is not None:
+            raise ValueError('No such column')
 
     def set_field(self, key, mapping):
         self.fields.setdefault(key, {}).update(mapping)
@@ -330,6 +339,80 @@ class TestExtract(unittest.TestCase):
         calls = []
         attributes.extract_book_attributes(3, api, store, settings, llm=llm, progress_cb=lambda d, t: calls.append((d, t)))
         self.assertEqual(calls, [])
+
+    def test_extraction_stores_but_skips_unexposed_column(self):
+        store = FakeStore()
+        api = FakeApi()
+        llm = FakeLLM({'gender': 'female', 'tropes': ['slow burn']})
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.attributes[1].exposed = False  # tropes: stored internally only
+        attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
+        values = attributes.extract_book_attributes(20, api, store, settings, llm=llm)
+        # source of truth gets everything...
+        self.assertEqual(values['gender'], 'female')
+        self.assertEqual(store.attrs[20]['tropes'], ['slow burn'])
+        # ...but only the exposed field is mirrored into a column
+        self.assertIn('ss_gender', api.columns)
+        self.assertNotIn('ss_tropes', api.columns)
+        self.assertEqual(api.fields['#ss_gender'], {20: 'female'})
+        self.assertNotIn('#ss_tropes', api.fields)
+
+
+class TestSyncColumns(unittest.TestCase):
+    """sync_attribute_columns converges the library's columns on the schema."""
+
+    def _settings(self, gender_exposed=True, tropes_exposed=True):
+        s = utils.Settings()
+        g = utils.AttrField('gender', 'ss_gender', 'text', 'g')
+        t = utils.AttrField('tropes', 'ss_tropes', 'tags', 't')
+        t.exposed = tropes_exposed
+        g.exposed = gender_exposed
+        s.attributes = [g, t]
+        return s
+
+    def test_creates_columns_and_backfills_from_store(self):
+        store = FakeStore()
+        store.attrs[1] = {'gender': 'female', 'tropes': ['slow burn']}
+        store.attrs[2] = {'gender': '', 'tropes': []}  # empty values are skipped
+        api = FakeApi()
+        attributes.sync_attribute_columns(api, store, self._settings())
+        self.assertEqual(sorted(api.columns), ['ss_gender', 'ss_tropes'])
+        self.assertEqual(api.fields['#ss_gender'], {1: 'female'})
+        self.assertEqual(api.fields['#ss_tropes'], {1: ['slow burn']})
+
+    def test_deletes_columns_of_unexposed_fields(self):
+        store = FakeStore()
+        store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
+        api = FakeApi()
+        api.columns['ss_gender'] = {'label': 'ss_gender'}
+        api.columns['ss_tropes'] = {'label': 'ss_tropes'}
+        attributes.sync_attribute_columns(api, store, self._settings(gender_exposed=False, tropes_exposed=False))
+        self.assertEqual(api.columns, {})
+        self.assertEqual(api.fields, {})
+
+    def test_mixed_exposure(self):
+        store = FakeStore()
+        store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
+        api = FakeApi()
+        api.columns['ss_tropes'] = {'label': 'ss_tropes'}  # stale column of the un-exposed field
+        attributes.sync_attribute_columns(api, store, self._settings(tropes_exposed=False))
+        self.assertNotIn('ss_tropes', api.columns)  # deleted
+        self.assertIn('ss_gender', api.columns)  # created
+        self.assertEqual(api.fields['#ss_gender'], {1: 'female'})
+        self.assertNotIn('#ss_tropes', api.fields)
+
+    def test_idempotent_noop_when_converged(self):
+        store = FakeStore()
+        store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
+        api = FakeApi()
+        api.columns['ss_gender'] = {'label': 'ss_gender'}
+        api.columns['ss_tropes'] = {'label': 'ss_tropes'}
+        attributes.sync_attribute_columns(api, store, self._settings())
+        # re-running must not duplicate or drop anything
+        attributes.sync_attribute_columns(api, store, self._settings())
+        self.assertEqual(sorted(api.columns), ['ss_gender', 'ss_tropes'])
+        self.assertEqual(api.fields['#ss_gender'], {1: 'female'})
 
 
 if __name__ == '__main__':

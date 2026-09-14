@@ -77,6 +77,35 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertNotIn(s.attributes[0].name, [a.name for a in en])
         self.assertEqual(len(en), len(s.attributes) - 1)
 
+    def test_exposed_roundtrip(self):
+        get, set_ = self._prefs()
+        s = utils.load_settings(get)
+        s.attributes[0].exposed = False
+        utils.save_settings(set_, s)
+        s2 = utils.load_settings(get)
+        self.assertFalse(s2.attributes[0].exposed)
+        self.assertTrue(s2.attributes[1].exposed)
+
+    def test_legacy_json_without_exposed_defaults_true(self):
+        # prefs written before the 'exposed' flag existed must keep mirroring on
+        get, set_ = self._prefs()
+        import json as _json
+
+        data = {'attributes': [{'name': 'pov', 'label': 'ss_pov', 'type': 'text', 'description': 'x', 'enabled': True}]}
+        set_(utils.PREF_KEY, _json.dumps(data))
+        s = utils.load_settings(get)
+        pov = next(a for a in s.attributes if a.name == 'pov')
+        self.assertTrue(pov.exposed)
+
+    def test_exposed_attributes(self):
+        s = utils.Settings()
+        s.attributes[0].enabled = False
+        s.attributes[1].exposed = False
+        names = [a.name for a in s.exposed_attributes()]
+        self.assertNotIn(s.attributes[0].name, names)  # disabled
+        self.assertNotIn(s.attributes[1].name, names)  # not exposed
+        self.assertEqual(len(names), len(s.attributes) - 2)
+
 
 class _WheelBuilder:
     """Craft a minimal but valid .whl so install/uninstall can run fully offline."""
