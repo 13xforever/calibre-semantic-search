@@ -203,6 +203,31 @@ class TestAttrPhase(unittest.TestCase):
         self.assertEqual(vs.failed_book_ids('attr'), [])
         vs.close()
 
+    def test_phase_interrupts_when_dirty_work_appears(self):
+        # a re-index queued mid-phase (Book Details context menu) must preempt the
+        # phase so the main loop can drain the dirty queue before more LLM calls
+        vs, ix, settings, statuses, done, writer = self._make()
+        llm = FakeLLM({'gender': 'f'})
+        inner = llm.generate_structured_output
+        state = {'added': False}
+
+        def gen(*a, **kw):
+            r = inner(*a, **kw)
+            if not state['added']:
+                state['added'] = True
+                vs.add_dirty(9, 'reindex')
+            return r
+
+        llm.generate_structured_output = gen
+        completed = ix._process_attributes([1, 2], settings, llm=llm)
+        self.assertFalse(completed)
+        # the first book finished before the dirty entry appeared; the second was skipped
+        self.assertEqual(vs.get_attrs(1)['gender'], 'f')
+        self.assertEqual(vs.get_attrs(2), {})
+        self.assertNotIn('attributes_done', [s['state'] for s in statuses])
+        self.assertEqual(done, [])
+        vs.close()
+
 
 def _index_book(vs, bid):
     vs.upsert_book(bid, 'EPUB', 1, 'm')
@@ -260,6 +285,16 @@ class TestForcedAttrExtraction(unittest.TestCase):
         self.assertEqual(ix._attr_phase_books(settings), [1])
         vs.close()
 
+    def test_forced_pending_book_jumps_to_front(self):
+        # a book that is normally pending (no attrs yet, e.g. first run) must also
+        # jump to the front when explicitly requested — not stay in id order
+        vs, ix, settings, *_ = self._make()
+        for bid in (1, 2, 3):
+            _index_book(vs, bid)
+        ix.request_attributes(1)
+        self.assertEqual(ix._attr_phase_books(settings), [1, 3, 2])
+        vs.close()
+
     def test_phase_books_forced_front_pending_newest_first(self):
         vs, ix, settings, *_ = self._make()
         for bid in (1, 5, 3):
@@ -288,6 +323,40 @@ class TestForcedAttrExtraction(unittest.TestCase):
         ix.request_attributes(7)
         ix._process_attributes(ix._attr_phase_books(settings), settings, llm=FailingLLM())
         self.assertEqual(vs.failed_book_ids('attr'), [7])
+        self.assertEqual(ix._forced_attrs, set())
+        vs.close()
+
+    def test_phase_interrupts_on_new_forced_request(self):
+        # a re-extraction requested mid-phase (Book Details context menu) must
+        # restart the phase with the forced book first, not wait for it to finish
+        vs, ix, settings, statuses, done = self._make()
+        _index_book(vs, 1)  # pending
+        _index_book(vs, 2)  # pending
+        _index_book(vs, 3)
+        vs.set_attrs(3, {'gender': 'old', 'tropes': []})  # stored -> not pending
+        llm = FakeLLM({'gender': 'f'})
+        inner = llm.generate_structured_output
+        state = {'forced': False}
+
+        def gen(*a, **kw):
+            r = inner(*a, **kw)
+            if not state['forced']:
+                state['forced'] = True
+                ix.request_attributes(3)
+            return r
+
+        llm.generate_structured_output = gen
+        completed = ix._process_attributes(ix._attr_phase_books(settings), settings, llm=llm)
+        self.assertFalse(completed)
+        # book 2 (first in descending order) finished before the request arrived
+        self.assertEqual(vs.get_attrs(2)['gender'], 'f')
+        self.assertEqual(vs.get_attrs(1), {})
+        self.assertEqual(done, [])
+        # restarting puts the forced book first; book 2 is no longer pending
+        self.assertEqual(ix._attr_phase_books(settings), [3, 1])
+        completed = ix._process_attributes([3, 1], settings, llm=FakeLLM({'gender': 'f'}))
+        self.assertTrue(completed)
+        self.assertEqual(vs.get_attrs(3)['gender'], 'f')
         self.assertEqual(ix._forced_attrs, set())
         vs.close()
 

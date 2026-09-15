@@ -202,13 +202,15 @@ class Indexer(threading.Thread):
     def _attr_phase_books(self, settings) -> list[int]:
         """Books for the next attribute phase.
 
-        Forced re-extractions (explicit user requests) go first; the normal pending
-        books follow newest-first (descending book id).
+        Forced re-extractions (explicit user requests) go first — even when they are
+        also normally pending, so a request always jumps the queue; the remaining
+        pending books follow newest-first (descending book id).
         """
         attr_pending = self._pending_attr_books(settings)
         with self._forced_lock:
-            forced = [b for b in sorted(self._forced_attrs, reverse=True) if b not in attr_pending]
-        return forced + sorted(attr_pending, reverse=True)
+            forced = sorted(self._forced_attrs, reverse=True)
+        forced_set = set(forced)
+        return forced + [b for b in sorted(attr_pending, reverse=True) if b not in forced_set]
 
     def _drop_forced(self, book_id):
         with self._forced_lock:
@@ -225,8 +227,11 @@ class Indexer(threading.Thread):
 
         Runs only after the indexing (embedding) queue is empty, so all embedding
         work is batched before any LLM calls (the two use different models).
-        Returns True if the phase ran to completion, False if it was interrupted
-        by a pause or shutdown (remaining books are picked up on a later pass).
+        Returns True if the phase ran to completion, False if it was interrupted —
+        by a pause or shutdown, or because new higher-priority work appeared
+        (dirty re-index entries, or a forced re-extraction requested while the
+        phase is running) — so the main loop can re-prioritize. The remaining
+        books are picked up on a later pass with a fresh list.
         """
         if llm is None:
             try:
@@ -245,9 +250,16 @@ class Indexer(threading.Thread):
 
         total = len(pending)
         errors: list[tuple[int, str]] = []
+        with self._forced_lock:
+            forced_snapshot = set(self._forced_attrs)
         for i, bid in enumerate(pending):
             if self.stop_event.is_set() or self._paused.is_set():
                 return False  # interrupted; the phase resumes on a later pass
+            if self.store.dirty_book_ids():
+                return False  # new (re)indexing work has priority; resume after it drains
+            with self._forced_lock:
+                if self._forced_attrs - forced_snapshot:
+                    return False  # a forced re-extraction was requested; restart so it goes first
             self._status('attributes', bid, done=i + 1, total=total)
 
             def progress(d, t, _bid=bid, _i=i):
