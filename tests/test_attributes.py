@@ -266,6 +266,58 @@ class TestTokenBudget(unittest.TestCase):
             self.assertLessEqual(attributes.estimate_tokens(g), 1700 + 5)
 
 
+class TestTextTokenBudget(unittest.TestCase):
+    """The per-call text budget accounts for the schema prompt + a safety margin."""
+
+    def _fields(self, desc='g'):
+        return [utils.AttrField('gender', 'ss_gender', 'text', desc)]
+
+    def test_longer_descriptions_shrink_budget(self):
+        ctx = 163840
+        short = attributes._text_token_budget(ctx, self._fields('g'))
+        long = attributes._text_token_budget(ctx, self._fields('a very long field description ' * 25))
+        self.assertLess(long, short)
+
+    def test_larger_window_gives_larger_budget(self):
+        f = self._fields()
+        self.assertGreater(attributes._text_token_budget(163840, f), attributes._text_token_budget(8192, f))
+
+    def test_worst_case_message_stays_under_window(self):
+        # even if a full-budget group tokenizes at the safety rate (estimate undershoot),
+        # prompt + text still fit inside the configured window
+        ctx = 163840
+        f = self._fields()
+        b = attributes._text_token_budget(ctx, f)
+        prefix = attributes.estimate_tokens(attributes._prompt_for('', f))
+        self.assertLess(b * attributes.EST_SAFETY_FACTOR + prefix, ctx)
+
+
+class TestBalancedSplit(unittest.TestCase):
+    """fulltext groups are balanced (not full,full,...,leftover) and stay within budget."""
+
+    def test_partition_is_contiguous_and_in_order(self):
+        chunks = [f'chunk{i} ' + 'a' * 900 for i in range(30)]
+        groups = attributes._split_for_map(chunks, group_tokens=4000)
+        flat = []
+        for g in groups:
+            flat.extend(g.split('\n\n'))
+        self.assertEqual(flat, chunks)
+
+    def test_groups_are_evenly_sized(self):
+        chunks = ['a' * 1000 for _ in range(40)]  # ~286 est tokens each
+        groups = attributes._split_for_map(chunks, group_tokens=5000)
+        ests = [attributes.estimate_tokens(g) for g in groups]
+        self.assertGreater(len(groups), 1)
+        self.assertLess(max(ests), 2 * min(ests))  # balanced, not full+leftover
+
+    def test_no_group_exceeds_budget(self):
+        chunks = ['a' * 1000 for _ in range(40)]
+        budget = 5000
+        groups = attributes._split_for_map(chunks, group_tokens=budget)
+        for g in groups:  # each chunk (~286) is far under the budget
+            self.assertLessEqual(attributes.estimate_tokens(g), budget)
+
+
 class TestBuildSchema(unittest.TestCase):
     def test_annotations(self):
         cls = attributes.build_schema_class(_FIELDS)
@@ -315,7 +367,7 @@ class TestExtract(unittest.TestCase):
         settings = utils.Settings()
         settings.attributes = [f.clone() for f in _FIELDS]
         settings.attr_mode = 'fulltext'
-        # 3000 tokens -> ~6916 char budget, so [5000,5000,100] splits into 2 groups
+        # window 3000 -> ~1564-token text budget, so [5000,5000,100] (~2887 est tokens) splits into 2 groups
         settings.attr_context_tokens = 3000
         attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
         try:
@@ -342,7 +394,7 @@ class TestExtract(unittest.TestCase):
         settings = utils.Settings()
         settings.attributes = [f.clone() for f in _FIELDS]
         settings.attr_mode = 'fulltext'
-        # 3000 tokens -> ~6916 char budget, so [5000,5000,100] splits into 2 groups
+        # window 3000 -> ~1564-token text budget, so [5000,5000,100] (~2887 est tokens) splits into 2 groups
         settings.attr_context_tokens = 3000
         attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
         llm = FakeLLMSequence([
@@ -361,7 +413,7 @@ class TestExtract(unittest.TestCase):
         settings = utils.Settings()
         settings.attributes = [f.clone() for f in _FIELDS]
         settings.attr_mode = 'fulltext'
-        # 3000 tokens -> ~6916 char budget, so [5000,5000,100] splits into 2 groups
+        # window 3000 -> ~1564-token text budget, so [5000,5000,100] (~2887 est tokens) splits into 2 groups
         settings.attr_context_tokens = 3000
         attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
         calls = []
@@ -421,7 +473,7 @@ class TestFulltextReduce(unittest.TestCase):
         settings = utils.Settings()
         settings.attributes = [f.clone() for f in _FIELDS]
         settings.attr_mode = 'fulltext'
-        # 3000 tokens -> ~6916 char budget, so [5000,5000,100] splits into 2 groups
+        # window 3000 -> ~1564-token text budget, so [5000,5000,100] (~2887 est tokens) splits into 2 groups
         settings.attr_context_tokens = context_tokens
         attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
         return settings
@@ -479,7 +531,7 @@ class TestFulltextReduce(unittest.TestCase):
 
     def test_over_budget_drops_middle_portions(self):
         store, api = FakeStore(), FakeApi()
-        settings = self._settings(context_tokens=1500)  # max_tok = 476
+        settings = self._settings(context_tokens=1500)  # small window -> 8 one-chunk map groups + a reduce that drops middle portions
         attributes._chunks_for_book = lambda s, bid: ['x' * 1000] * 8  # 8 groups of ~286 tokens
         parts = [f'partial number {i} ' + 'x' * 350 for i in range(8)]
         llm = ScriptedLLM([{'gender': p, 'tropes': [f't{i}']} for i, p in enumerate(parts)] + [{'gender': 'final merged'}])

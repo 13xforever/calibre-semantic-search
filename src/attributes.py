@@ -12,13 +12,25 @@ from typing import Annotated, Any, Optional
 from .chunker import CHARS_PER_TOKEN, estimate_tokens
 
 DEFAULT_CONTEXT_TOKENS = 8192
-OVERHEAD_TOKENS = 1024  # reserved for prompt + field schema + output + safety margin
+OVERHEAD_TOKENS = 1024  # tokens held back for the model's structured output + wrapper; the per-schema prompt size is measured and subtracted separately (see _text_token_budget)
+EST_SAFETY_FACTOR = 1.13  # headroom for estimate_tokens undershooting the model's real tokenizer
 MIN_TEXT_CHARS = 2000  # floor so a tiny context limit still yields a usable sample
 
 
 def text_budget_chars(context_tokens: int) -> int:
     """Book-text character budget per LLM call, derived from the model's context limit."""
     return max(MIN_TEXT_CHARS, int((context_tokens - OVERHEAD_TOKENS) * CHARS_PER_TOKEN))
+
+
+def _text_token_budget(context_tokens: int, fields) -> int:
+    """Book-text token budget per LLM call for a schema and model window.
+
+    Holds back a safety-scaled slice of the window, then subtracts the actual
+    prompt size for THIS schema (which grows with user-added fields/descriptions)
+    and the output/wrapper reserve. estimate_tokens can undershoot the model's
+    real tokenizer, so EST_SAFETY_FACTOR keeps realized messages inside the window."""
+    prefix_est = estimate_tokens(_prompt_for('', fields))
+    return max(1, int(context_tokens / EST_SAFETY_FACTOR) - prefix_est - OVERHEAD_TOKENS)
 
 
 def column_key(label: str) -> str:
@@ -218,9 +230,14 @@ def sample_text(chunks: list[str], max_chars: int | None = None, max_tokens: int
 def _split_for_map(chunks: list[str], group_chars: int | None = None, group_tokens: int | None = None):
     if group_tokens is not None:
         toks = [estimate_tokens(c) for c in chunks]
+        total = sum(toks)
+        # ceil(total / budget): Python's // floors, so -(-a // b) is the integer ceil idiom.
+        n_groups = max(1, -(-total // max(1, group_tokens)))
+        target = total / n_groups  # even share; closing at it keeps groups balanced
         groups, cur, used = [], [], 0
         for c, t in zip(chunks, toks):
-            if cur and used + t > group_tokens:
+            # close early to keep groups even-sized, and never let a group exceed the budget
+            if cur and (used >= target or used + t > group_tokens):
                 groups.append('\n\n'.join(cur))
                 cur, used = [], 0
             cur.append(c)
@@ -425,7 +442,7 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
     chunks = _chunks_for_book(store, book_id)
     if not chunks:
         return {}
-    max_tok = settings.attr_context_tokens - OVERHEAD_TOKENS
+    max_tok = _text_token_budget(settings.attr_context_tokens, fields)
 
     values: dict[str, Any] = {}
     if settings.attr_mode == 'fulltext':
