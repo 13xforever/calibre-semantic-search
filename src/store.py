@@ -25,8 +25,9 @@ it where the data lives until the user picks another backend in settings, which
 VectorStore.finalize_schema() then carries out as a resumable cross-backend
 transfer. Chunk-text compression works the same way: meta['text_codec'] records
 the codec the chunks are actually stored with (zstd+dict or zlib), and a switch
-confirmed in settings is recorded as a meta['recompress'] marker that
-finalize_schema() executes as an in-place, resumable conversion — the marker is
+confirmed in settings — or a plugin update shipping a new default dictionary,
+detected on open — is recorded as a meta['recompress'] marker that
+finalize_schema() executes as an in-place, resumable conversion; the marker is
 deleted when it finishes. Opening a store whose data cannot be read with the
 currently installed packages raises MissingDependencyError.
 
@@ -318,7 +319,7 @@ DEFAULT_DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'as
 # Per-library choices and in-flight migration progress, all in the meta table:
 BACKEND_KEY = 'vector_backend'  # 'sqlite' | 'lancedb' — where this library's chunks should live
 MIGRATE_KEY = 'backend_migrate'  # JSON progress of an in-flight cross-backend transfer
-RECOMPRESS_KEY = 'recompress'  # JSON progress of a pending/in-flight sqlite codec conversion (written when the user confirms a compression switch)
+RECOMPRESS_KEY = 'recompress'  # JSON progress of a pending/in-flight sqlite codec conversion (written when the user confirms a compression switch, or on open when a shipped default-dictionary change is detected)
 VEC_MIGRATE_KEY = 'vec_migrate'  # JSON progress of an in-flight f32->f16 vector conversion (migrations.v3; deleted with the final user_version flip)
 
 
@@ -432,6 +433,12 @@ def ensure_codec_setup(meta: 'MetaStore'):
     usable codec: zstd when zstandard is available, zlib otherwise. Healing is only
     reachable for dataless libraries — a library whose chunks are stored with zstd
     but lacks the package is blocked in VectorStore.__init__ before this runs.
+
+    A plugin update may ship a new default dictionary: when a stored zstd record
+    holds a different one, the chunks must be re-compressed (old-dict frames do not
+    decode with the new dict), so a recompress marker is written and
+    finalize_schema() carries out the conversion — unless a conversion is already
+    in flight, whose progress must not be reset.
     """
     spec = None
     try:
@@ -441,6 +448,15 @@ def ensure_codec_setup(meta: 'MetaStore'):
     if spec is not None and spec.get('name') == 'zlib':
         return
     if spec is not None and spec.get('name') == 'zstd' and _module_available('zstandard'):
+        # A plugin update may ship a new default dictionary; frames compressed with
+        # the old one cannot be decoded with the new, so schedule an in-place
+        # re-compression (finalize_schema's 'codec' stage). An in-flight conversion
+        # is left alone — its progress must not be reset.
+        if (
+            spec.get('dictionary') != base64.b64encode(_load_default_dict()).decode('ascii')
+            and meta.get_meta(RECOMPRESS_KEY) is None
+        ):
+            write_codec_choice(meta, 'zstd')
         return
     meta.set_meta(TEXT_CODEC_KEY, codec_spec_json('zstd' if _module_available('zstandard') else 'zlib'))
 
@@ -1493,8 +1509,9 @@ class VectorStore:
         """Ordered migration stages still to run: 'schema', 'backend', 'codec', 'index'.
 
         The 'codec' stage is pending while a meta[RECOMPRESS_KEY] marker asks for a
-        conversion (written when the user confirms a compression switch); it is
-        deleted when the conversion finishes. A marker whose target package is
+        conversion (written when the user confirms a compression switch, or on open
+        when a shipped default-dictionary change is detected); it is deleted when
+        the conversion finishes. A marker whose target package is
         missing blocks the open in __init__, so here it always means the work can
         actually run. The lancedb 'index' stage is pending while any table with rows
         lacks its vector index or has a long unindexed tail; it needs no marker,
@@ -1823,9 +1840,12 @@ class VectorStore:
 
         In place and resumable: rows are updated in keyset batches, each batch
         committed together with its progress marker (meta[RECOMPRESS_KEY]); a row
-        already in the target format is recognized by magic bytes and skipped, so
-        a restart never double-converts. The codec meta flips only after every
-        table has been fully converted, then the marker is deleted."""
+        already in the target format is recognized and skipped, so a restart never
+        double-converts — for zstd that means a decode attempt with the target
+        codec (a dictionary change leaves valid zstd frames behind, so magic bytes
+        cannot tell converted rows apart), for zlib a magic-byte check. The codec
+        meta flips only after every table has been fully converted, then the
+        marker is deleted."""
         prog = self._recompress_progress()
         if prog is None or prog.get('target') not in ('zstd', 'zlib'):
             return  # no valid marker: nothing to do (pending_stages gates on it)
@@ -1839,13 +1859,14 @@ class VectorStore:
         dstc = TextCodec(target_spec)
         tables = self.backend._chunk_tables()
         done = set(prog.get('done') or [])
-        zstd_magic = b'\x28\xb5\x2f\xfd'
 
         def convert(blob):
             if prog['target'] == 'zstd':
-                if blob[:4] == zstd_magic:
-                    return None  # already converted
-                text = src.decompress(blob)
+                try:
+                    dstc.decompress(blob)
+                    return None  # already converted (decodes with the target dict)
+                except Exception:
+                    text = src.decompress(blob)
             else:
                 if blob[:1] == b'\x78':
                     return None

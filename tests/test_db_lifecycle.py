@@ -537,6 +537,80 @@ class TestCodecRecompress(_MigrateOps, unittest.TestCase):
         self.assertEqual(self._codec_name(self.s), 'zstd')
         self._check(self.s)
 
+    def test_dict_drift_recompresses_on_open(self):
+        # a plugin update ships a new default dictionary: on open, the stored zstd
+        # record holding the old one schedules an in-place re-compression
+        from unittest import mock
+
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        self.assertEqual(self._codec_name(s), 'zstd')  # zstandard is installed in the test env
+        self.assertIsNone(s.get_meta(store.RECOMPRESS_KEY))  # no drift while the dict matches
+        s.close()
+        self.s = None
+        new_dict = b'updated default compression dictionary' * 16
+        with mock.patch.object(store, '_load_default_dict', return_value=new_dict):
+            s = store.VectorStore(self.path, backend='sqlite')
+            self.s = s
+            self.assertEqual(store.json.loads(s.get_meta(store.RECOMPRESS_KEY))['target'], 'zstd')
+            self.assertEqual(s.pending_stages(), ['codec'])
+            self.assertTrue(s.needs_finalize())
+            stages = []
+            s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+            self.assertIsNone(s.get_meta(store.RECOMPRESS_KEY))
+            spec = store.json.loads(s.get_meta(store.TEXT_CODEC_KEY))
+            self.assertEqual(spec['name'], 'zstd')
+            self.assertEqual(spec['dictionary'], store.base64.b64encode(new_dict).decode('ascii'))
+            self.assertTrue(any(st == 'codec' for st, _ in stages))
+            self.assertFalse(s.needs_finalize())
+            self._check(s)  # the text round-trips through the new dictionary
+
+    def test_dict_drift_dataless_updates_spec_directly(self):
+        # a dataless library gets no marker — its record is simply updated to the new
+        # default dictionary, and data arriving afterwards uses it
+        from unittest import mock
+
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        old_dict = b'outdated default compression dictionary' * 16
+        s.set_meta(
+            store.TEXT_CODEC_KEY,
+            store.json.dumps({'name': 'zstd', 'dictionary': store.base64.b64encode(old_dict).decode('ascii')}),
+        )
+        s.close()
+        self.s = None
+        new_dict = b'updated default compression dictionary' * 16
+        with mock.patch.object(store, '_load_default_dict', return_value=new_dict):
+            s = store.VectorStore(self.path, backend='sqlite')
+            self.s = s
+            self.assertIsNone(s.get_meta(store.RECOMPRESS_KEY))
+            spec = store.json.loads(s.get_meta(store.TEXT_CODEC_KEY))
+            self.assertEqual(spec['dictionary'], store.base64.b64encode(new_dict).decode('ascii'))
+            self.assertEqual(s.pending_stages(), [])
+            self.assertFalse(s.needs_finalize())
+            for bid, fmt, n in self.BOOKS:
+                self._index(s, bid, fmt, n)
+            self._check(s)
+
+    def test_dict_drift_keeps_inflight_marker(self):
+        # a conversion already in flight (any target) is not reset by drift detection
+        from unittest import mock
+
+        s = store.VectorStore(self.path, backend='sqlite')
+        self.s = s
+        for bid, fmt, n in self.BOOKS:
+            self._index(s, bid, fmt, n)
+        s.set_meta(store.RECOMPRESS_KEY, store.recompress_marker('zlib'))  # a user-confirmed switch in flight
+        s.close()
+        self.s = None
+        new_dict = b'updated default compression dictionary' * 16
+        with mock.patch.object(store, '_load_default_dict', return_value=new_dict):
+            s = store.VectorStore(self.path, backend='sqlite')
+            self.s = s
+            self.assertEqual(store.json.loads(s.get_meta(store.RECOMPRESS_KEY))['target'], 'zlib')
+
     def test_reopen_zstd_db_without_zstandard_blocks(self):
         s = store.VectorStore(self.path, backend='sqlite')
         self.s = s
