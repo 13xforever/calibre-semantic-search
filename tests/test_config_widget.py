@@ -26,12 +26,16 @@ def _install_stubs():
     qtcore.pyqtSignal = _Sig
 
     class _W:
-        """Generic no-op widget: any method not defined below does nothing."""
+        """Generic no-op widget: any public method not defined below does nothing.
+        Missing private attributes raise AttributeError like on a real object, so
+        hasattr/getattr-with-default behave normally."""
 
         def __init__(self, *a, **k):
             pass
 
         def __getattr__(self, name):
+            if name.startswith('_'):
+                raise AttributeError(name)
             return lambda *a, **k: None
 
     class QDialog(_W):
@@ -111,6 +115,9 @@ def _install_stubs():
         def __init__(self, text=''):
             self._text = text
 
+        def setText(self, t):
+            self._text = t
+
         def text(self):
             return self._text
 
@@ -179,6 +186,14 @@ def _install_stubs():
                  'QMessageBox', 'QSpinBox', 'QTabWidget', 'QTextEdit',
                  'QVBoxLayout', 'QWidget'):
         setattr(qtcore, name, type(name, (_W,), {}))
+
+    class _NoopMeta(type):
+        # QMessageBox is used via class-level calls (QMessageBox.critical(...)), which a
+        # plain no-op widget class cannot answer; make those no-ops too.
+        def __getattr__(cls, name):
+            return lambda *a, **k: None
+
+    qtcore.QMessageBox = _NoopMeta('QMessageBox', (_W,), {})
 
     qtcore.QLineEdit = QLineEdit
     qtcore.QPlainTextEdit = QPlainTextEdit
@@ -490,6 +505,57 @@ class TestAttrTableCollect(unittest.TestCase):
         self.assertEqual(w.attr_table.item(n, 0).checkState(), cfgw.Qt.CheckState.Checked)
         self.assertEqual(w.attr_table.cellWidget(n, 2).currentText(), 'text')
         self.assertEqual(w.attr_table.cellWidget(n, 3).currentText(), 'Default')
+
+
+class TestTemplateKwargsSetting(unittest.TestCase):
+    """The extra template kwargs field round-trips into the saved settings, and a value
+    that is not a JSON object blocks accept so a bad setting can never be persisted."""
+
+    def setUp(self):
+        self._saved = (cfgw.dep_in_root, cfgw.external_deps_disabled, cfgw.lancedb_status, cfgw.zstandard_status)
+        cfgw.external_deps_disabled = lambda: False
+        cfgw.lancedb_status = lambda: (True, 'stub')
+        cfgw.zstandard_status = lambda: (True, 'stub')
+
+    def tearDown(self):
+        cfgw.dep_in_root, cfgw.external_deps_disabled, cfgw.lancedb_status, cfgw.zstandard_status = self._saved
+
+    def _widget(self, **kw):
+        cfgw.dep_in_root = lambda dep: False
+        s = utils.Settings()
+        for k, v in kw.items():
+            setattr(s, k, v)
+        return cfgw.SettingsWidget(s)
+
+    def test_init_from_settings(self):
+        w = self._widget(attr_template_kwargs='{"enable_thinking": false}')
+        self.assertEqual(w.e_template_kwargs.text(), '{"enable_thinking": false}')
+
+    def test_collect_roundtrip_strips_whitespace(self):
+        w = self._widget()
+        w.e_template_kwargs.setText('  {"reasoning_effort": "low"}  ')
+        w._collect_and_accept()
+        self.assertEqual(w.settings().attr_template_kwargs, '{"reasoning_effort": "low"}')
+
+    def test_clearing_collects_empty(self):
+        w = self._widget(attr_template_kwargs='{"a": 1}')
+        w.e_template_kwargs.setText('   ')
+        w._collect_and_accept()
+        self.assertEqual(w.settings().attr_template_kwargs, '')
+
+    def test_invalid_json_blocks_accept(self):
+        w = self._widget()
+        w.e_template_kwargs.setText('not json')
+        w._collect_and_accept()
+        self.assertFalse(hasattr(w, '_result'))  # the dialog was not accepted
+        self.assertEqual(w.settings().attr_template_kwargs, '')  # still the loaded settings
+
+    def test_non_object_json_blocks_accept(self):
+        for raw in ('[1, 2]', '42', '"no"'):
+            w = self._widget()
+            w.e_template_kwargs.setText(raw)
+            w._collect_and_accept()
+            self.assertFalse(hasattr(w, '_result'))
 
 
 if __name__ == '__main__':

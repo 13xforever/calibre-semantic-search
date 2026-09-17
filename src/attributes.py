@@ -7,9 +7,12 @@ on a worker thread; the LLM provider is injected so tests can fake it.
 from __future__ import annotations
 
 import re
+import threading
+from contextlib import contextmanager
 from typing import Annotated, Any, Optional
 
 from .chunker import CHARS_PER_TOKEN, estimate_tokens
+from .utils import parse_template_kwargs
 
 DEFAULT_CONTEXT_TOKENS = 8192
 OVERHEAD_TOKENS = 1024  # tokens held back for the model's structured output + wrapper; the per-schema prompt size is measured and subtracted separately (see _text_token_budget)
@@ -425,6 +428,52 @@ def _merge_fulltext_partials(fields, partials, llm, max_tok, stage_cb=None):
     return values
 
 
+@contextmanager
+def _with_template_kwargs(llm, raw: str):
+    """Yield llm; while active, merge the configured template kwargs into every
+    outgoing chat request of an OpenAI-protocol provider.
+
+    calibre's backends build the request body internally with no hook for extra
+    fields, so the provider's live module is temporarily wrapped at its single
+    request funnel (chat_request). The injection is scoped to this thread — other
+    features may use the same provider concurrently — and any setup problem
+    degrades to a plain no-op: extraction must never break because of this.
+    """
+    kwargs = parse_template_kwargs(raw)
+    if not kwargs or getattr(llm, 'name', '') not in ('OpenAI compatible', 'LMStudio'):
+        yield
+        return
+    mod = orig = patched = None
+    try:
+        # builtin_live_module (not a fresh import): calibre.live may hand the
+        # provider a live-updated copy of the backend, a distinct module object.
+        mod = llm.builtin_live_module
+        orig = getattr(mod, 'chat_request', None)
+        if mod is not None and callable(orig):
+            tid = threading.get_ident()
+
+            def patched(data, *args, **kw):
+                if threading.get_ident() == tid and isinstance(data, dict):
+                    merged = data.get('chat_template_kwargs')
+                    merged = dict(merged) if isinstance(merged, dict) else {}
+                    merged.update(kwargs)
+                    data['chat_template_kwargs'] = merged
+                return orig(data, *args, **kw)
+
+            mod.chat_request = patched
+    except Exception:
+        pass  # degrades to no-op; the request goes out unmodified
+    try:
+        yield
+    finally:
+        # restore only when we are still the topmost wrapper
+        if patched is not None and mod is not None and getattr(mod, 'chat_request', None) is patched:
+            try:
+                mod.chat_request = orig
+            except Exception:
+                pass
+
+
 def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, progress_cb=None, stage_cb=None):
     """Extract attributes for one book and write them to custom columns.
 
@@ -451,25 +500,26 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
     max_tok = _text_token_budget(settings.attr_context_tokens, fields)
 
     values: dict[str, Any] = {}
-    if settings.attr_mode == 'fulltext':
-        groups = _split_for_map(chunks, group_tokens=max_tok)
-        partials = []
-        for i, g in enumerate(groups):
-            if progress_cb:
-                progress_cb(i + 1, len(groups))
-            res = llm.generate_structured_output(_prompt_for(g, fields), schema, 'You are extracting book attributes from a portion of a book. Only report what is present in this portion.')
+    with _with_template_kwargs(llm, settings.attr_template_kwargs):
+        if settings.attr_mode == 'fulltext':
+            groups = _split_for_map(chunks, group_tokens=max_tok)
+            partials = []
+            for i, g in enumerate(groups):
+                if progress_cb:
+                    progress_cb(i + 1, len(groups))
+                res = llm.generate_structured_output(_prompt_for(g, fields), schema, 'You are extracting book attributes from a portion of a book. Only report what is present in this portion.')
+                if res.exception is not None:
+                    raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
+                partials.append(res.data)
+            values = _merge_fulltext_partials(fields, partials, llm, max_tok, stage_cb=stage_cb)
+        else:
+            text = sample_text(chunks, max_tokens=max_tok)
+            res = llm.generate_structured_output(_prompt_for(text, fields), schema, 'You are extracting book attributes. Use only information actually present in the text.')
             if res.exception is not None:
                 raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
-            partials.append(res.data)
-        values = _merge_fulltext_partials(fields, partials, llm, max_tok, stage_cb=stage_cb)
-    else:
-        text = sample_text(chunks, max_tokens=max_tok)
-        res = llm.generate_structured_output(_prompt_for(text, fields), schema, 'You are extracting book attributes. Use only information actually present in the text.')
-        if res.exception is not None:
-            raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
-        data = res.data
-        for f in fields:
-            values[f.name] = _normalize_value(getattr(data, f.name, None) if data is not None else None, f.type)
+            data = res.data
+            for f in fields:
+                values[f.name] = _normalize_value(getattr(data, f.name, None) if data is not None else None, f.type)
 
     # The map-reduce union (and even a single LLM call) can yield near-duplicate
     # tags that differ only in spelling; collapse them before persisting.

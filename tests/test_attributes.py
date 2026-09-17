@@ -206,6 +206,81 @@ class TestNormalizeTags(unittest.TestCase):
         self.assertEqual(attributes.normalize_tags(['  ', '', 'ok']), ['ok'])
 
 
+class _FakeBackendModule:
+    """Stand-in for a provider's live module: records the payload chat_request gets."""
+
+    def __init__(self, with_chat_request=True):
+        self.seen = []
+        if with_chat_request:
+            self.chat_request = self._chat_request
+
+    def _chat_request(self, data, *args, **kwargs):
+        self.seen.append(data)
+        return 'ok'
+
+
+class TestTemplateKwargs(unittest.TestCase):
+    """_with_template_kwargs injects the configured chat_template_kwargs into outgoing requests."""
+
+    def _llm(self, name='OpenAI compatible', with_chat_request=True):
+        mod = _FakeBackendModule(with_chat_request=with_chat_request)
+        return types.SimpleNamespace(name=name, builtin_live_module=mod), mod
+
+    def test_injects_and_restores(self):
+        llm, mod = self._llm()
+        with attributes._with_template_kwargs(llm, '{"enable_thinking": false}'):
+            payload = {'model': 'qwen3', 'messages': []}
+            mod.chat_request(payload)
+            self.assertEqual(payload['chat_template_kwargs'], {'enable_thinking': False})
+        self.assertEqual(mod.chat_request, mod._chat_request)  # restored afterwards
+        payload2 = {'model': 'qwen3'}
+        mod.chat_request(payload2)
+        self.assertNotIn('chat_template_kwargs', payload2)
+
+    def test_noop_for_other_providers(self):
+        llm, mod = self._llm(name='OllamaAI')
+        with attributes._with_template_kwargs(llm, '{"enable_thinking": false}'):
+            self.assertEqual(mod.chat_request, mod._chat_request)  # never wrapped
+
+    def test_noop_when_setting_empty_or_invalid(self):
+        for raw in ('', 'not json', '[1]', '42'):
+            llm, mod = self._llm()
+            with attributes._with_template_kwargs(llm, raw):
+                self.assertEqual(mod.chat_request, mod._chat_request)
+
+    def test_thread_scoping(self):
+        from threading import Thread
+
+        llm, mod = self._llm()
+        other = {}
+
+        def worker():
+            p = {'model': 'x'}
+            mod.chat_request(p)
+            other['payload'] = p
+
+        with attributes._with_template_kwargs(llm, '{"enable_thinking": false}'):
+            t = Thread(target=worker)
+            t.start()
+            t.join()
+            mine = {'model': 'x'}
+            mod.chat_request(mine)
+        self.assertNotIn('chat_template_kwargs', other['payload'])  # another thread is untouched
+        self.assertEqual(mine['chat_template_kwargs'], {'enable_thinking': False})
+
+    def test_merges_over_existing(self):
+        llm, mod = self._llm()
+        with attributes._with_template_kwargs(llm, '{"enable_thinking": false}'):
+            payload = {'model': 'x', 'chat_template_kwargs': {'temperature': 0.5}}
+            mod.chat_request(payload)
+            self.assertEqual(payload['chat_template_kwargs'], {'temperature': 0.5, 'enable_thinking': False})
+
+    def test_missing_chat_request_degrades(self):
+        llm, _mod = self._llm(with_chat_request=False)
+        with attributes._with_template_kwargs(llm, '{"a": 1}'):
+            pass  # must not raise
+
+
 class TestSampling(unittest.TestCase):
     def test_sample_small(self):
         chunks = ['a' * 100, 'b' * 100]

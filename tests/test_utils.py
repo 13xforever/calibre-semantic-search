@@ -79,6 +79,7 @@ class TestSettingsRoundtrip(unittest.TestCase):
         s.embed_context_tokens = 4096
         s.search_min_score = 0.35
         s.attr_mode = 'fulltext'
+        s.attr_template_kwargs = '{"enable_thinking": false}'
         s.attributes[0].enabled = False
         utils.save_settings(set_, s)
 
@@ -90,6 +91,7 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertEqual(s2.embed_context_tokens, 4096)
         self.assertEqual(s2.search_min_score, 0.35)
         self.assertEqual(s2.attr_mode, 'fulltext')
+        self.assertEqual(s2.attr_template_kwargs, '{"enable_thinking": false}')
         self.assertFalse(s2.attributes[0].enabled)
         self.assertTrue(s2.attributes[1].enabled)
         # descriptions preserved from defaults for known names
@@ -166,6 +168,37 @@ class TestSettingsRoundtrip(unittest.TestCase):
         s2 = utils.load_settings(get)
         blurb2 = next(a for a in s2.attributes if a.name == 'blurb')
         self.assertFalse(blurb2.enabled)  # defaults must not clobber saved flags
+
+
+class TestParseTemplateKwargs(unittest.TestCase):
+    """The extra template kwargs setting is passed through only when it is a JSON object."""
+
+    def test_valid_object(self):
+        self.assertEqual(utils.parse_template_kwargs('{"enable_thinking": false}'), {'enable_thinking': False})
+
+    def test_nested_values(self):
+        self.assertEqual(
+            utils.parse_template_kwargs('{"reasoning_effort": "low", "nested": {"a": 1}}'),
+            {'reasoning_effort': 'low', 'nested': {'a': 1}},
+        )
+
+    def test_empty_and_whitespace(self):
+        self.assertIsNone(utils.parse_template_kwargs(''))
+        self.assertIsNone(utils.parse_template_kwargs('   \n'))
+
+    def test_malformed_json(self):
+        self.assertIsNone(utils.parse_template_kwargs('{enable_thinking: false}'))
+        self.assertIsNone(utils.parse_template_kwargs('{"a": }'))
+
+    def test_non_object_json(self):
+        # an array or scalar is valid JSON but meaningless as chat_template_kwargs
+        self.assertIsNone(utils.parse_template_kwargs('[1, 2]'))
+        self.assertIsNone(utils.parse_template_kwargs('42'))
+        self.assertIsNone(utils.parse_template_kwargs('"no"'))
+
+    def test_empty_object_parses_to_empty_dict(self):
+        # valid but nothing to send: callers treat a falsy result as "no override"
+        self.assertEqual(utils.parse_template_kwargs('{}'), {})
 
 
 class _WheelBuilder:

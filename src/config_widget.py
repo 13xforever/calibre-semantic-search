@@ -41,6 +41,7 @@ from .utils import (
     install_dep,
     lancedb_status,
     numpy_status,
+    parse_template_kwargs,
     uninstall_dep,
     zstandard_status,
 )
@@ -233,6 +234,16 @@ HELP_CONTEXT = _(
     "per call. Set it to your model's max context, e.g. 8192 for llama3.1."
 )
 
+HELP_TEMPLATE_KWARGS = _(
+    'Extra options sent to the model server with every attribute-extraction request. The value is a JSON '
+    'object passed through verbatim as chat_template_kwargs; it applies to OpenAI-compatible providers '
+    '(unsloth / vLLM / LM Studio) and is ignored by other providers.\n\n'
+    'Valid examples:\n'
+    '- {"enable_thinking": false} — disable thinking entirely (Qwen3)\n'
+    '- {"reasoning_effort": "low"} — reduce the reasoning effort ("xhigh", "medium" or "low")\n\n'
+    'Leave empty to send nothing extra. If your server rejects a value, attribute extraction fails with an error.'
+)
+
 
 class SettingsWidget(QDialog):
     def __init__(self, settings: Settings, action=None, library_backend=None, library_codec=None, blocked_dep=None, blocked_has_data=False):
@@ -357,6 +368,12 @@ class SettingsWidget(QDialog):
         ctx_row.addWidget(self.e_ctx)
         ctx_row.addStretch(1)
         av.addLayout(ctx_row)
+        tk_row = QHBoxLayout()
+        tk_row.addWidget(QLabel(_('Extra template kwargs (JSON):')))
+        self.e_template_kwargs = QLineEdit(self.s.attr_template_kwargs)
+        self.e_template_kwargs.setPlaceholderText('{"enable_thinking": false}')
+        tk_row.addWidget(self.e_template_kwargs, 1)
+        av.addLayout(tk_row)
         self.attr_table = QTableWidget(len(self.s.attributes), 5)
         self.attr_table.setHorizontalHeaderLabels([_('Enabled'), _('Name'), _('Type'), _('Language'), _('Description')])
         self.attr_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
@@ -436,6 +453,7 @@ class SettingsWidget(QDialog):
                 item.setToolTip(key)
         B(HELP_ATTR_TABLE, self.attr_table)
         B(HELP_CONTEXT, self.e_ctx)
+        B(HELP_TEMPLATE_KWARGS, self.e_template_kwargs)
         B(HELP_AUTO_ATTR, self.e_auto_attr)
         for dep, (_status_fn, _inst, _uninst, purpose) in self._dep_funcs.items():
             row = self._dep_rows[dep]
@@ -661,6 +679,15 @@ class SettingsWidget(QDialog):
     # -- collect -----------------------------------------------------------------
 
     def _collect_and_accept(self):
+        raw_kwargs = self.e_template_kwargs.text().strip()
+        if raw_kwargs and parse_template_kwargs(raw_kwargs) is None:
+            QMessageBox.critical(
+                self,
+                _('Semantic search'),
+                _('Extra template kwargs must be a JSON object, e.g. {"enable_thinking": false}.\n\n'
+                  'Fix the value or leave the field empty to send nothing extra.'),
+            )
+            return
         s = Settings()
         s.embed.base_url = self.e_base_url.text().strip() or 'http://localhost:11434'
         s.embed.model = self.e_model.text().strip() or 'nomic-embed-text'
@@ -678,6 +705,7 @@ class SettingsWidget(QDialog):
         s.search_min_score = self.i_min_score.value()
         s.attr_mode = self.i_attrmode.currentText()
         s.attr_context_tokens = self.e_ctx.value()
+        s.attr_template_kwargs = raw_kwargs
         s.auto_extract_attributes = bool(self.e_auto_attr.isChecked())
         attrs = []
         for r in range(self.attr_table.rowCount()):

@@ -11,7 +11,7 @@ import tempfile
 import urllib.parse
 import zipfile
 from dataclasses import asdict, dataclass, field, fields
-from typing import Any
+from typing import Any, Optional
 
 PREF_KEY = 'semantic_search_settings'
 
@@ -92,6 +92,7 @@ class Settings:
     search_min_score: float = 0.2  # only show search results with score >= this (0..1)
     attr_mode: str = 'sampled'  # sampled | fulltext (map-reduce)
     attr_context_tokens: int = 8192  # model context window (tokens); sample/group sizes derive from this
+    attr_template_kwargs: str = ''  # JSON object passed through as chat_template_kwargs to OpenAI-compatible providers; '' = nothing extra
     auto_extract_attributes: bool = True  # run LLM attribute extraction automatically after indexing
     attributes: list[AttrField] = field(default_factory=lambda: [f.clone() for f in DEFAULT_ATTRIBUTES])
 
@@ -106,7 +107,7 @@ def _settings_from_dict(data: dict[str, Any]) -> Settings:
     embed = data.get('embed')
     if isinstance(embed, dict):
         ans.embed = EmbedSettings(**{k: v for k, v in embed.items() if k in {f.name for f in fields(EmbedSettings)}})
-    for key in ('vector_backend', 'format_priority', 'target_chars', 'overlap_chars', 'embed_context_tokens', 'max_chunks_per_book', 'search_min_score', 'attr_mode', 'attr_context_tokens', 'auto_extract_attributes'):
+    for key in ('vector_backend', 'format_priority', 'target_chars', 'overlap_chars', 'embed_context_tokens', 'max_chunks_per_book', 'search_min_score', 'attr_mode', 'attr_context_tokens', 'attr_template_kwargs', 'auto_extract_attributes'):
         if key in data:
             setattr(ans, key, data[key])
     if ans.vector_backend == 'auto':
@@ -153,6 +154,21 @@ def save_settings(prefs, settings: Settings) -> None:
         prefs(PREF_KEY, blob)
     else:
         prefs[PREF_KEY] = blob
+
+
+def parse_template_kwargs(raw: str) -> Optional[dict]:
+    """Parse the configured extra template kwargs (Settings.attr_template_kwargs).
+
+    Returns the JSON object to pass through as chat_template_kwargs, or None when
+    the setting is empty, not valid JSON, or not a JSON object (an array or scalar
+    would be meaningless there)."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 # -- optional dependencies -------------------------------------------------------
