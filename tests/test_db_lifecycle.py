@@ -404,9 +404,15 @@ class TestLanceDb(_LifecycleOps, unittest.TestCase):
 
         # data now exists -> the ANN index is a pending finalize stage
         self.assertEqual(s.pending_stages(), ['index'])
+        tname = s.backend._table_name(self.MODEL)
+        data_dir = os.path.join(s._lancedb_dir(), tname + '.lance', 'data')
+        frags_before = len(os.listdir(data_dir))
         stages = []
         s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
         self.assertTrue(any(st == 'index' for st, _ in stages))
+        # the fresh build consolidates the per-book fragments into a single one
+        self.assertGreater(frags_before, 1)
+        self.assertEqual(len(os.listdir(data_dir)), 1)
         cfg = s.backend._our_index(s.backend._open_table(self.MODEL))
         self.assertIsNotNone(cfg)
         self.assertEqual(cfg.index_type, store.LanceVectorBackend.INDEX_TYPE)

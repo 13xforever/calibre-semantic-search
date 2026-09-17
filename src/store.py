@@ -1203,9 +1203,14 @@ class LanceVectorBackend:
     def finalize_index(self, say=None):
         """Build / incrementally update the vector index of every table that needs it.
 
-        A missing index is built (IVF_HNSW_SQ, cosine); a stale one is refreshed with
-        optimize(), which also compacts and prunes fragments — followed by an
-        aggressive prune so the space of replaced fragments is reclaimed immediately."""
+        A missing index is built over consolidated data: per-book adds (a fresh transfer
+        or a fresh library) leave one fragment per book, so the table is compacted and
+        pruned first — optimize() must run before create_index, because with thousands of
+        small fragments and an existing index, lance's index-maintenance path panics
+        (arrow-data slice assertion; lancedb 0.38 / lance 11), while compaction without an
+        index is fine at any scale. A stale one is refreshed with optimize(), which also
+        compacts and prunes fragments — both followed by an aggressive prune so the space
+        of replaced fragments is reclaimed immediately."""
         for name in sorted(self._table_names()):
             t = self._open_named(name)
             if t is None:
@@ -1220,6 +1225,12 @@ class LanceVectorBackend:
             if cfg is None:
                 if say is not None:
                     say('index', f'building vector index for {name} ({n:,} rows)')
+                # per-book adds (a fresh transfer or a fresh library) leave one fragment
+                # per book; consolidate before building the index, both so it reads a few
+                # large files and because optimize() with an existing index over thousands
+                # of small fragments panics in lance 11 (arrow-data slice assertion)
+                t.optimize()
+                t.optimize(cleanup_older_than=timedelta(0))
                 from lancedb.index import IvfHnswSq
 
                 t.create_index(
