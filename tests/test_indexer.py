@@ -57,6 +57,25 @@ class FailingLLM:
         return SimpleNamespace(data=None, exception=RuntimeError('boom'), error_details='boom')
 
 
+class FakeLLMSequence:
+    """Serves queued responses in order (one dict per call), cycling."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.i = 0
+        self.calls = 0
+
+    def generate_structured_output(self, prompt, schema, instructions='', use_model=''):
+        from types import SimpleNamespace
+
+        self.calls += 1
+        raw = self.responses[self.i % len(self.responses)]
+        self.i += 1
+        return SimpleNamespace(
+            data=SimpleNamespace(**{f.name: raw.get(f.name) for f in _FIELDS}), exception=None, error_details=''
+        )
+
+
 class FakeApi:
     """Minimal newAPI stand-in for reconcile tests."""
 
@@ -186,6 +205,21 @@ class TestAttrPhase(unittest.TestCase):
             self.assertEqual(s['state'], 'attributes')
             self.assertEqual((s['done'], s['total']), (1, 1))
             self.assertEqual(s['book_id'], 1)
+        vs.close()
+
+    def test_fulltext_merge_stage_reported(self):
+        # parts that disagree on a text field trigger the extra reduce call; it must be
+        # reported as its own stage so the GUI doesn't sit on "part N/N"
+        vs, ix, settings, statuses, done, writer = self._make()
+        settings.attr_mode = 'fulltext'
+        settings.attr_context_tokens = 3000  # ~6916 char budget -> [5000,5000,100] splits into 2 groups
+        attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
+        ix._process_attributes([1], settings, llm=FakeLLMSequence([{'gender': 'male'}, {'gender': 'female'}]))
+        merge = [s for s in statuses if s.get('stage') == 'merging']
+        self.assertEqual(len(merge), 1)
+        self.assertEqual(merge[0]['state'], 'attributes')
+        self.assertEqual((merge[0]['done'], merge[0]['total']), (1, 1))
+        self.assertEqual(merge[0]['book_id'], 1)
         vs.close()
 
     def test_pending_excludes_failed(self):

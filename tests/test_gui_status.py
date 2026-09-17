@@ -163,6 +163,17 @@ class TestStatusLines(unittest.TestCase):
         gui.SemanticSearchAction._on_status(a, {'state': 'attributes', 'done': 2, 'total': 10, 'book_id': 5, 'sub_done': 1, 'sub_total': 1})
         self.assertEqual(a.qaction.tip, 'Extracting attributes (2/10)')
 
+    def test_attributes_line_shows_merge_stage(self):
+        # the reduce call after all parts are done shows as its own stage, not a stale "part N/N"
+        lines = _status_lines(FakeApi(), {'state': 'attributes', 'done': 7, 'total': 19, 'book_id': 5, 'stage': 'merging'})
+        self.assertEqual(lines[0], 'Extracting attributes (7/19): book 5, merging parts')
+
+    def test_attributes_tooltip_shows_merge_stage(self):
+        a = object.__new__(gui.SemanticSearchAction)
+        a.qaction = _FakeQtAction()
+        gui.SemanticSearchAction._on_status(a, {'state': 'attributes', 'done': 2, 'total': 10, 'book_id': 5, 'stage': 'merging'})
+        self.assertEqual(a.qaction.tip, 'Extracting attributes (2/10), merging parts')
+
 
 class _FakeIconSink:
     def __init__(self):

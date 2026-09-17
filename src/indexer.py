@@ -266,8 +266,12 @@ class Indexer(threading.Thread):
                 # per-book sub-progress (fulltext map steps) on top of book-level done/total
                 self._status('attributes', _bid, done=_i + 1, total=total, sub_done=d, sub_total=t)
 
+            def stage(name, _bid=bid, _i=i):
+                # post-map stage (the reduce call when parts disagree on a text field)
+                self._status('attributes', _bid, done=_i + 1, total=total, stage=name)
+
             try:
-                extract_book_attributes(bid, self.attr_writer, self.store, settings, llm=llm, progress_cb=progress)
+                extract_book_attributes(bid, self.attr_writer, self.store, settings, llm=llm, progress_cb=progress, stage_cb=stage)
                 self._set_attr_failed(bid, None)
             except Exception as e:
                 self._set_attr_failed(bid, repr(e))

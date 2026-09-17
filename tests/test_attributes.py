@@ -420,6 +420,45 @@ class TestExtract(unittest.TestCase):
         attributes.extract_book_attributes(2, api, store, settings, llm=llm, progress_cb=lambda d, t: calls.append((d, t)))
         self.assertEqual(calls, [(1, 2), (2, 2)])
 
+    def test_fulltext_disagreeing_parts_emit_merge_stage(self):
+        # parts that disagree on a text field trigger the extra reduce LLM call; the
+        # 'merging' stage must be reported right before it so the GUI leaves "part N/N"
+        store = FakeStore()
+        api = FakeApi()
+        llm = FakeLLMSequence([
+            {'gender': 'male', 'tropes': ['x']},
+            {'gender': 'female', 'tropes': ['y']},
+        ])
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.attr_mode = 'fulltext'
+        settings.attr_context_tokens = 3000
+        attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
+        progress, stages = [], []
+        attributes.extract_book_attributes(
+            4, api, store, settings, llm=llm,
+            progress_cb=lambda d, t: progress.append((d, t)),
+            stage_cb=lambda name: stages.append(name),
+        )
+        self.assertEqual(llm.calls, 3)  # two map calls + one reduce call
+        self.assertEqual(progress, [(1, 2), (2, 2)])
+        self.assertEqual(stages, ['merging'])
+
+    def test_fulltext_agreeing_parts_emit_no_stage(self):
+        # no text-field disagreement -> no reduce call -> no stage to report
+        store = FakeStore()
+        api = FakeApi()
+        llm = FakeLLM({'gender': 'male'})
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.attr_mode = 'fulltext'
+        settings.attr_context_tokens = 3000
+        attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
+        stages = []
+        attributes.extract_book_attributes(5, api, store, settings, llm=llm, stage_cb=lambda name: stages.append(name))
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(stages, [])
+
     def test_sampled_mode_emits_no_progress(self):
         store = FakeStore()
         api = FakeApi()

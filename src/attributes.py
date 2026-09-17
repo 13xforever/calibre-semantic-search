@@ -378,12 +378,14 @@ def _reduce_prompt(pending, max_tok):
     return render()
 
 
-def _merge_fulltext_partials(fields, partials, llm, max_tok):
+def _merge_fulltext_partials(fields, partials, llm, max_tok, stage_cb=None):
     """Merge per-group partials into final values.
 
     Tags union without an LLM call. Text fields with a single distinct value use it
     directly; when groups disagree, one reduce call over the ordered partials
     produces the final value (a null reduce result falls back to the first partial).
+    `stage_cb('merging')` is emitted right before that reduce call so callers can
+    surface the extra API wait as its own progress stage.
     """
     by_field: dict[str, list] = {}
     for p in partials:
@@ -411,6 +413,8 @@ def _merge_fulltext_partials(fields, partials, llm, max_tok):
             else:
                 pending.append((f, distinct))
     if pending:
+        if stage_cb:
+            stage_cb('merging')
         schema = build_schema_class([f for f, _ in pending], doc='Merge the partial attribute values into one final value per field.')
         res = llm.generate_structured_output(_reduce_prompt(pending, max_tok), schema, 'You are merging partial book attribute extractions into final values. Use only information present in the partials.')
         if res.exception is not None:
@@ -421,12 +425,14 @@ def _merge_fulltext_partials(fields, partials, llm, max_tok):
     return values
 
 
-def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, progress_cb=None):
+def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, progress_cb=None, stage_cb=None):
     """Extract attributes for one book and write them to custom columns.
 
     Returns the raw values dict. Raises on LLM errors (caller decides whether to retry).
     In fulltext mode `progress_cb(done, total)` is called before each map call so the
     caller can surface per-book sub-progress; sampled mode is a single call and emits none.
+    `stage_cb(name)` reports stage transitions: 'merging' is emitted right before the
+    extra reduce LLM call (only when groups disagree on a text field).
     """
     fields = settings.enabled_attributes()
     if not fields:
@@ -455,7 +461,7 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
             if res.exception is not None:
                 raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
             partials.append(res.data)
-        values = _merge_fulltext_partials(fields, partials, llm, max_tok)
+        values = _merge_fulltext_partials(fields, partials, llm, max_tok, stage_cb=stage_cb)
     else:
         text = sample_text(chunks, max_tokens=max_tok)
         res = llm.generate_structured_output(_prompt_for(text, fields), schema, 'You are extracting book attributes. Use only information actually present in the text.')

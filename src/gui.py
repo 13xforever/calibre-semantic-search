@@ -614,8 +614,11 @@ class SemanticSearchAction(InterfaceAction):
             tip = _('Indexing paused')
         elif state == 'attributes':
             tip = f"Extracting attributes ({d.get('done')}/{d.get('total')})"
+            if d.get('stage') == 'merging':
+                # all parts are done; the part counter is stale while the reduce call runs
+                tip += ', merging parts'
             # a single-part book (whole book fits one LLM call) has nothing to count
-            if (d.get('sub_total') or 0) > 1:
+            elif (d.get('sub_total') or 0) > 1:
                 tip += f", part {d.get('sub_done')}/{d.get('sub_total')}"
         elif state == 'attributes_done':
             tip = f"Attributes: {d.get('done')}/{d.get('total')} done"
@@ -821,8 +824,11 @@ class SemanticSearchAction(InterfaceAction):
         elif st and st.get('state') in ('extracting', 'embedding', 'saving', 'attributes'):
             if st.get('state') == 'attributes':
                 line = f"Extracting attributes ({st.get('done')}/{st.get('total')}): {self._book_label(st.get('book_id'), api)}"
+                if st.get('stage') == 'merging':
+                    # all parts are done; the part counter is stale while the reduce call runs
+                    line += ', merging parts'
                 # a single-part book (whole book fits one LLM call) has nothing to count
-                if (st.get('sub_total') or 0) > 1:
+                elif (st.get('sub_total') or 0) > 1:
                     line += f", part {st.get('sub_done')}/{st.get('sub_total')}"
             else:
                 line = f"Currently indexing {self._book_label(st.get('book_id'), api)}: {st.get('state')}"
