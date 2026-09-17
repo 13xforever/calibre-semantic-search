@@ -83,6 +83,34 @@ class BookMatchesWorker(QThread):
             self.failed.emit(str(e))
 
 
+class DeleteChunkWorker(QThread):
+    """Delete one chunk from the store, then re-fetch the book's match list with the
+    search's cached query vector (no new embedding call)."""
+
+    finished_ok = pyqtSignal(object)  # fresh match list, or None when there is no query vector
+    failed = pyqtSignal(str)
+
+    def __init__(self, store, query_vec, book_id: int, chunk_no: int, min_score: float, model: str | None = None):
+        super().__init__()
+        self.store = store
+        self.query_vec = query_vec
+        self.book_id = book_id
+        self.chunk_no = chunk_no
+        self.min_score = min_score
+        self.model = model
+
+    def run(self):
+        try:
+            self.store.delete_chunk(self.book_id, self.chunk_no)
+            if self.query_vec is None:
+                self.finished_ok.emit(None)
+            else:
+                res = self.store.search_book(self.query_vec, self.book_id, min_score=self.min_score, model=self.model)
+                self.finished_ok.emit(res)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 def best_search_phrase(chunk_text: str, max_len: int = 400) -> str:
     """Pick a long contiguous phrase from a chunk for the viewer's text search."""
     paras = [p.strip() for p in re.split(r'\n\s*\n', chunk_text) if p.strip()]
@@ -165,9 +193,11 @@ class SemanticSearchDialog(QDialog):
         self._query_ctx = None  # (query_vec, model) reused by BookMatchesWorker
         self._sort_state = {'books': [2, False], 'matches': [2, False]}  # (col, asc) per view
         self._meta_cache = {}
-        self._gen = 0  # bumped by do_search/drill_into; stale worker results are dropped
+        self._gen = 0  # bumped by do_search/drill_into/delete_selected; stale worker results are dropped
         self.worker = None
         self.matches_worker = None
+        self.delete_worker = None
+        self._deleting = None  # (book_id, chunk_no) of the in-flight deletion
         self.setWindowTitle(_('Semantic search'))
         self.resize(900, 560)
 
@@ -213,10 +243,17 @@ class SemanticSearchDialog(QDialog):
         self.count_label = QLabel('')
         bottom.addWidget(self.count_label)
         bottom.addStretch(1)
+        self.btn_delete = QPushButton(_('Delete &chunk'))
+        self.btn_delete.setToolTip(
+            _('Remove only this chunk from the book\'s search index. The book keeps its other chunks; re-indexing the book restores it.')
+        )
+        self.btn_delete.clicked.connect(self.delete_selected)
         self.btn_restrict = QPushButton(_('&Restrict library to results'))
         self.btn_restrict.setToolTip(_('Set the library search so only books with matches are shown'))
         self.btn_restrict.clicked.connect(self.restrict_library)
         self.btn_context = QPushButton(_('Show &book matches'))
+        bottom.addWidget(self.btn_delete)
+        bottom.addSpacing(12)  # set chunk deletion apart from the view/filter buttons
         bottom.addWidget(self.btn_restrict)
         bottom.addWidget(self.btn_context)
         v.addLayout(bottom)
@@ -328,6 +365,63 @@ class SemanticSearchDialog(QDialog):
         self._update_view_chrome()
         self._render_table()
 
+    def delete_selected(self):
+        """Remove the selected match's chunk from the store (book-matches view only)."""
+        if self.worker is not None or self.delete_worker is not None:
+            return
+        row = self.selected_row()
+        if self.matches is None or row is None or row >= len(self.matches):
+            return
+        r = self.matches[row]
+        ctx = self._query_ctx
+        vec, model = (ctx if ctx is not None else (None, None))
+        settings = self.action.get_settings()
+        min_score = min(1.0, max(0.0, float(settings.search_min_score)))
+        self._gen += 1
+        gen = self._gen
+        self._deleting = (r.book_id, r.chunk_no)
+        w = DeleteChunkWorker(self.store, vec, r.book_id, r.chunk_no, min_score=min_score, model=model)
+        self.delete_worker = w
+        _live_workers.add(w)
+        w.finished_ok.connect(lambda res, g=gen, w=w: self._on_chunk_deleted(res, g, w))
+        w.failed.connect(lambda msg, g=gen, w=w: self._on_chunk_delete_failed(msg, g, w))
+        w.finished.connect(lambda w=w: _live_workers.discard(w))
+        self.status_label.setText(_('Deleting chunk...'))
+        self._update_view_chrome()
+        w.start()
+
+    def _on_chunk_deleted(self, results, gen, worker):
+        if self.delete_worker is worker:
+            # clear the in-flight state even for a stale result (a newer search superseded
+            # this deletion), or the button would stay disabled until the next view change
+            self.delete_worker = None
+            deleting = self._deleting
+            self._deleting = None
+        else:
+            deleting = None
+        if gen != self._gen or self._active_book_id is None:
+            return
+        if results is not None:
+            self.matches = list(results)
+            self._sort_state['matches'] = [2, False]  # search_book returns score-descending
+        else:
+            # no query vector to re-search with: drop the deleted row locally
+            bid, cno = deleting or (None, None)
+            self.matches = [m for m in self.matches if not (m.book_id == bid and m.chunk_no == cno)]
+        self.status_label.setText('')
+        self._update_view_chrome()
+        self._render_table()
+
+    def _on_chunk_delete_failed(self, msg, gen, worker):
+        if self.delete_worker is worker:
+            self.delete_worker = None
+            self._deleting = None
+        if gen != self._gen:
+            return
+        self.status_label.setText(_('Deleting chunk failed: ') + msg)
+        self._update_view_chrome()
+        self.status_label.setVisible(True)  # the matches view normally hides it; keep the error on screen
+
     def go_back(self):
         if self._active_book_id is None:
             return
@@ -356,9 +450,14 @@ class SemanticSearchDialog(QDialog):
         """Refresh everything that depends on which view/data is showing: the middle row,
         the table's columns, the count label and the context button."""
         in_book = self._active_book_id is not None
-        self.status_label.setVisible(not in_book)
+        deleting = self.delete_worker is not None
+        # the status label doubles as the deletion progress/error line; keep it up while
+        # a deletion runs or fails, even though the matches view normally hides it
+        self.status_label.setVisible(not in_book or deleting)
         self.btn_back.setVisible(in_book)
         self.book_label.setVisible(in_book)
+        self.btn_delete.setVisible(self.matches is not None)
+        self.btn_delete.setEnabled(self.matches is not None and not deleting)
         if self.matches is not None:
             self.table.setHorizontalHeaderLabels([_('Chapter'), _('Match'), _('Score')])
             self.table.setColumnWidth(0, 160)
@@ -480,7 +579,7 @@ class SemanticSearchDialog(QDialog):
         self.gui.search.set_search_string(q, store_in_history=True)
 
     def closeEvent(self, e):
-        for w in (self.worker, self.matches_worker):
+        for w in (self.worker, self.matches_worker, self.delete_worker):
             if w is not None and w.isRunning():
                 w.wait(10000)
         super().closeEvent(e)

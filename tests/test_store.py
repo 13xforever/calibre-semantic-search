@@ -107,7 +107,46 @@ class _SearchBookMixin:
         self.assertTrue(other and all(r.book_id == 12 for r in other))
 
 
-class TestVectorStore(_SearchBookMixin, unittest.TestCase):
+class _DeleteChunkMixin:
+    """delete_chunk checks shared by the sqlite and lancedb backend test classes."""
+
+    def _check_delete_chunk(self):
+        s = self.s
+        dim = 8
+        for b in (21, 22):
+            chunks = [_C(i, f'book {b} chunk {i}', ['ch'], i, i + 1, i) for i in range(4)]
+            vecs = [store.l2_normalize([1.0 - 0.05 * i] + [0.1] * (dim - 1)) for i in range(4)]
+            for c, v in zip(chunks, vecs):
+                s.insert_chunk(b, c, 'del-model', v)
+            s.commit()
+            s.upsert_book(b, 'EPUB', 4, 'del-model')
+
+        q = store.l2_normalize([1.0] + [0.0] * (dim - 1))
+        # delete one chunk: it leaves the results and the registry count follows
+        s.delete_chunk(21, 1)
+        self.assertEqual([r.chunk_no for r in s.search_book(q, 21, model='del-model')], [0, 2, 3])
+        reg = {b['id']: b for b in s.indexed_books()}
+        self.assertEqual(reg[21]['n_chunks'], 3)
+        # the book is still found through its surviving chunks (its best one was kept)
+        top = s.search(q, limit=10, min_score=-1.0, model='del-model')
+        self.assertIn(21, {r.book_id for r in top})
+        self.assertEqual(s.book_chunks_text(21), ['book 21 chunk 0', 'book 21 chunk 2', 'book 21 chunk 3'])
+        # deleting a chunk that is not there changes nothing (counts never go negative)
+        s.delete_chunk(22, 99)
+        reg = {b['id']: b for b in s.indexed_books()}
+        self.assertEqual(reg[22]['n_chunks'], 4)
+        # delete every chunk of a book: the count hits zero and the book drops out of
+        # search, but it stays registered as indexed (a manual deletion is not a failure)
+        for i in range(4):
+            s.delete_chunk(22, i)
+        reg = {b['id']: b for b in s.indexed_books()}
+        self.assertEqual(reg[22]['n_chunks'], 0)
+        self.assertTrue(s.book_is_indexed(22))
+        self.assertNotIn(22, {r.book_id for r in s.search(q, limit=10, min_score=-1.0, model='del-model')})
+        self.assertEqual(s.search_book(q, 22, model='del-model'), [])
+
+
+class TestVectorStore(_SearchBookMixin, _DeleteChunkMixin, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.tmp.name, 'test.db')
@@ -212,6 +251,9 @@ class TestVectorStore(_SearchBookMixin, unittest.TestCase):
 
     def test_search_book(self):
         self._check_search_book()
+
+    def test_delete_chunk(self):
+        self._check_delete_chunk()
 
     def test_dim_mismatch_isolated(self):
         s = self.s
@@ -550,7 +592,7 @@ class TestHalfLut(unittest.TestCase):
         self.assertEqual(store._half_bytes_to_floats(b''), [])
 
 
-class TestVectorStoreLance(_SearchBookMixin, unittest.TestCase):
+class TestVectorStoreLance(_SearchBookMixin, _DeleteChunkMixin, unittest.TestCase):
     """Runtime coverage for the LanceDB backend (forced, not auto).
 
     Not skipped when lancedb is missing: without the package, VectorStore raises a
@@ -610,6 +652,9 @@ class TestVectorStoreLance(_SearchBookMixin, unittest.TestCase):
 
     def test_search_book(self):
         self._check_search_book()
+
+    def test_delete_chunk(self):
+        self._check_delete_chunk()
 
 
 class TestDefaultDictLoading(unittest.TestCase):

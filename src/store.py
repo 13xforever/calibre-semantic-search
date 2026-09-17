@@ -704,6 +704,15 @@ class MetaStore:
             )
             self.conn.commit()
 
+    def set_chunk_count(self, book_id: int, n_chunks: int):
+        """Update only the chunk count of an indexed book (manual chunk deletion).
+
+        Unlike upsert_book this leaves fmt/model/indexed_at untouched — the book was
+        not re-indexed. A missing books row is a no-op."""
+        with self._lock:
+            self.conn.execute('UPDATE books SET n_chunks=? WHERE id=?', (int(n_chunks), book_id))
+            self.conn.commit()
+
     # -- file change-detection registry ---------------------------------------------
 
     def get_file_info(self, book_id: int):
@@ -927,6 +936,20 @@ class SqliteVectorBackend:
         with self.meta._lock:
             for t in self._chunk_tables_locked():
                 self.conn.execute(f'DELETE FROM {t} WHERE book_id=?', (book_id,))
+
+    def delete_chunk(self, book_id: int, chunk_no: int):
+        """Delete one of a book's chunks ((book_id, chunk_no) is unique per table)."""
+        with self.meta._lock:
+            for t in self._chunk_tables_locked():
+                self.conn.execute(f'DELETE FROM {t} WHERE book_id=? AND chunk_no=?', (book_id, int(chunk_no)))
+            self.conn.commit()
+
+    def count_book_chunks(self, book_id: int) -> int:
+        with self.meta._lock:
+            n = 0
+            for t in self._chunk_tables_locked():
+                n += self.conn.execute(f'SELECT COUNT(*) FROM {t} WHERE book_id=?', (book_id,)).fetchone()[0]
+        return n
 
     def insert_chunks(self, book_id: int, items):
         """items: list of (chunk, vector, model); text is compressed per the saved codec."""
@@ -1287,6 +1310,20 @@ class LanceVectorBackend:
     def delete_book(self, book_id: int):
         for t in self._all_tables():
             t.delete(f'book_id = {int(book_id)}')
+
+    def delete_chunk(self, book_id: int, chunk_no: int):
+        """Delete one of a book's chunks ((book_id, chunk_no) is unique per table)."""
+        for t in self._all_tables():
+            t.delete(f'book_id = {int(book_id)} AND chunk_no = {int(chunk_no)}')
+
+    def count_book_chunks(self, book_id: int) -> int:
+        n = 0
+        for t in self._all_tables():
+            try:
+                n += t.count_rows(f'book_id = {int(book_id)}')
+            except Exception:
+                continue
+        return n
 
     def insert_chunks(self, book_id: int, items):
         first_model = items[0][2]
@@ -2012,6 +2049,14 @@ class VectorStore:
     def clear_book(self, book_id: int):
         self.backend.delete_book(book_id)
         self.meta.clear_book(book_id)
+
+    def delete_chunk(self, book_id: int, chunk_no: int):
+        """Delete one indexed chunk and keep the books registry's count in step.
+
+        The count is recounted (not decremented) so a concurrent re-index of the same
+        book can never drive it negative or stale."""
+        self.backend.delete_chunk(book_id, chunk_no)
+        self.meta.set_chunk_count(book_id, self.backend.count_book_chunks(book_id))
 
     def insert_chunk(self, book_id, chunk, model, vector):
         self._pending.append((book_id, (chunk, vector, model)))

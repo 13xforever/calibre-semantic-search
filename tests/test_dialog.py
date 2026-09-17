@@ -213,9 +213,19 @@ class _Table:
 class _Store:
     def __init__(self, books=None):
         self._books = [{'id': 1, 'n_chunks': 5}] if books is None else books
+        self.deleted = []
+        self.search_book_results = None
 
     def indexed_books(self):
         return self._books
+
+    def delete_chunk(self, book_id, chunk_no):
+        self.deleted.append((book_id, chunk_no))
+
+    def search_book(self, vec, book_id, min_score=0.0, model=None):
+        if self.search_book_results is None:
+            raise AssertionError('search_book called without prepared results')
+        return self.search_book_results
 
 
 def _result(i=0, score=0.5):
@@ -257,6 +267,10 @@ def _make_dialog(min_score=0.2, api=None, books=None):
     d.count_label = _Label()
     d.btn_back = _Btn()
     d.btn_context = _Btn('Show &book matches')
+    d.btn_delete = _Btn('Delete &chunk')
+    d.btn_delete.visible = False  # the real __init__ ends with _update_view_chrome() (no matches yet)
+    d.delete_worker = None
+    d._deleting = None
     d.table = _Table()
     settings = utils.Settings()
     settings.search_min_score = min_score
@@ -856,6 +870,162 @@ class TestRestrictLibrary(unittest.TestCase):
         d.gui = types.SimpleNamespace(search=types.SimpleNamespace(set_search_string=lambda *a, **k: calls.append(1)))
         dialog.SemanticSearchDialog.restrict_library(d)
         self.assertEqual(calls, [])
+
+
+class TestDeleteChunk(unittest.TestCase):
+    """The 'Delete chunk' button removes the selected match's chunk from the store."""
+
+    def setUp(self):
+        # the stub signals are class-level and shared by every worker instance; drop slots
+        # left over from earlier tests so emits here reach only this test's handlers
+        for sig in (dialog.DeleteChunkWorker.finished_ok, dialog.DeleteChunkWorker.failed):
+            sig.slots.clear()
+
+    def _matches_view(self, d, matches):
+        """Load the books view and drill into book 1 with the given match list."""
+        _searched(d, [_result(1), _result(2)])
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.drill_into(d)
+        dialog.SemanticSearchDialog._on_book_results(d, matches, d._gen)
+
+    def test_button_hidden_until_matches_load(self):
+        d = _make_dialog(api=_FakeApi())
+        self.assertFalse(d.btn_delete.visible)
+        _searched(d, [_result(1), _result(2)])
+        self.assertFalse(d.btn_delete.visible)  # books view
+        m = _result(1)
+        m.chunk_no = 3
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.drill_into(d)
+        self.assertFalse(d.btn_delete.visible)  # matches still loading
+        dialog.SemanticSearchDialog._on_book_results(d, [m], d._gen)
+        self.assertTrue(d.btn_delete.visible)
+        self.assertTrue(d.btn_delete.enabled)
+
+    def test_no_selection_is_noop(self):
+        d = _make_dialog(api=_FakeApi())
+        m1, m2 = _result(1, score=0.9), _result(1, score=0.4)
+        m1.chunk_no, m2.chunk_no = 7, 8
+        self._matches_view(d, [m1, m2])
+        d.table.setCurrentCell(-1, 0)
+        gen = d._gen
+        dialog.SemanticSearchDialog.delete_selected(d)
+        self.assertIsNone(d.delete_worker)
+        self.assertEqual(d._gen, gen)
+
+    def test_second_click_ignored_while_deleting(self):
+        d = _make_dialog(api=_FakeApi())
+        m1, m2 = _result(1, score=0.9), _result(1, score=0.4)
+        m1.chunk_no, m2.chunk_no = 7, 8
+        self._matches_view(d, [m1, m2])
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.delete_selected(d)
+        first = d.delete_worker
+        dialog.SemanticSearchDialog.delete_selected(d)
+        self.assertIs(d.delete_worker, first)
+
+    def test_worker_targets_selected_chunk(self):
+        d = _make_dialog(api=_FakeApi(), min_score=0.35)
+        m1, m2 = _result(1, score=0.9), _result(1, score=0.4)
+        m1.chunk_no, m2.chunk_no = 7, 8
+        self._matches_view(d, [m1, m2])
+        d.table.setCurrentCell(1, 0)
+        dialog.SemanticSearchDialog.delete_selected(d)
+        w = d.delete_worker
+        self.assertIsNotNone(w)
+        self.assertEqual((w.book_id, w.chunk_no), (1, 8))
+        self.assertEqual(w.query_vec, [1.0] * 4)
+        self.assertAlmostEqual(w.min_score, 0.35)
+        self.assertEqual(w.model, d.action.get_settings().embed.model)
+        # in flight: the button is disabled and progress shows on the status line
+        self.assertFalse(d.btn_delete.enabled)
+        self.assertTrue(d.status_label.visible)
+        self.assertEqual(d.status_label.text, 'Deleting chunk...')
+
+    def test_run_deletes_and_refetches(self):
+        d = _make_dialog(api=_FakeApi())
+        m1, m2 = _result(1, score=0.9), _result(1, score=0.4)
+        m1.chunk_no, m2.chunk_no = 7, 8
+        self._matches_view(d, [m1, m2])
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.delete_selected(d)
+        w = d.delete_worker
+        remaining = _result(1, score=0.4)
+        remaining.chunk_no = 8
+        d.store.search_book_results = [remaining]
+        w.run()  # emits finished_ok synchronously
+        self.assertEqual(d.store.deleted, [(1, 7)])
+        self.assertIsNone(d.delete_worker)
+        self.assertIsNone(d._deleting)
+        self.assertEqual(d.matches, [remaining])
+        self.assertTrue(d.btn_delete.enabled)
+        self.assertEqual(d.status_label.text, '')
+
+    def test_can_delete_again_after_success(self):
+        d = _make_dialog(api=_FakeApi())
+        m1, m2 = _result(1, score=0.9), _result(1, score=0.4)
+        m1.chunk_no, m2.chunk_no = 7, 8
+        self._matches_view(d, [m1, m2])
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.delete_selected(d)
+        w1 = d.delete_worker
+        remaining = _result(1, score=0.4)
+        remaining.chunk_no = 8
+        d.store.search_book_results = [remaining]
+        w1.run()
+        self.assertIsNone(d.delete_worker)
+        # the surviving row is now row 0; deleting it starts a fresh worker
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.delete_selected(d)
+        w2 = d.delete_worker
+        self.assertIsNotNone(w2)
+        self.assertEqual((w2.book_id, w2.chunk_no), (1, 8))
+
+    def test_without_query_vector_filters_locally(self):
+        d = _make_dialog(api=_FakeApi())
+        m1, m2 = _result(1, score=0.9), _result(1, score=0.4)
+        m1.chunk_no, m2.chunk_no = 7, 8
+        self._matches_view(d, [m1, m2])
+        d._query_ctx = None
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.delete_selected(d)
+        w = d.delete_worker
+        self.assertIsNone(w.query_vec)
+        w.run()  # no vector -> emits None -> the deleted row is dropped locally
+        self.assertEqual(d.store.deleted, [(1, 7)])
+        self.assertEqual([m.chunk_no for m in d.matches], [8])
+
+    def test_failure_reports_and_reenables(self):
+        d = _make_dialog(api=_FakeApi())
+        m1, m2 = _result(1, score=0.9), _result(1, score=0.4)
+        m1.chunk_no, m2.chunk_no = 7, 8
+        self._matches_view(d, [m1, m2])
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.delete_selected(d)
+        w = d.delete_worker
+        gen = d._gen
+        dialog.SemanticSearchDialog._on_chunk_delete_failed(d, 'boom', gen, w)
+        self.assertIsNone(d.delete_worker)
+        self.assertIsNone(d._deleting)
+        self.assertTrue(d.btn_delete.enabled)
+        self.assertEqual(d.status_label.text, 'Deleting chunk failed: boom')
+        self.assertTrue(d.status_label.visible)
+
+    def test_stale_result_clears_inflight_state(self):
+        d = _make_dialog(api=_FakeApi())
+        m1, m2 = _result(1, score=0.9), _result(1, score=0.4)
+        m1.chunk_no, m2.chunk_no = 7, 8
+        self._matches_view(d, [m1, m2])
+        d.table.setCurrentCell(0, 0)
+        dialog.SemanticSearchDialog.delete_selected(d)
+        w = d.delete_worker
+        stale_gen = d._gen
+        dialog.SemanticSearchDialog.do_search(d)  # a new search supersedes the deletion
+        self.assertNotEqual(stale_gen, d._gen)
+        dialog.SemanticSearchDialog._on_chunk_deleted(d, [m1], stale_gen, w)
+        self.assertIsNone(d.delete_worker)
+        self.assertIsNone(d._deleting)
+        self.assertFalse(d.btn_delete.visible)
 
 
 if __name__ == '__main__':

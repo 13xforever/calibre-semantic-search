@@ -192,6 +192,13 @@ class _LifecycleOps:
         self._index(s, 905, 'EPUB', 2, self.MODEL)
         self.assertEqual(s.cleanup_stale_models(self.MODEL), 1)
         self.assertEqual(s.search(q, limit=10, model='stale-model'), [])
+        # -- manual chunk deletion --------------------------------------------------------
+        s.delete_chunk(905, 0)
+        self.assertEqual(s.book_chunks_text(905), ['book 905 chunk 1'])
+        reg = {b['id']: b for b in s.indexed_books()}
+        self.assertEqual(reg[905]['n_chunks'], 1)
+        # the book is still found through its surviving chunk
+        self.assertIn(905, {r.book_id for r in s.search(q, limit=10, min_score=-1.0)})
 
     def _assert_persisted(self, s):
         q = [1.0] * self.DIM
@@ -202,6 +209,10 @@ class _LifecycleOps:
         self.assertEqual((res[0].book_id, res[0].chunk_no), (901, 0))
         self.assertGreater(res[0].score, 0.999)
         self.assertEqual(s.book_chunks_text(903), [f'book 903 chunk {i}' for i in range(4)])
+        # the manually deleted chunk stays gone across a close/reopen, count included
+        reg = {b['id']: b for b in s.indexed_books()}
+        self.assertEqual(reg[905]['n_chunks'], 1)
+        self.assertEqual(s.book_chunks_text(905), ['book 905 chunk 1'])
         self.assertEqual(s.get_attrs(901)['title'], 'Ops Book One')
         self.assertEqual(s.get_attrs(903), {})
         self.assertNotIn(904, s.dirty_book_ids())
