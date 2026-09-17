@@ -16,7 +16,7 @@ re-index clears and rebuilds it.
 
 Resumable: meta['vec_migrate'] records converted tables and known-bad books,
 written before work starts and updated per batch in the same transaction as the
-rows (same pattern as the recompress marker); a crash resumes where it stopped.
+rows; a crash resumes where it stopped.
 While running, WAL auto-checkpointing is disabled and the WAL is checkpointed
 explicitly between tables. The final commit flips user_version to 3 and deletes
 the marker in one transaction, so the f16 format only ever becomes visible

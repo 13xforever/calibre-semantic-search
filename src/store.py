@@ -27,9 +27,11 @@ transfer. Chunk-text compression works the same way: meta['text_codec'] records
 the codec the chunks are actually stored with (zstd+dict or zlib), and a switch
 confirmed in settings — or a plugin update shipping a new default dictionary,
 detected on open — is recorded as a meta['recompress'] marker that
-finalize_schema() executes as an in-place, resumable conversion; the marker is
-deleted when it finishes. Opening a store whose data cannot be read with the
-currently installed packages raises MissingDependencyError.
+finalize_schema() executes as an in-place, all-or-nothing conversion: one
+transaction with a single end commit (a crash or cancel rolls it back and the
+next open re-runs it from scratch); the marker is deleted when it finishes.
+Opening a store whose data cannot be read with the currently installed packages
+raises MissingDependencyError.
 
 Schema versioning: the meta tables (books/dirty/attrs_raw/failed plus the
 models/formats/file_info registries) are versioned with PRAGMA user_version and
@@ -267,6 +269,10 @@ def model_table_name(model: str) -> str:
 
 # Memory budget for the batched sqlite search: a quarter of the available RAM, with a floor.
 SEARCH_MIN_BUDGET = 10 * 1024 * 1024
+# Same idea for the codec recompression pass, so a machine with headroom converts an
+# entire table in one read/write round trip (I/O volume is batch-independent: each
+# touched page hits the WAL once per transaction regardless).
+RECOMPRESS_MIN_BUDGET = 10 * 1024 * 1024
 
 
 def available_ram_bytes():
@@ -320,6 +326,10 @@ DEFAULT_DICT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'as
 BACKEND_KEY = 'vector_backend'  # 'sqlite' | 'lancedb' — where this library's chunks should live
 MIGRATE_KEY = 'backend_migrate'  # JSON progress of an in-flight cross-backend transfer
 RECOMPRESS_KEY = 'recompress'  # JSON progress of a pending/in-flight sqlite codec conversion (written when the user confirms a compression switch, or on open when a shipped default-dictionary change is detected)
+# Progress/cancel checkpoints inside the recompression row loop, per N rows seen —
+# the read batch itself is RAM-sized (see _recompress_batch), so on a big machine a
+# whole table is one batch and this is what keeps the progress bar and cancel alive.
+RECOMPRESS_PROGRESS_EVERY = 50_000
 VEC_MIGRATE_KEY = 'vec_migrate'  # JSON progress of an in-flight f32->f16 vector conversion (migrations.v3; deleted with the final user_version flip)
 
 
@@ -1544,7 +1554,11 @@ class VectorStore:
             return self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0] != 2
 
     def finalize_schema(self, progress=None, cancel=None):
-        """Run pending migrations (schema -> backend -> codec -> index), then one final VACUUM.
+        """Run pending migrations (schema -> backend -> codec -> index).
+
+        Ends with a full VACUUM only when a stage freed pages (legacy chunk-table
+        rebuilds, backend transfer) or the auto_vacuum setting was lost; in-place
+        work like the codec conversion frees nothing and already drains its own WAL.
 
         Idempotent and resumable: every stage records its progress in meta (or, for
         the lancedb index stage, in the dataset manifest itself), so an interrupted
@@ -1571,10 +1585,12 @@ class VectorStore:
 
         cancelled()
         did = False
+        vacuum = False
         if self.backend.pending_work():
             say('schema', 'migrating chunk tables')
             self.backend.finalize(say)
             did = True
+            vacuum = True  # the legacy chunk-table rebuilds free pages
         # evaluated live: a legacy DB finishes its chunk migrations (v2/v3) above and
         # lands here in the same pass. The version bump must come after them — v3's
         # pending check and the blob-width derivation both gate on user_version >= 3,
@@ -1592,6 +1608,7 @@ class VectorStore:
             say('backend', f'moving data to the {dst} backend')
             self._migrate_backend(src, dst, say)
             did = True
+            vacuum = True  # the source chunk tables are dropped
         cancelled()
         if self.backend_name == 'sqlite' and self.meta.get_meta(RECOMPRESS_KEY) is not None:
             say('codec', 'recompressing chunk text')
@@ -1607,6 +1624,11 @@ class VectorStore:
         with self.meta._lock:
             av = self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0]
         if not did and av == 2:
+            return
+        if not vacuum and av == 2:
+            # Only in-place / meta-only work ran (codec conversion, failed-table
+            # move): no pages were freed, so a full VACUUM would just rewrite the
+            # whole file for nothing. The codec stage already drained its own WAL.
             return
         with self.meta._lock:
             prev_ac = self.meta.conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0]
@@ -1835,17 +1857,37 @@ class VectorStore:
             return None
         return p if isinstance(p, dict) else None
 
+    def _recompress_batch(self, table) -> int:
+        """Rows per read/update pass, sized against available RAM like the search.
+
+        Probes the table's average blob size (first 1000 rows), then takes a quarter
+        of the free RAM divided by the per-row working set (old blob + decoded text
+        + new blob + Python overhead ≈ 4x the blob). On a machine with headroom this
+        is larger than the table, so the whole conversion is one round trip."""
+        with self.meta._lock:
+            lens = [r[0] or 0 for r in self.meta.conn.execute(f'SELECT LENGTH(text_z) FROM {table} LIMIT 1000').fetchall()]
+        avg = sum(lens) // max(1, len(lens)) if lens else 512
+        row_bytes = 4 * avg + 256
+        free = available_ram_bytes()
+        budget = RECOMPRESS_MIN_BUDGET if free is None else max(RECOMPRESS_MIN_BUDGET, free // 4)
+        return max(1, budget // max(1, row_bytes))
+
     def _recompress_chunks(self, say):
         """Convert every sqlite chunk row to the codec named in meta[RECOMPRESS_KEY].
 
-        In place and resumable: rows are updated in keyset batches, each batch
-        committed together with its progress marker (meta[RECOMPRESS_KEY]); a row
-        already in the target format is recognized and skipped, so a restart never
+        In place and all-or-nothing: every row is converted in one transaction with
+        a single commit at the end — a commit is a WAL fsync, so per-batch commits
+        would make this stage I/O-bound on slow disks. Read/update batches are sized
+        against available RAM (_recompress_batch), so a machine with headroom does
+        each table in one round trip. A crash or cancel rolls the
+        whole conversion back (the marker survives; it was committed before work
+        began) and the next open simply runs the stage again from scratch. A row
+        already in the target format is recognized and skipped, so a re-run never
         double-converts — for zstd that means a decode attempt with the target
         codec (a dictionary change leaves valid zstd frames behind, so magic bytes
-        cannot tell converted rows apart), for zlib a magic-byte check. The codec
-        meta flips only after every table has been fully converted, then the
-        marker is deleted."""
+        cannot tell converted rows apart), for zlib a magic-byte check. The single
+        end commit covers the row updates, the marker deletion and the codec flip
+        together."""
         prog = self._recompress_progress()
         if prog is None or prog.get('target') not in ('zstd', 'zlib'):
             return  # no valid marker: nothing to do (pending_stages gates on it)
@@ -1858,7 +1900,6 @@ class VectorStore:
         src = TextCodec(cur_spec)
         dstc = TextCodec(target_spec)
         tables = self.backend._chunk_tables()
-        done = set(prog.get('done') or [])
 
         def convert(blob):
             if prog['target'] == 'zstd':
@@ -1878,41 +1919,45 @@ class VectorStore:
             self.meta.conn.execute('PRAGMA wal_autocheckpoint=0')
         try:
             for t in tables:
-                if t in done:
-                    continue
-                last_id = prog['last_id'] if prog.get('cur_table') == t else 0
+                batch = self._recompress_batch(t)
+                last_id = 0
                 while True:
                     with self.meta._lock:
-                        rows = self.meta.conn.execute(f'SELECT id, text_z FROM {t} WHERE id>? ORDER BY id LIMIT 500', (last_id,)).fetchall()
+                        rows = self.meta.conn.execute(
+                            f'SELECT id, text_z FROM {t} WHERE id>? ORDER BY id LIMIT ?', (last_id, batch),
+                        ).fetchall()
                     if not rows:
                         break
                     updates = []
+                    seen = 0
                     for rid, blob in rows:
                         new = convert(blob)
                         if new is not None and new != blob:
                             updates.append((new, rid))
+                        seen += 1
+                        if seen % RECOMPRESS_PROGRESS_EVERY == 0:
+                            say('codec', f'{t}: row {rid}')
                     last_id = rows[-1][0]
                     with self.meta._lock:
                         if updates:
                             self.meta.conn.executemany(f'UPDATE {t} SET text_z=? WHERE id=?', updates)
-                    prog['cur_table'] = t
-                    prog['last_id'] = last_id
-                    self.meta.set_meta(RECOMPRESS_KEY, json.dumps(prog))  # commits the batch + progress atomically
                     say('codec', f'{t}: row {last_id}')
-                done.add(t)
-                prog['done'] = sorted(done)
-                prog['cur_table'] = None
-                prog['last_id'] = 0
-                self.meta.set_meta(RECOMPRESS_KEY, json.dumps(prog))
-                with self.meta._lock:
-                    self.meta.wal_checkpoint_truncate()
+            with self.meta._lock:
+                # the single end commit: row updates + marker deletion + codec flip, atomically
+                self.meta.conn.execute('DELETE FROM meta WHERE key=?', (RECOMPRESS_KEY,))
+                self.meta.conn.execute(
+                    'INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                    (TEXT_CODEC_KEY, json.dumps(target_spec)),
+                )
+                self.meta.conn.commit()
+            with self.meta._lock:
+                self.meta.wal_checkpoint_truncate()
         finally:
             with self.meta._lock:
+                # cancel/crash: discard the uncommitted conversion — the marker stays, so the
+                # next open re-runs the stage from scratch (a no-op once it has committed)
+                self.meta.conn.rollback()
                 self.meta.conn.execute(f'PRAGMA wal_autocheckpoint={prev_ac}')
-        self.meta.delete_meta(RECOMPRESS_KEY)
-        self.meta.set_meta(TEXT_CODEC_KEY, json.dumps(target_spec))
-        with self.meta._lock:
-            self.meta.wal_checkpoint_truncate()
         self._swap_backend('sqlite')  # rebuild the TextCodec on the new spec
 
     # -- pass-throughs -------------------------------------------------------------

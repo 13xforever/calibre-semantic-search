@@ -759,8 +759,46 @@ class TestFinalizeCancel(unittest.TestCase):
         ev.set()
         with self.assertRaises(store.FinalizeCancelled):
             s.finalize_schema(cancel=ev)
-        # the marker survives: a later open resumes the conversion from where it stopped
+        # the marker survives: a later open re-runs the conversion from scratch (nothing committed)
         self.assertIsNotNone(s.get_meta(store.RECOMPRESS_KEY))
+
+    def test_cancel_mid_conversion_rolls_back_and_reruns(self):
+        # one transaction, one end commit: a cancel mid-stage discards every update,
+        # the marker keeps its original progress, and a re-run converts from scratch
+        import threading
+        from dataclasses import dataclass
+        from unittest import mock
+
+        @dataclass
+        class C:
+            chunk_no: int
+            text: str
+            chapter_path: list = None
+
+        s = self.s
+        for i in range(10):
+            s.insert_chunk(1, C(i, f'text {i}', []), 'm', store.l2_normalize([1.0, 0.0, 0.0]))
+        s.commit()
+        s.upsert_book(1, 'EPUB', 10, 'm')
+        s.set_meta(store.RECOMPRESS_KEY, store.recompress_marker('zlib'))
+        ev = threading.Event()
+
+        def progress(stage, detail):
+            if stage == 'codec':
+                ev.set()  # cancel from the first progress report onward
+
+        with mock.patch.object(s, '_recompress_batch', return_value=3):
+            with self.assertRaises(store.FinalizeCancelled):
+                s.finalize_schema(progress=progress, cancel=ev)
+        prog = store.json.loads(s.get_meta(store.RECOMPRESS_KEY))
+        self.assertEqual(prog['last_id'], 0)  # nothing was ever committed
+        self.assertEqual(s.stored_codec(), 'zstd')  # the codec flip did not happen
+        # re-run: the conversion completes from scratch and the text survives
+        s.finalize_schema()
+        self.assertIsNone(s.get_meta(store.RECOMPRESS_KEY))
+        self.assertEqual(s.stored_codec(), 'zlib')
+        res = s.search([1.0, 0.0, 0.0], limit=5, min_score=-1.0)
+        self.assertEqual(res[0].text, 'text 0')
 
 
 if __name__ == '__main__':
