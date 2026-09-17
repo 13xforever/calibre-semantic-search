@@ -421,6 +421,56 @@ class TestReindexNewAndFailed(unittest.TestCase):
         self.assertEqual(store.dirty, [])
 
 
+class _ExtractStore:
+    def __init__(self, indexed=()):
+        self._indexed = {bid: n for bid, n in indexed}
+        self.wiped = []
+
+    def indexed_books(self):
+        return [{'id': b, 'n_chunks': n} for b, n in sorted(self._indexed.items())]
+
+    def wipe_failed(self, kind):
+        self.wiped.append(kind)
+
+
+class _ExtractIndexer:
+    def __init__(self):
+        self.requests = []
+
+    def request_attributes(self, book_id=None):
+        self.requests.append(book_id)
+
+
+class TestExtractActionsOpenNoDialog(unittest.TestCase):
+    """The re-extract menu actions queue work and must not open the status dialog;
+    it stays user-invoked (see todo: dialogs only for wipe confirmations)."""
+
+    def _action(self, indexed=()):
+        a = object.__new__(gui.SemanticSearchAction)
+        store = _ExtractStore(indexed)
+        ix = _ExtractIndexer()
+        shown = []
+        a.store = store
+        a.indexer = ix
+        a._ensure_started = lambda: True
+        a._check_llm_provider = lambda: True
+        a.show_status = lambda: shown.append(1)
+        return a, store, ix, shown
+
+    def test_reextract_book_queues_without_dialog(self):
+        a, store, ix, shown = self._action(indexed=[(7, 3)])
+        gui.SemanticSearchAction.reextract_attributes_book(a, 7)
+        self.assertEqual(ix.requests, [7])
+        self.assertEqual(shown, [])
+
+    def test_extract_menu_queues_without_dialog(self):
+        a, store, ix, shown = self._action()
+        gui.SemanticSearchAction.extract_attributes_menu(a)
+        self.assertEqual(store.wiped, ['attr'])
+        self.assertEqual(ix.requests, [None])
+        self.assertEqual(shown, [])
+
+
 class TestBookDetailsMenuHook(unittest.TestCase):
     def _install_fake_bd(self):
         class FakeQMenu:

@@ -1063,8 +1063,9 @@ class SemanticSearchAction(InterfaceAction):
             return
         if not self._check_llm_provider():
             return
+        # No dialog: the work is queued and progress shows in the toolbar tooltip /
+        # the user-invoked "Index status" action.
         self.indexer.request_attributes(book_id)
-        self.show_status()
 
     def reindex_new_and_failed(self):
         """Queue books that are not indexed yet, previously failed, or indexed with no
@@ -1169,22 +1170,22 @@ class SemanticSearchAction(InterfaceAction):
         return True
 
     def extract_attributes_menu(self):
-        """Force-run the attribute-extraction phase now and show live progress.
+        """Force-run the attribute-extraction phase now.
 
         Attribute extraction normally runs automatically right after indexing (see
         settings.auto_extract_attributes). This menu item re-runs it on demand: it
-        resets previously-failed books, asks the indexer to run the phase, and
-        raises the same status dialog used for indexing so progress is visible.
+        resets previously-failed books and asks the indexer to run the phase. No
+        dialog is opened; progress shows in the toolbar tooltip or the
+        user-invoked "Index status" action.
         """
         if not self._ensure_started():
             return
         if not self._check_llm_provider():
             return
         # Retry books that previously failed, then ask the indexer to run the
-        # attribute phase; raise the live status dialog so progress is immediate.
+        # attribute phase (no dialog: progress shows under "Index status").
         self.store.wipe_failed('attr')
         self.indexer.request_attributes()
-        self.show_status()
 
     def _api(self):
         try:
