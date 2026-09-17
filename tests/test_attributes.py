@@ -114,11 +114,13 @@ _FIELDS = [utils.AttrField('gender', 'ss_gender', 'text', 'g'), utils.AttrField(
 
 class FakeApi:
     def __init__(self):
-        self.columns = {}  # label -> {'label', 'datatype', 'is_multiple'}
+        self.columns = {}  # label -> {'label', 'name', 'datatype', 'is_multiple', 'num'}
         self.fields = {}
         self.created = []  # (label, name, datatype, is_multiple), in creation order
         self.deleted = []  # labels, in deletion order
+        self.renamed = []  # (label, new_name), in rename order
         self.book_values = {}  # label -> {book_id: value}, served by get_custom
+        self._next_num = 1
 
     @property
     def backend(self):
@@ -130,8 +132,18 @@ class FakeApi:
         return b
 
     def create_custom_column(self, label, name, datatype, is_multiple):
-        self.columns[label] = {'label': label, 'datatype': datatype, 'is_multiple': is_multiple}
+        num = self._next_num
+        self._next_num += 1
+        self.columns[label] = {'label': label, 'name': name, 'datatype': datatype, 'is_multiple': is_multiple, 'num': num}
         self.created.append((label, name, datatype, is_multiple))
+
+    def set_custom_column_metadata(self, num, name=None, label=None, is_editable=None, display=None):
+        for col in self.columns.values():
+            if col['num'] == num:
+                if name is not None:
+                    col['name'] = name
+                    self.renamed.append((col['label'], name))
+                break
 
     def delete_custom_column(self, label=None, num=None):
         if label is not None and label in self.columns:
@@ -687,8 +699,8 @@ class TestSyncColumns(unittest.TestCase):
         store = FakeStore()
         store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
         api = FakeApi()
-        api.columns['ss_gender'] = {'label': 'ss_gender', 'datatype': 'text', 'is_multiple': False}
-        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'datatype': 'text', 'is_multiple': True}
+        api.columns['ss_gender'] = {'label': 'ss_gender', 'name': 'Gender', 'datatype': 'text', 'is_multiple': False, 'num': 1}
+        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'name': 'Tropes', 'datatype': 'text', 'is_multiple': True, 'num': 2}
         attributes.sync_attribute_columns(api, store, self._settings(gender_enabled=False, tropes_enabled=False))
         self.assertEqual(api.columns, {})
         self.assertEqual(api.deleted, ['ss_gender', 'ss_tropes'])
@@ -698,7 +710,7 @@ class TestSyncColumns(unittest.TestCase):
         store = FakeStore()
         store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
         api = FakeApi()
-        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'datatype': 'text', 'is_multiple': True}  # stale column of the disabled field
+        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'name': 'Tropes', 'datatype': 'text', 'is_multiple': True, 'num': 1}  # stale column of the disabled field
         attributes.sync_attribute_columns(api, store, self._settings(tropes_enabled=False))
         self.assertNotIn('ss_tropes', api.columns)  # deleted
         self.assertIn('ss_gender', api.columns)  # created
@@ -709,14 +721,15 @@ class TestSyncColumns(unittest.TestCase):
         store = FakeStore()
         store.attrs[1] = {'gender': 'female', 'tropes': ['a']}
         api = FakeApi()
-        api.columns['ss_gender'] = {'label': 'ss_gender', 'datatype': 'text', 'is_multiple': False}
-        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'datatype': 'text', 'is_multiple': True}
+        api.columns['ss_gender'] = {'label': 'ss_gender', 'name': 'Gender', 'datatype': 'text', 'is_multiple': False, 'num': 1}
+        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'name': 'Tropes', 'datatype': 'text', 'is_multiple': True, 'num': 2}
         attributes.sync_attribute_columns(api, store, self._settings())
         # re-running must not duplicate or drop anything
         attributes.sync_attribute_columns(api, store, self._settings())
         self.assertEqual(sorted(api.columns), ['ss_gender', 'ss_tropes'])
         self.assertEqual(api.created, [])
         self.assertEqual(api.deleted, [])
+        self.assertEqual(api.renamed, [])  # titles already match -> no in-place rename
         self.assertEqual(api.fields['#ss_gender'], {1: 'female'})
 
 
@@ -741,15 +754,16 @@ class TestColumnConversion(unittest.TestCase):
 
     def test_matching_column_left_alone(self):
         api = FakeApi()
-        api.columns['ss_blurb'] = {'label': 'ss_blurb', 'datatype': 'comments', 'is_multiple': False}
+        api.columns['ss_blurb'] = {'label': 'ss_blurb', 'name': 'Blurb', 'datatype': 'comments', 'is_multiple': False, 'num': 1}
         attributes.ensure_columns(api, self._settings())
         self.assertEqual(api.created, [])
         self.assertEqual(api.deleted, [])
+        self.assertEqual(api.renamed, [])
 
     def test_text_column_converted_to_comments_values_preserved(self):
         # the pre-rename default: ss_blurb existed as a single-value text column
         api = FakeApi()
-        api.columns['ss_blurb'] = {'label': 'ss_blurb', 'datatype': 'text', 'is_multiple': False}
+        api.columns['ss_blurb'] = {'label': 'ss_blurb', 'name': 'Blurb', 'datatype': 'text', 'is_multiple': False, 'num': 1}
         api.book_values['ss_blurb'] = {1: 'A storm is coming.', 2: ''}
         attributes.ensure_columns(api, self._settings())
         self.assertEqual(api.deleted, ['ss_blurb'])
@@ -758,7 +772,7 @@ class TestColumnConversion(unittest.TestCase):
 
     def test_tags_column_converted_to_category_joins_values(self):
         api = FakeApi()
-        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'datatype': 'text', 'is_multiple': True}
+        api.columns['ss_tropes'] = {'label': 'ss_tropes', 'name': 'Tropes', 'datatype': 'text', 'is_multiple': True, 'num': 1}
         api.book_values['ss_tropes'] = {1: ['slow burn', 'found family'], 2: []}
         attributes.ensure_columns(api, self._settings('tropes', 'ss_tropes', 'category'))
         self.assertEqual(api.created, [('ss_tropes', 'Tropes', 'text', False)])
@@ -766,11 +780,54 @@ class TestColumnConversion(unittest.TestCase):
 
     def test_category_column_converted_to_tags_splits_single_value(self):
         api = FakeApi()
-        api.columns['ss_pov'] = {'label': 'ss_pov', 'datatype': 'text', 'is_multiple': False}
+        api.columns['ss_pov'] = {'label': 'ss_pov', 'name': 'Pov', 'datatype': 'text', 'is_multiple': False, 'num': 1}
         api.book_values['ss_pov'] = {1: 'first person'}
         attributes.ensure_columns(api, self._settings('pov', 'ss_pov', 'tags'))
         self.assertEqual(api.created, [('ss_pov', 'Pov', 'text', True)])
         self.assertEqual(api.fields['#ss_pov'], {1: ['first person']})
+
+
+class TestColumnTitle(unittest.TestCase):
+    """The configured title is used on create and enforced in place on existing columns."""
+
+    def _settings(self, name='gender', label='ss_gender', ftype='category', title=''):
+        s = utils.Settings()
+        s.attributes = [utils.AttrField(name, label, ftype, 'd', True, '', title)]
+        return s
+
+    def test_custom_title_used_on_create(self):
+        api = FakeApi()
+        attributes.ensure_columns(api, self._settings(title='Main Gender'))
+        self.assertEqual(api.created, [('ss_gender', 'Main Gender', 'text', False)])
+        self.assertEqual(api.renamed, [])
+
+    def test_blank_title_falls_back_to_human_name(self):
+        api = FakeApi()
+        attributes.ensure_columns(api, self._settings(title='   '))
+        self.assertEqual(api.created, [('ss_gender', 'Gender', 'text', False)])
+
+    def test_existing_column_renamed_in_place(self):
+        # a column whose stored title differs is renamed without create/delete (no data loss)
+        api = FakeApi()
+        api.columns['ss_gender'] = {'label': 'ss_gender', 'name': 'Old Title', 'datatype': 'text', 'is_multiple': False, 'num': 7}
+        attributes.ensure_columns(api, self._settings(title='New Title'))
+        self.assertEqual(api.created, [])
+        self.assertEqual(api.deleted, [])
+        self.assertEqual(api.renamed, [('ss_gender', 'New Title')])
+
+    def test_clearing_title_reverts_to_derived_in_place(self):
+        api = FakeApi()
+        api.columns['ss_gender'] = {'label': 'ss_gender', 'name': 'Custom', 'datatype': 'text', 'is_multiple': False, 'num': 7}
+        attributes.ensure_columns(api, self._settings(title=''))
+        self.assertEqual(api.renamed, [('ss_gender', 'Gender')])
+
+    def test_matching_title_is_noop(self):
+        api = FakeApi()
+        api.columns['ss_gender'] = {'label': 'ss_gender', 'name': 'Gender', 'datatype': 'text', 'is_multiple': False, 'num': 7}
+        attributes.ensure_columns(api, self._settings(title=''))
+        self.assertEqual(api.created, [])
+        self.assertEqual(api.deleted, [])
+        self.assertEqual(api.renamed, [])
 
 
 class TestLanguageNote(unittest.TestCase):

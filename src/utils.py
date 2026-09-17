@@ -36,6 +36,7 @@ class AttrField:
     description: str
     enabled: bool = True
     language: str = ''  # '' = no instruction | 'book' = the book's original language | any other string is used verbatim as a language name in the prompt
+    title: str = ''  # '' = derive from name (human_name); otherwise the calibre column's display title, used verbatim
 
     def clone(self) -> 'AttrField':
         return AttrField(**asdict(self))

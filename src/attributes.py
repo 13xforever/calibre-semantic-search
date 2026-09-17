@@ -44,6 +44,13 @@ def human_name(name: str) -> str:
     return name.replace('_', ' ').title()
 
 
+def column_title(f) -> str:
+    """The calibre column's display title for a field: the configured title, or a
+    derived one (underscores to spaces, title-cased) when none is set."""
+    t = (f.title or '').strip()
+    return t or human_name(f.name)
+
+
 def _column_spec(f) -> tuple[str, bool]:
     """Calibre column (datatype, is_multiple) for an attribute field."""
     if f.type == 'tags':
@@ -80,7 +87,7 @@ def _convert_column(api, f, datatype, is_multiple):
         print(f'semantic search: could not read column {f.label} for conversion: {e!r}')
     try:
         api.delete_custom_column(label=f.label)
-        api.create_custom_column(f.label, human_name(f.name), datatype, is_multiple)
+        api.create_custom_column(f.label, column_title(f), datatype, is_multiple)
         if old:
             api.set_field(column_key(f.label), old)
     except Exception as e:
@@ -88,25 +95,33 @@ def _convert_column(api, f, datatype, is_multiple):
 
 
 def ensure_columns(new_api, settings) -> dict[str, str]:
-    """Ensure a custom column of the right type exists for every enabled attribute.
+    """Ensure a custom column of the right type and title exists for every enabled attribute.
 
     Returns {field.name: '#label'}. 'tags' fields use datatype 'text' with
     is_multiple=True (the same mechanism calibre uses for #tags); 'category'
     fields use single-value 'text'; 'text' fields use datatype 'comments'
     (plain multi-line, like #description — no tag-browser category). A column
     whose stored type no longer matches the field is converted in place with
-    its values copied across.
+    its values copied across; a column whose display title differs from the
+    configured one is renamed in place (no data loss).
     """
     out = {}
     existing = new_api.backend.custom_column_label_map
     for f in settings.enabled_attributes():
         datatype, is_multiple = _column_spec(f)
+        desired = column_title(f)
         meta = existing.get(f.label)
         if meta is None:
-            new_api.create_custom_column(f.label, human_name(f.name), datatype, is_multiple)
+            new_api.create_custom_column(f.label, desired, datatype, is_multiple)
             existing = new_api.backend.custom_column_label_map
         elif meta['datatype'] != datatype or bool(meta['is_multiple']) != is_multiple:
             _convert_column(new_api, f, datatype, is_multiple)
+            existing = new_api.backend.custom_column_label_map
+        # enforce the configured title in place (covers the no-type-change case and
+        # any manual rename); a no-op once the stored name already matches
+        meta = existing.get(f.label)
+        if meta is not None and meta.get('name') != desired:
+            new_api.set_custom_column_metadata(meta['num'], name=desired)
             existing = new_api.backend.custom_column_label_map
         out[f.name] = column_key(f.label)
     return out

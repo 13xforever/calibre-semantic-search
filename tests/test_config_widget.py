@@ -169,6 +169,9 @@ def _install_stubs():
         def text(self):
             return self._text
 
+        def setText(self, t):
+            self._text = t
+
         def setCheckState(self, v):
             self._check = v
 
@@ -457,7 +460,7 @@ class TestAttrTableCollect(unittest.TestCase):
         w = self._widget()
         # disable the first field and switch its type via the dropdown
         w.attr_table.item(0, 0).setCheckState(cfgw.Qt.CheckState.Unchecked)
-        w.attr_table.cellWidget(0, 2).setCurrentText('tags')
+        w.attr_table.cellWidget(0, 3).setCurrentText('tags')
         w._collect_and_accept()
         a = w.settings().attributes[0]
         self.assertFalse(a.enabled)
@@ -467,32 +470,32 @@ class TestAttrTableCollect(unittest.TestCase):
 
     def test_type_combo_items(self):
         w = self._widget()
-        combo = w.attr_table.cellWidget(0, 2)
+        combo = w.attr_table.cellWidget(0, 3)
         items = [combo.itemText(i) for i in range(combo.count())]
         self.assertEqual(items, ['text', 'category', 'tags'])
 
     def test_language_combo_items_and_blurb_default(self):
         w = self._widget()
-        combo = w.attr_table.cellWidget(0, 3)
+        combo = w.attr_table.cellWidget(0, 4)
         items = [combo.itemText(i) for i in range(combo.count())]
         self.assertEqual(items, ['Default', 'Match book'])
         # the blurb row ships with match-book selected
         row = next(r for r in range(w.attr_table.rowCount()) if w.attr_table.item(r, 1).text() == 'blurb')
-        self.assertEqual(w.attr_table.cellWidget(row, 3).currentText(), 'Match book')
+        self.assertEqual(w.attr_table.cellWidget(row, 4).currentText(), 'Match book')
 
     def test_language_collect_mappings(self):
         # typed free text is kept as a forced language name
         w = self._widget()
-        w.attr_table.cellWidget(0, 3).setCurrentText('russian')
+        w.attr_table.cellWidget(0, 4).setCurrentText('russian')
         w._collect_and_accept()
         self.assertEqual(w.settings().attributes[0].language, 'russian')
         # the presets map to their sentinels
         w2 = self._widget()
-        w2.attr_table.cellWidget(0, 3).setCurrentText('Match book')
+        w2.attr_table.cellWidget(0, 4).setCurrentText('Match book')
         w2._collect_and_accept()
         self.assertEqual(w2.settings().attributes[0].language, 'book')
         w3 = self._widget()
-        w3.attr_table.cellWidget(0, 3).setCurrentText('Default')
+        w3.attr_table.cellWidget(0, 4).setCurrentText('Default')
         w3._collect_and_accept()
         self.assertEqual(w3.settings().attributes[0].language, '')
 
@@ -503,8 +506,20 @@ class TestAttrTableCollect(unittest.TestCase):
         self.assertEqual(w.attr_table.rowCount(), n + 1)
         self.assertEqual(w.attr_table.item(n, 1).text(), 'new_field')
         self.assertEqual(w.attr_table.item(n, 0).checkState(), cfgw.Qt.CheckState.Checked)
-        self.assertEqual(w.attr_table.cellWidget(n, 2).currentText(), 'text')
-        self.assertEqual(w.attr_table.cellWidget(n, 3).currentText(), 'Default')
+        self.assertEqual(w.attr_table.item(n, 2).text(), '')  # title starts empty (derived on save)
+        self.assertEqual(w.attr_table.cellWidget(n, 3).currentText(), 'text')
+        self.assertEqual(w.attr_table.cellWidget(n, 4).currentText(), 'Default')
+
+    def test_title_round_trips(self):
+        # a typed title is collected into the field; blank/whitespace stays empty (derived on save)
+        w = self._widget()
+        w.attr_table.item(0, 2).setText('Main Character Gender')
+        w._collect_and_accept()
+        self.assertEqual(w.settings().attributes[0].title, 'Main Character Gender')
+        w2 = self._widget()
+        w2.attr_table.item(0, 2).setText('   ')
+        w2._collect_and_accept()
+        self.assertEqual(w2.settings().attributes[0].title, '')
 
 
 class TestTemplateKwargsSetting(unittest.TestCase):

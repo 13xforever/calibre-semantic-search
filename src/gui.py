@@ -70,9 +70,9 @@ class _GuiDbProxy:
 
     The real new_api is resolved lazily via a getter so the proxy stays valid
     across library switches. calibre's newAPI is not safe to write from a worker
-    thread, so create_custom_column, delete_custom_column and set_field are
-    marshalled to the GUI thread synchronously; everything else (reads such as
-    backend.custom_column_label_map) passes straight through.
+    thread, so create_custom_column, delete_custom_column, set_field and
+    set_custom_column_metadata are marshalled to the GUI thread synchronously;
+    everything else (reads such as backend.custom_column_label_map) passes straight through.
     '''
 
     def __init__(self, action, get_real):
@@ -96,6 +96,9 @@ class _GuiDbProxy:
 
     def set_field(self, *a, **k):
         self._action._run_db_write('set_field', a, k)
+
+    def set_custom_column_metadata(self, *a, **k):
+        self._action._run_db_write('set_custom_column_metadata', a, k)
 
 
 class StatusDialog(QDialog):

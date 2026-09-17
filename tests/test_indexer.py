@@ -99,6 +99,7 @@ class FakeWriter:
     def __init__(self):
         self.columns = {}
         self.fields = {}
+        self._next_num = 1
 
     @property
     def backend(self):
@@ -111,7 +112,16 @@ class FakeWriter:
         return b
 
     def create_custom_column(self, label, name, datatype, is_multiple):
-        self.columns[label] = {'label': label, 'datatype': datatype, 'is_multiple': is_multiple}
+        num = self._next_num
+        self._next_num += 1
+        self.columns[label] = {'label': label, 'name': name, 'datatype': datatype, 'is_multiple': is_multiple, 'num': num}
+
+    def set_custom_column_metadata(self, num, name=None, label=None, is_editable=None, display=None):
+        for col in self.columns.values():
+            if col['num'] == num:
+                if name is not None:
+                    col['name'] = name
+                break
 
     def set_field(self, key, mapping):
         self.fields.setdefault(key, {}).update(mapping)

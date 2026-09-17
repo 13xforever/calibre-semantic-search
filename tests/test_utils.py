@@ -100,7 +100,7 @@ class TestSettingsRoundtrip(unittest.TestCase):
     def test_custom_attribute_preserved(self):
         get, set_ = self._prefs()
         s = utils.load_settings(get)
-        s.attributes.append(utils.AttrField('my_field', 'ss_myfield', 'tags', 'custom desc', True))
+        s.attributes.append(utils.AttrField('my_field', 'ss_myfield', 'tags', 'custom desc', True, '', 'My Field Title'))
         utils.save_settings(set_, s)
         s2 = utils.load_settings(get)
         names = [a.name for a in s2.attributes]
@@ -109,6 +109,17 @@ class TestSettingsRoundtrip(unittest.TestCase):
         self.assertEqual(mine.type, 'tags')
         self.assertEqual(mine.description, 'custom desc')
         self.assertTrue(mine.enabled)
+        self.assertEqual(mine.title, 'My Field Title')
+
+    def test_legacy_blob_without_title_defaults_empty(self):
+        # fields saved before the title option existed load with a blank title (derived on use)
+        get, set_ = self._prefs()
+        import json as _json
+
+        data = {'attributes': [{'name': 'pov', 'label': 'ss_pov', 'type': 'category', 'description': 'x', 'enabled': True}]}
+        set_(utils.PREF_KEY, _json.dumps(data))
+        s = utils.load_settings(get)
+        self.assertEqual(next(a for a in s.attributes if a.name == 'pov').title, '')
 
     def test_corrupt_json_falls_back(self):
         get, set_ = self._prefs()

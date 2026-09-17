@@ -205,6 +205,11 @@ HELP_ATTR_NAME = _(
     "Internal name of the field (lowercase letters, digits, underscores). Determines the calibre "
     "custom column (label 'ss_...') where values are stored."
 )
+HELP_ATTR_TITLE = _(
+    "Human-readable title shown for this attribute in calibre's UI (columns, filters, book details). "
+    "Leave empty to derive it from the field name (underscores become spaces, e.g. 'main_character' "
+    "becomes 'Main Character'). Changing it renames the existing column in place."
+)
 HELP_ATTR_TYPE = _(
     "text = plain multi-line text, like the Description field: shown in Edit metadata and the Book details "
     "panel, but not a Tag browser category.\n"
@@ -374,17 +379,18 @@ class SettingsWidget(QDialog):
         self.e_template_kwargs.setPlaceholderText('{"enable_thinking": false}')
         tk_row.addWidget(self.e_template_kwargs, 1)
         av.addLayout(tk_row)
-        self.attr_table = QTableWidget(len(self.s.attributes), 5)
-        self.attr_table.setHorizontalHeaderLabels([_('Enabled'), _('Name'), _('Type'), _('Language'), _('Description')])
-        self.attr_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.attr_table = QTableWidget(len(self.s.attributes), 6)
+        self.attr_table.setHorizontalHeaderLabels([_('Enabled'), _('Name'), _('Title'), _('Type'), _('Language'), _('Description')])
+        self.attr_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         for r, a in enumerate(self.s.attributes):
             cb = QTableWidgetItem()
             cb.setCheckState(Qt.CheckState.Unchecked if not a.enabled else Qt.CheckState.Checked)
             self.attr_table.setItem(r, 0, cb)
             self.attr_table.setItem(r, 1, QTableWidgetItem(a.name))
-            self.attr_table.setCellWidget(r, 2, self._attr_type_combo(a.type))
-            self.attr_table.setCellWidget(r, 3, self._attr_language_combo(a.language))
-            self.attr_table.setItem(r, 4, QTableWidgetItem(a.description))
+            self.attr_table.setItem(r, 2, QTableWidgetItem(a.title))
+            self.attr_table.setCellWidget(r, 3, self._attr_type_combo(a.type))
+            self.attr_table.setCellWidget(r, 4, self._attr_language_combo(a.language))
+            self.attr_table.setItem(r, 5, QTableWidgetItem(a.description))
         av.addWidget(self.attr_table, 1)
         btns = QHBoxLayout()
         b_add = QPushButton(_('Add field'))
@@ -447,7 +453,7 @@ class SettingsWidget(QDialog):
         B(HELP_MAX_CHUNKS, self.i_maxchunks, f2.labelForField(self.i_maxchunks))
         B(HELP_MIN_SCORE, self.i_min_score, f2.labelForField(self.i_min_score))
         B(HELP_ATTR_MODE, self.i_attrmode, f2.labelForField(self.i_attrmode))
-        for col, key in enumerate((HELP_ATTR_ENABLED, HELP_ATTR_NAME, HELP_ATTR_TYPE, HELP_ATTR_LANGUAGE, HELP_ATTR_DESC)):
+        for col, key in enumerate((HELP_ATTR_ENABLED, HELP_ATTR_NAME, HELP_ATTR_TITLE, HELP_ATTR_TYPE, HELP_ATTR_LANGUAGE, HELP_ATTR_DESC)):
             item = self.attr_table.horizontalHeaderItem(col)
             if item is not None:
                 item.setToolTip(key)
@@ -506,9 +512,10 @@ class SettingsWidget(QDialog):
         cb.setCheckState(Qt.CheckState.Checked)
         self.attr_table.setItem(r, 0, cb)
         self.attr_table.setItem(r, 1, QTableWidgetItem('new_field'))
-        self.attr_table.setCellWidget(r, 2, self._attr_type_combo('text'))
-        self.attr_table.setCellWidget(r, 3, self._attr_language_combo(''))
-        self.attr_table.setItem(r, 4, QTableWidgetItem(''))
+        self.attr_table.setItem(r, 2, QTableWidgetItem(''))
+        self.attr_table.setCellWidget(r, 3, self._attr_type_combo('text'))
+        self.attr_table.setCellWidget(r, 4, self._attr_language_combo(''))
+        self.attr_table.setItem(r, 5, QTableWidgetItem(''))
 
     def _del_attr(self):
         r = self.attr_table.currentRow()
@@ -713,11 +720,12 @@ class SettingsWidget(QDialog):
             name = ''.join(c if c.isalnum() or c == '_' else '_' for c in name)
             if not name:
                 continue
-            combo = self.attr_table.cellWidget(r, 2)
+            title = (self.attr_table.item(r, 2).text() if self.attr_table.item(r, 2) else '').strip()
+            combo = self.attr_table.cellWidget(r, 3)
             typ = (combo.currentText() if combo is not None else 'text').strip().lower()
             if typ not in ('text', 'category', 'tags'):
                 typ = 'text'
-            lang_combo = self.attr_table.cellWidget(r, 3)
+            lang_combo = self.attr_table.cellWidget(r, 4)
             lang_raw = (lang_combo.currentText() if lang_combo is not None else '').strip()
             lang_cf = lang_raw.casefold()
             if lang_cf in ('', 'default'):
@@ -726,12 +734,12 @@ class SettingsWidget(QDialog):
                 lang = 'book'
             else:
                 lang = lang_raw  # a forced language name, kept as typed
-            desc = (self.attr_table.item(r, 4).text() if self.attr_table.item(r, 4) else '').strip()
+            desc = (self.attr_table.item(r, 5).text() if self.attr_table.item(r, 5) else '').strip()
             enabled = bool(self.attr_table.item(r, 0) and self.attr_table.item(r, 0).checkState() == Qt.CheckState.Checked)
             # preserve label from existing schema when possible
             old = next((a for a in self.s.attributes if a.name == name), None)
             label = old.label if old else ('ss_' + name[:30])
-            attrs.append(AttrField(name=name, label=label, type=typ, description=desc, enabled=enabled, language=lang))
+            attrs.append(AttrField(name=name, label=label, type=typ, description=desc, enabled=enabled, language=lang, title=title))
         s.attributes = attrs or [a.clone() for a in self.s.attributes]
         self._result = s
         self.accept()
