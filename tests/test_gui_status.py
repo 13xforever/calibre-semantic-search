@@ -131,6 +131,26 @@ class TestStatusLines(unittest.TestCase):
         # no queue-length line: the done/total on the action line covers it
         self.assertFalse(any(l.startswith('Pending:') for l in lines))
 
+    def test_attr_failures_listed_before_index_failures(self):
+        # attribute failures are the more actionable issues; they must sit above
+        # the indexing ones so they are easier to keep an eye on
+        a = object.__new__(gui.SemanticSearchAction)
+
+        class _Store(FakeStore):
+            def failed_entries(self, kind=None):
+                if kind == 'attr':
+                    return [{'book_id': 1, 'error': 'llm timeout'}]
+                return [{'book_id': 2, 'error': 'no text found'}]
+
+        a.store = _Store()
+        a._last_status = {'state': 'idle'}
+        a._api = lambda: FakeApi()
+        a.get_settings = lambda: utils.Settings()
+        lines = gui.SemanticSearchAction.status_lines(a)
+        attr_i = next(i for i, l in enumerate(lines) if l.startswith('Attribute failures'))
+        idx_i = next(i for i, l in enumerate(lines) if l.startswith('Failed books'))
+        self.assertLess(attr_i, idx_i)
+
     def test_no_api_falls_back_to_indexed(self):
         lines = _status_lines(None)
         self.assertEqual(lines[1], 'Indexed books: 2')

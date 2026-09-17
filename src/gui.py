@@ -851,15 +851,8 @@ class SemanticSearchAction(InterfaceAction):
             with_chunks = [b for b in books if b['n_chunks'] > 0]
             done_attrs = max(0, len(with_chunks) - len(pending_attrs))
             lines.append(f'Attributes stored: {done_attrs}/{len(with_chunks)} books')
-        try:
-            failed = self.store.failed_entries('index')
-        except Exception:
-            failed = []
-        if failed and api is not None:
-            lines.append('')
-            lines.append(f'Failed books: {len(failed)}')
-            for entry in failed:
-                lines.append(f'{self._book_label(entry["book_id"], api)}: {entry["error"]}')
+        # attribute failures first: they are the more actionable issues and the
+        # user wants them on top while watching the dialog
         try:
             attr_failed = self.store.failed_entries('attr')
         except Exception:
@@ -868,6 +861,15 @@ class SemanticSearchAction(InterfaceAction):
             lines.append('')
             lines.append(f'Attribute failures: {len(attr_failed)} (use "Extract attributes..." to retry)')
             for entry in attr_failed:
+                lines.append(f'{self._book_label(entry["book_id"], api)}: {entry["error"]}')
+        try:
+            failed = self.store.failed_entries('index')
+        except Exception:
+            failed = []
+        if failed and api is not None:
+            lines.append('')
+            lines.append(f'Failed books: {len(failed)}')
+            for entry in failed:
                 lines.append(f'{self._book_label(entry["book_id"], api)}: {entry["error"]}')
         return lines
 
