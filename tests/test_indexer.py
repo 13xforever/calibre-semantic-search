@@ -2,6 +2,7 @@ import importlib.util
 import os as _os
 import sys as _sys
 import tempfile
+import time
 import types
 import unittest
 
@@ -529,6 +530,76 @@ class TestPauseResume(unittest.TestCase):
         self.assertTrue(completed)
         self.assertEqual(done[0][0], 1)
         self.assertIn('attributes_done', [s['state'] for s in statuses])
+        vs.close()
+
+
+class TestResumeReconcile(unittest.TestCase):
+    """A book that failed indexing and was then removed from the library must be
+    cleaned up when indexing resumes (not before a library switch or calibre restart);
+    while paused itself nothing runs."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_interval = indexer.Indexer.IDLE_RECONCILE_SECONDS
+        indexer.Indexer.IDLE_RECONCILE_SECONDS = 0.2
+
+    def tearDown(self):
+        indexer.Indexer.IDLE_RECONCILE_SECONDS = self._orig_interval
+        self._tmp.cleanup()
+
+    def test_removed_failed_book_cleaned_on_resume(self):
+        vs = store_mod.VectorStore(_os.path.join(self._tmp.name, 't.db'), backend='sqlite')
+        settings = utils.Settings()
+        api = FakeApi([1])  # book 2 is gone from the library
+        ix = indexer.Indexer(
+            store=vs,
+            get_new_api=lambda: api,
+            settings_provider=lambda: settings,
+            status_cb=lambda d: None,
+            attr_writer=FakeWriter(),
+        )
+        vs.set_failed(2, 'index', 'embedding failed')
+        ix.pause()
+        ix.start()
+        try:
+            # while paused nothing runs: the stale entry must still be there
+            time.sleep(0.5)
+            self.assertEqual(vs.failed_book_ids(), [2])
+            ix.resume()
+            deadline = time.time() + 5
+            while time.time() < deadline and 2 in vs.failed_book_ids():
+                time.sleep(0.05)
+        finally:
+            ix.stop()
+            ix.join(timeout=5)
+        # book 2 (gone from the library) is cleaned up; book 1 may have its own
+        # failure from the worker picking it up after resume, which is irrelevant here
+        self.assertNotIn(2, vs.failed_book_ids())
+        vs.close()
+
+    def test_paused_loop_does_not_process_dirty_queue(self):
+        # reconcile keeps running while paused, but no indexing work happens
+        vs = store_mod.VectorStore(_os.path.join(self._tmp.name, 't.db'), backend='sqlite')
+        settings = utils.Settings()
+        api = FakeApi([1])
+        ix = indexer.Indexer(
+            store=vs,
+            get_new_api=lambda: api,
+            settings_provider=lambda: settings,
+            status_cb=lambda d: None,
+            attr_writer=FakeWriter(),
+        )
+        vs.add_dirty(1)
+        ix.pause()
+        ix.start()
+        try:
+            # long enough for several reconcile cycles at the shortened interval
+            time.sleep(0.6)
+        finally:
+            ix.stop()
+            ix.join(timeout=5)
+        self.assertEqual(vs.dirty_book_ids(), [1])
+        self.assertFalse(vs.book_is_indexed(1))
         vs.close()
 
 

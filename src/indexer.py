@@ -359,14 +359,23 @@ class Indexer(threading.Thread):
 
     def run(self):
         idle_since = None
+        was_paused = False
         while not self.stop_event.is_set():
             try:
                 if self._paused.is_set():
                     # Suspend without touching the queues; pick up where we left off
                     # on resume. Takes effect between books/phases, not mid-book.
+                    was_paused = True
                     self.status_cb({'state': 'paused'})
                     self.stop_event.wait(1)
                     continue
+                if was_paused:
+                    # Just resumed: resync with the library once (reads library
+                    # metadata and writes our own store — no embedding/LLM calls) so
+                    # books removed from the library while paused are cleaned up.
+                    was_paused = False
+                    idle_since = None
+                    self.reconcile()
                 pending = self.store.dirty_book_ids()
                 if pending:
                     # Indexing (embedding) has priority: drain the whole dirty queue
