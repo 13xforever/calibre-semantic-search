@@ -453,6 +453,39 @@ class TestForcedAttrExtraction(unittest.TestCase):
         self.assertEqual(ix._attr_phase_books(settings), [X, 20, 10])
         vs.close()
 
+    def test_requeue_mid_phase_jumps_back(self):
+        # a book already processed earlier in this pass is re-queued while a later book
+        # is still running; the worker must jump back to it (the live queue top) instead
+        # of plowing down the stale list — mirrors re-extracting a just-finished book
+        vs, ix, settings, statuses, done = self._make()
+        for bid in (30, 20, 10):
+            _index_book(vs, bid)
+            vs.set_attrs(bid, {'gender': 'old', 'tropes': []})  # complete -> only forced work
+        ix.request_attributes(30)
+        ix.request_attributes(20)
+        ix.request_attributes(10)
+        self.assertEqual(ix._attr_phase_books(settings), [30, 20, 10])
+        llm = FakeLLM({'gender': 'f'})
+        inner = llm.generate_structured_output
+        calls = {'n': 0}
+
+        def gen(*a, **kw):
+            r = inner(*a, **kw)
+            calls['n'] += 1
+            if calls['n'] == 2:  # during the second book's (20) extraction
+                ix.request_attributes(30)  # re-queue the already-processed book 30
+            return r
+
+        llm.generate_structured_output = gen
+        completed = ix._process_attributes(ix._attr_phase_books(settings), settings, llm=llm)
+        self.assertFalse(completed)  # must restart to run the re-queued book first
+        # 30 and 20 finished before the re-queue; restarting puts 30 back ahead of 10
+        self.assertEqual(vs.get_attrs(30)['gender'], 'f')
+        self.assertEqual(vs.get_attrs(20)['gender'], 'f')
+        self.assertEqual(done, [])
+        self.assertEqual(ix._attr_phase_books(settings), [30, 10])
+        vs.close()
+
     def test_request_attributes_all_queues_whole_library(self):
         # whole-library force enqueues every indexed book at the default tier; a
         # per-book request still jumps ahead of it
