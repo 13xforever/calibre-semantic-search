@@ -18,6 +18,7 @@ DEFAULT_CONTEXT_TOKENS = 8192
 OVERHEAD_TOKENS = 1024  # tokens held back for the model's structured output + wrapper; the per-schema prompt size is measured and subtracted separately (see _text_token_budget)
 EST_SAFETY_FACTOR = 1.13  # headroom for estimate_tokens undershooting the model's real tokenizer
 MIN_TEXT_CHARS = 2000  # floor so a tiny context limit still yields a usable sample
+STRUCTURED_RETRIES = 2  # re-samples after a model-output failure (invalid JSON or wrong shape) before failing the book
 
 
 def text_budget_chars(context_tokens: int) -> int:
@@ -434,9 +435,7 @@ def _merge_fulltext_partials(fields, partials, llm, max_tok, stage_cb=None):
         if stage_cb:
             stage_cb('merging')
         schema = build_schema_class([f for f, _ in pending], doc='Merge the partial attribute values into one final value per field.')
-        res = llm.generate_structured_output(_reduce_prompt(pending, max_tok), schema, 'You are merging partial book attribute extractions into final values. Use only information present in the partials.')
-        if res.exception is not None:
-            raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
+        res = _generate_structured(llm, _reduce_prompt(pending, max_tok), schema, 'You are merging partial book attribute extractions into final values. Use only information present in the partials.')
         for f, distinct in pending:
             r = _normalize_value(getattr(res.data, f.name, None) if res.data is not None else None, 'text')
             values[f.name] = r or distinct[0]
@@ -489,10 +488,37 @@ def _with_template_kwargs(llm, raw: str):
                 pass
 
 
+def _is_model_output_error(exc) -> bool:
+    """Whether a failed structured-output response is a model-output problem worth
+    re-sampling. calibre's parse_structured_response surfaces both invalid JSON and
+    valid-JSON-with-a-wrong-shape as ValueError; network/HTTP failures are OSError
+    subclasses (HTTPError/URLError) and are not retried here."""
+    return isinstance(exc, ValueError)
+
+
+def _generate_structured(llm, prompt: str, schema, instructions: str):
+    """One generate_structured_output call. A model-output failure (the LLM returned an
+    answer that is invalid JSON or doesn't match the schema) is re-sampled up to
+    STRUCTURED_RETRIES more times, immediately, before the book is failed; any other
+    failure (e.g. network/HTTP) raises at once."""
+    max_attempts = 1 + STRUCTURED_RETRIES
+    res = llm.generate_structured_output(prompt, schema, instructions)
+    attempts = 1
+    while res.exception is not None and _is_model_output_error(res.exception) and attempts < max_attempts:
+        res = llm.generate_structured_output(prompt, schema, instructions)
+        attempts += 1
+    if res.exception is not None:
+        plural = '' if attempts == 1 else 's'
+        raise RuntimeError(f'attribute extraction failed after {attempts} attempt{plural}: {res.error_details or res.exception}')
+    return res
+
+
 def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, progress_cb=None, stage_cb=None):
     """Extract attributes for one book and write them to custom columns.
 
-    Returns the raw values dict. Raises on LLM errors (caller decides whether to retry).
+    Returns the raw values dict. A model-output failure (the LLM returned an answer that
+    is invalid JSON or doesn't match the schema) is re-sampled up to STRUCTURED_RETRIES
+    times before raising; other LLM errors (e.g. network/HTTP) raise immediately.
     In fulltext mode `progress_cb(done, total)` is called before each map call so the
     caller can surface per-book sub-progress; sampled mode is a single call and emits none.
     `stage_cb(name)` reports stage transitions: 'merging' is emitted right before the
@@ -522,16 +548,12 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
             for i, g in enumerate(groups):
                 if progress_cb:
                     progress_cb(i + 1, len(groups))
-                res = llm.generate_structured_output(_prompt_for(g, fields), schema, 'You are extracting book attributes from a portion of a book. Only report what is present in this portion.')
-                if res.exception is not None:
-                    raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
+                res = _generate_structured(llm, _prompt_for(g, fields), schema, 'You are extracting book attributes from a portion of a book. Only report what is present in this portion.')
                 partials.append(res.data)
             values = _merge_fulltext_partials(fields, partials, llm, max_tok, stage_cb=stage_cb)
         else:
             text = sample_text(chunks, max_tokens=max_tok)
-            res = llm.generate_structured_output(_prompt_for(text, fields), schema, 'You are extracting book attributes. Use only information actually present in the text.')
-            if res.exception is not None:
-                raise RuntimeError(f'attribute extraction failed: {res.error_details or res.exception}')
+            res = _generate_structured(llm, _prompt_for(text, fields), schema, 'You are extracting book attributes. Use only information actually present in the text.')
             data = res.data
             for f in fields:
                 values[f.name] = _normalize_value(getattr(data, f.name, None) if data is not None else None, f.type)

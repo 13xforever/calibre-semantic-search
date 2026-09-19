@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os as _os
 import sys as _sys
 import types
@@ -110,6 +111,35 @@ class ScriptedLLM(FakeLLM):
 
 
 _FIELDS = [utils.AttrField('gender', 'ss_gender', 'text', 'g'), utils.AttrField('tropes', 'ss_tropes', 'tags', 't')]
+
+
+def _model_output_error(kind='parse'):
+    """A failed structured-output response's exception, as calibre would surface it: a
+    ValueError for both invalid JSON ('parse') and valid-JSON-wrong-shape ('shape')."""
+    if kind == 'shape':
+        return ValueError('BookAttributes.tropes: expected array, got str')
+    e = ValueError("The AI model did not return valid JSON, with error: Expecting value: line 1 column 1 (char 0)")
+    e.__cause__ = json.JSONDecodeError('Expecting value', '', 0)
+    return e
+
+
+class FlakyModelOutputLLM(FakeLLM):
+    """Fails its first `fails` calls with a model-output error (or a network OSError),
+    then returns `data`. kind: 'parse' | 'shape' | 'network'. Records every call."""
+
+    def __init__(self, data=None, fails=0, kind='parse'):
+        super().__init__(data)
+        self.fails = fails
+        self.kind = kind
+
+    def generate_structured_output(self, prompt, schema, instructions=''):
+        from types import SimpleNamespace
+
+        self.calls += 1
+        if self.calls <= self.fails:
+            exc = OSError('connection refused') if self.kind == 'network' else _model_output_error(self.kind)
+            return SimpleNamespace(data=None, exception=exc, error_details='traceback')
+        return SimpleNamespace(data=SimpleNamespace(**{f.name: self.data.get(f.name) for f in _FIELDS}), exception=None, error_details='')
 
 
 class FakeApi:
@@ -857,6 +887,66 @@ class TestLanguageNote(unittest.TestCase):
         # merged prose must stay in the field's target language
         p = attributes._reduce_prompt([(self._field('Russian'), ['a', 'b'])], 4000)
         self.assertIn('Write all values in Russian.', p)
+
+
+class TestStructuredRetry(unittest.TestCase):
+    """A model-output failure (invalid JSON or wrong shape) is re-sampled before the book fails."""
+
+    def _settings(self, mode='sampled', context_tokens=8192):
+        settings = utils.Settings()
+        settings.attributes = [f.clone() for f in _FIELDS]
+        settings.attr_mode = mode
+        settings.attr_context_tokens = context_tokens
+        return settings
+
+    def test_is_model_output_error(self):
+        self.assertTrue(attributes._is_model_output_error(_model_output_error('parse')))
+        self.assertTrue(attributes._is_model_output_error(_model_output_error('shape')))
+        self.assertFalse(attributes._is_model_output_error(OSError('connection refused')))
+        self.assertFalse(attributes._is_model_output_error(RuntimeError('boom')))
+        self.assertFalse(attributes._is_model_output_error(None))
+
+    def test_parse_failure_retried_then_succeeds(self):
+        store, api = FakeStore(), FakeApi()
+        llm = FlakyModelOutputLLM({'gender': 'female', 'tropes': ['slow burn']}, fails=1, kind='parse')
+        attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
+        values = attributes.extract_book_attributes(1, api, store, self._settings(), llm=llm)
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(values['gender'], 'female')
+
+    def test_shape_failure_retried_then_succeeds(self):
+        store, api = FakeStore(), FakeApi()
+        llm = FlakyModelOutputLLM({'gender': 'male', 'tropes': ['x']}, fails=1, kind='shape')
+        attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
+        values = attributes.extract_book_attributes(2, api, store, self._settings(), llm=llm)
+        self.assertEqual(llm.calls, 2)
+        self.assertEqual(values['gender'], 'male')
+
+    def test_retries_exhausted_fails_after_three_attempts(self):
+        store, api = FakeStore(), FakeApi()
+        llm = FlakyModelOutputLLM({'gender': 'female'}, fails=99, kind='parse')
+        attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
+        with self.assertRaises(RuntimeError):
+            attributes.extract_book_attributes(3, api, store, self._settings(), llm=llm)
+        self.assertEqual(llm.calls, 3)
+
+    def test_network_failure_not_retried(self):
+        store, api = FakeStore(), FakeApi()
+        llm = FlakyModelOutputLLM({'gender': 'female'}, fails=1, kind='network')
+        attributes._chunks_for_book = lambda s, bid: ['para one', 'para two']
+        with self.assertRaises(RuntimeError):
+            attributes.extract_book_attributes(4, api, store, self._settings(), llm=llm)
+        self.assertEqual(llm.calls, 1)
+
+    def test_fulltext_group_recovers_on_retry(self):
+        store, api = FakeStore(), FakeApi()
+        settings = self._settings(mode='fulltext', context_tokens=3000)
+        attributes._chunks_for_book = lambda s, bid: ['a' * 5000, 'b' * 5000, 'c' * 100]
+        llm = FlakyModelOutputLLM({'gender': 'male', 'tropes': ['x']}, fails=1, kind='parse')
+        values = attributes.extract_book_attributes(5, api, store, settings, llm=llm)
+        # group 1: fail + retry (2 calls), group 2: 1 call -> no reduce (parts agree on gender)
+        self.assertEqual(llm.calls, 3)
+        self.assertEqual(values['gender'], 'male')
 
 
 if __name__ == '__main__':
