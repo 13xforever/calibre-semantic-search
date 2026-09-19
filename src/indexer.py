@@ -1,4 +1,4 @@
-'''Background indexing worker: dirty queue -> extract -> chunk -> embed -> store.
+'''Background indexing worker: indexing queue -> extract -> chunk -> embed -> store.
 
 Runs as a daemon thread. All calibre/Qt access happens through the injected
 `get_new_api()` callable so it works across library switches and is testable.
@@ -147,7 +147,7 @@ def file_info_from_md(fmt: str, md: dict):
 
 
 class Indexer(threading.Thread):
-    """Daemon thread draining the store's dirty queue."""
+    """Daemon thread draining the store's indexing queue (and attribute work)."""
 
     def __init__(self, store: VectorStore, get_new_api, settings_provider, status_cb=None, attr_writer=None, attr_done_cb=None):
         super().__init__(name='SemanticSearchIndexer', daemon=True)
@@ -161,8 +161,6 @@ class Indexer(threading.Thread):
         self.current_book_id: int | None = None
         self._reconcile_lock = threading.Lock()
         self._attr_requested = threading.Event()
-        self._forced_attrs: set[int] = set()
-        self._forced_lock = threading.Lock()
         self._paused = threading.Event()
 
     def stop(self):
@@ -185,12 +183,17 @@ class Indexer(threading.Thread):
         """Ask the worker loop to run the attribute-extraction phase.
 
         If book_id is given, that book is (re-)extracted even when its attributes
-        are already stored; it stays in the force list until the phase has
-        processed it (so a pause mid-phase doesn't lose the request).
+        are already stored; it is recorded in the store's persistent attribute queue
+        at the per-book tier and stays there until the phase has processed it (so a
+        pause or restart mid-phase doesn't lose the request).
         """
         if book_id is not None:
-            with self._forced_lock:
-                self._forced_attrs.add(int(book_id))
+            self.store.enqueue_attrs(book_id)
+        self._attr_requested.set()
+
+    def request_attributes_all(self, book_ids):
+        """Force attribute re-extraction for a whole-library batch (default tier)."""
+        self.store.enqueue_attrs_all(book_ids)
         self._attr_requested.set()
 
     def _pending_attr_books(self, settings) -> list[int]:
@@ -207,14 +210,12 @@ class Indexer(threading.Thread):
         pending books follow newest-first (descending book id).
         """
         attr_pending = self._pending_attr_books(settings)
-        with self._forced_lock:
-            forced = sorted(self._forced_attrs, reverse=True)
+        forced = self.store.queued_attrs_book_ids()
         forced_set = set(forced)
         return forced + [b for b in sorted(attr_pending, reverse=True) if b not in forced_set]
 
     def _drop_forced(self, book_id):
-        with self._forced_lock:
-            self._forced_attrs.discard(int(book_id))
+        self.store.dequeue_attrs(book_id)
 
     def _set_attr_failed(self, book_id: int, error: str | None):
         if error is None:
@@ -229,7 +230,7 @@ class Indexer(threading.Thread):
         work is batched before any LLM calls (the two use different models).
         Returns True if the phase ran to completion, False if it was interrupted —
         by a pause or shutdown, or because new higher-priority work appeared
-        (dirty re-index entries, or a forced re-extraction that is not yet reflected
+        (new indexing-queue entries, or a forced re-extraction that is not yet reflected
         in this list — requested while running, or landed after the list was built)
         — so the main loop can re-prioritize. The remaining books are picked up on
         a later pass with a fresh list.
@@ -252,15 +253,13 @@ class Indexer(threading.Thread):
         total = len(pending)
         errors: list[tuple[int, str]] = []
         pending_set = set(pending)
-        with self._forced_lock:
-            forced_snapshot = set(self._forced_attrs)
+        forced_snapshot = set(self.store.queued_attrs_book_ids())
         for i, bid in enumerate(pending):
             if self.stop_event.is_set() or self._paused.is_set():
                 return False  # interrupted; the phase resumes on a later pass
-            if self.store.dirty_book_ids():
+            if self.store.queued_indexing_book_ids():
                 return False  # new (re)indexing work has priority; resume after it drains
-            with self._forced_lock:
-                forced_now = set(self._forced_attrs)
+            forced_now = set(self.store.queued_attrs_book_ids())
             # Restart when a forced request is not reflected in this list: either it
             # arrived after the snapshot, or the list was built before it landed (so a
             # forced book is missing from it entirely). Re-derive the phase so the
@@ -305,11 +304,11 @@ class Indexer(threading.Thread):
         indexed = {b['id']: b for b in self.store.indexed_books()}
         failed_indexing = set(self.store.failed_book_ids('index'))
         # Every book id the store knows about, so a vanished book is cleaned up
-        # even when it left no books/dirty row behind (failed indexing) and
+        # even when it left no books/queue row behind (failed indexing) and
         # orphans from older versions are swept on the first run.
         known = (
             set(indexed)
-            | set(self.store.dirty_book_ids())
+            | set(self.store.queued_indexing_book_ids())
             | set(self.store.attr_book_ids())
             | set(self.store.file_info_book_ids())
             | set(self.store.failed_book_ids())
@@ -317,7 +316,7 @@ class Indexer(threading.Thread):
         # remove books that vanished from the library
         for bid in sorted(known - lib_ids):
             self.store.clear_book(bid)
-            self.store.remove_dirty(bid)
+            self.store.dequeue_indexing(bid)
             self.store.clear_file_info(bid)
             self.store.clear_attrs(bid)
             self.store.clear_failed(bid)
@@ -336,7 +335,7 @@ class Indexer(threading.Thread):
                 # never indexed; skip if it failed before and the file is unchanged
                 if bid in failed_indexing and fi is not None and fi['fmt'] == fmt and self._same_file(fi, md):
                     continue
-                self.store.add_dirty(bid, 'added')
+                self.store.enqueue_indexing(bid)
                 continue
             if fi is None:
                 # no file info recorded (e.g. stat info was missing at index time)
@@ -344,7 +343,7 @@ class Indexer(threading.Thread):
             else:
                 changed = fi['fmt'] != fmt or not self._same_file(fi, md)
             if changed:
-                self.store.add_dirty(bid, 'changed')
+                self.store.enqueue_indexing(bid)
         try:
             # removed books may have been the last ones of their model
             self.store.cleanup_stale_models(settings.embed.model)
@@ -383,9 +382,9 @@ class Indexer(threading.Thread):
                     was_paused = False
                     idle_since = None
                     self.reconcile()
-                pending = self.store.dirty_book_ids()
+                pending = self.store.queued_indexing_book_ids()
                 if pending:
-                    # Indexing (embedding) has priority: drain the whole dirty queue
+                    # Indexing (embedding) has priority: drain the whole indexing queue
                     # before any attribute work so the two models are used in batches.
                     idle_since = None
                     self._process_one(pending[0])
@@ -448,11 +447,11 @@ class Indexer(threading.Thread):
         formats = api.formats(book_id)
         if not formats:
             self.store.clear_book(book_id)
-            self.store.remove_dirty(book_id)
+            self.store.dequeue_indexing(book_id)
             return
         fmt = pick_format(formats, settings.format_priority)
         if fmt is None:
-            self.store.remove_dirty(book_id)
+            self.store.dequeue_indexing(book_id)
             return
         try:
             md = api.format_metadata(book_id, fmt)
@@ -546,7 +545,7 @@ class Indexer(threading.Thread):
         else:
             self.store.clear_file_info(book_id)
         self.store.clear_failed(book_id, 'index')
-        self.store.remove_dirty(book_id)
+        self.store.dequeue_indexing(book_id)
         self.current_book_id = None
         self._status('done', book_id, n_chunks=len(chunks))
 
@@ -570,6 +569,6 @@ class Indexer(threading.Thread):
             except Exception:
                 pass
         self.store.set_failed(book_id, 'index', msg)
-        self.store.remove_dirty(book_id)
+        self.store.dequeue_indexing(book_id)
         self.current_book_id = None
         self._status('error', book_id, error=msg)

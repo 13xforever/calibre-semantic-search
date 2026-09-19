@@ -23,13 +23,15 @@ from __future__ import annotations
 
 import json
 
-from ..store import SCHEMA_VERSION
+# This step brings v3 -> v4. Later steps (v5) bump further, so target a fixed
+# version rather than store.SCHEMA_VERSION to avoid re-running on newer DBs.
+_TARGET = 4
 
 
 def pending(meta) -> bool:
     """True when failed-book records still live in the meta table."""
     with meta._lock:
-        return meta.conn.execute('PRAGMA user_version').fetchone()[0] < SCHEMA_VERSION
+        return meta.conn.execute('PRAGMA user_version').fetchone()[0] < _TARGET
 
 
 def _parse_entries(raw):
@@ -63,7 +65,7 @@ def upgrade(meta) -> bool:
     One committed transaction; returns True when the version was flipped."""
     with meta._lock:
         conn = meta.conn
-        if conn.execute('PRAGMA user_version').fetchone()[0] >= SCHEMA_VERSION:
+        if conn.execute('PRAGMA user_version').fetchone()[0] >= _TARGET:
             return False
         rows = []
         for key, kind in (('failed', 'index'), ('attr_failed', 'attr')):
@@ -76,6 +78,6 @@ def upgrade(meta) -> bool:
                 rows,
             )
         conn.execute("DELETE FROM meta WHERE key IN ('failed', 'attr_failed')")
-        conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
+        conn.execute(f'PRAGMA user_version={_TARGET}')
         conn.commit()
     return True

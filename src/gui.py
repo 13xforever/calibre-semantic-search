@@ -21,6 +21,7 @@ from qt.core import (
 from .store import (
     BACKEND_KEY,
     MIGRATE_KEY,
+    PRIORITY_BOOK,
     RECOMPRESS_KEY,
     FinalizeCancelled,
     MetaStore,
@@ -193,6 +194,7 @@ class SemanticSearchAction(InterfaceAction):
         self._blocked_want = None
         self._status_dialog = None
         self._attrs_action = None
+        self._attrs_all_action = None
         self._reindex_new_action = None
         self._reindex_action = None
         self._status_sig.connect(self._on_status)
@@ -244,10 +246,6 @@ class SemanticSearchAction(InterfaceAction):
         self._pause_action.triggered.connect(self.toggle_pause)
         self._set_pause_label(False)
         m.addAction(self._pause_action)
-        ac_attrs = self.create_action(spec=(_('Extract attributes...'), 'ai.png', _('Run LLM attribute extraction on indexed books'), None), attr='attrs')
-        ac_attrs.triggered.connect(self.extract_attributes_menu)
-        self._attrs_action = ac_attrs
-        m.addAction(ac_attrs)
         m.addSeparator()
         # && renders as a literal & in Qt action text (a single & would become a mnemonic)
         ac_reindex_new = self.create_action(
@@ -261,6 +259,20 @@ class SemanticSearchAction(InterfaceAction):
         ac_reindex.triggered.connect(self.reindex_all)
         self._reindex_action = ac_reindex
         m.addAction(ac_reindex)
+        ac_attrs = self.create_action(
+            spec=(_('Extract attributes for new && failed books'), 'ai.png', _('Run LLM attribute extraction on indexed books that are missing or failed it; skip complete books'), None),
+            attr='attrs',
+        )
+        ac_attrs.triggered.connect(self.extract_attributes_menu)
+        self._attrs_action = ac_attrs
+        m.addAction(ac_attrs)
+        ac_attrs_all = self.create_action(
+            spec=(_('Extract attributes for all books'), 'ai.png', _('Force LLM attribute re-extraction on every indexed book, even ones that already have attributes'), None),
+            attr='attrs_all',
+        )
+        ac_attrs_all.triggered.connect(self.extract_attributes_all)
+        self._attrs_all_action = ac_attrs_all
+        m.addAction(ac_attrs_all)
         m.addSeparator()
         ac_settings = self.create_action(spec=(_('Settings'), 'config.png', _('Semantic search settings'), None), attr='settings')
         ac_settings.triggered.connect(self.open_settings)
@@ -461,7 +473,7 @@ class SemanticSearchAction(InterfaceAction):
         ft = getattr(self, '_finalize_thread', None)
         busy = ft is not None and ft.is_alive()
         enabled = self.store is not None and not busy
-        for act in (self._pause_action, self._attrs_action, self._reindex_new_action, self._reindex_action):
+        for act in (self._pause_action, self._attrs_action, self._attrs_all_action, self._reindex_new_action, self._reindex_action):
             if act is not None:
                 act.setEnabled(enabled)
         if self.search_action is not None:
@@ -862,7 +874,7 @@ class SemanticSearchAction(InterfaceAction):
             attr_failed = []
         if attr_failed and api is not None:
             lines.append('')
-            lines.append(f'Attribute failures: {len(attr_failed)} (use "Extract attributes..." to retry)')
+            lines.append(f'Attribute failures: {len(attr_failed)} (use "Extract attributes for new & failed books" to retry)')
             for entry in attr_failed:
                 lines.append(f'{self._book_label(entry["book_id"], api)}: {entry["error"]}')
         try:
@@ -1045,7 +1057,7 @@ class SemanticSearchAction(InterfaceAction):
 
             error_dialog(self.gui, _('Semantic search'), f'No usable format for {self._book_label(book_id)}.', show=True)
             return
-        self.store.add_dirty(book_id, 'reindex')
+        self.store.enqueue_indexing(book_id, PRIORITY_BOOK)
 
     def reextract_attributes_book(self, book_id):
         """Force LLM attribute extraction for one book (Book Details context menu)."""
@@ -1109,7 +1121,7 @@ class SemanticSearchAction(InterfaceAction):
                 continue
             queued.append(bid)
         if queued and self.store is store:  # the library may have switched mid-scan
-            store.add_dirty_many(queued, 'reindex')
+            store.enqueue_indexing_many(queued)
 
     def reindex_all(self):
         if not self._ensure_started():
@@ -1147,7 +1159,7 @@ class SemanticSearchAction(InterfaceAction):
                 continue
             queued.append(bid)
         if queued and self.store is store:  # the library may have switched mid-scan
-            store.add_dirty_many(queued, 'reindex')
+            store.enqueue_indexing_many(queued)
 
     def _check_llm_provider(self):
         """Return True if a text-to-text AI provider is configured; show an error otherwise."""
@@ -1191,6 +1203,34 @@ class SemanticSearchAction(InterfaceAction):
         # attribute phase (no dialog: progress shows under "Index status").
         self.store.wipe_failed('attr')
         self.indexer.request_attributes()
+
+    def extract_attributes_all(self):
+        """Force attribute re-extraction on every indexed book (whole-library tier).
+
+        Unlike "Extract attributes for new && failed books" (which only touches books
+        missing or failing extraction), this re-runs the LLM on every indexed book,
+        including ones that already have complete attributes. A confirmation dialog
+        warns about the cost; the work is queued in the store's persistent attribute
+        queue and runs in the indexer worker.
+        """
+        if not self._ensure_started():
+            return
+        if not self._check_llm_provider():
+            return
+        from calibre.gui2 import question_dialog
+
+        ok = question_dialog(
+            self.gui,
+            _('Semantic search'),
+            'Re-extract attributes for ALL books?\n\n'
+            'This forces the LLM to re-read and re-extract the attributes of every indexed book, '
+            'even ones that already have them. It can take a long time and uses many LLM API calls.',
+        )
+        if not ok:
+            return
+        ids = [b['id'] for b in self.store.indexed_books()]
+        if ids:
+            self.indexer.request_attributes_all(ids)
 
     def _api(self):
         try:

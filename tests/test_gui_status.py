@@ -1,3 +1,4 @@
+import contextlib
 import importlib.util
 import os as _os
 import sys as _sys
@@ -88,7 +89,7 @@ class FakeStore:
     def indexed_books(self):
         return self._books
 
-    def dirty_book_ids(self):
+    def queued_indexing_book_ids(self):
         return [3]
 
     def failed_entries(self, kind=None):
@@ -385,7 +386,7 @@ class _ReindexStore:
     def __init__(self, indexed=(), failed=()):
         self._indexed = {bid: n for bid, n in indexed}
         self._failed = set(failed)
-        self.dirty = []
+        self.queued = []
 
     def indexed_books(self):
         return [{'id': b, 'n_chunks': n} for b, n in sorted(self._indexed.items())]
@@ -393,11 +394,11 @@ class _ReindexStore:
     def failed_book_ids(self, kind=None):
         return sorted(self._failed) if kind == 'index' else []
 
-    def add_dirty(self, bid, reason='added'):
-        self.dirty.append((bid, reason))
+    def enqueue_indexing(self, bid, priority=0):
+        self.queued.append(bid)
 
-    def add_dirty_many(self, bids, reason='added'):
-        self.dirty.extend((b, reason) for b in bids)
+    def enqueue_indexing_many(self, bids, priority=0):
+        self.queued.extend(bids)
 
 
 class TestReindexNewAndFailed(unittest.TestCase):
@@ -426,19 +427,19 @@ class TestReindexNewAndFailed(unittest.TestCase):
         a, store = self._action([1, 2, 3, 4], indexed=[(1, 5), (3, 2), (4, 0)], failed=[3])
         gui.SemanticSearchAction.reindex_new_and_failed(a)
         a._reindex_queue_thread.join(timeout=5)
-        self.assertEqual(store.dirty, [(2, 'reindex'), (3, 'reindex'), (4, 'reindex')])
+        self.assertEqual(store.queued, [2, 3, 4])
 
     def test_all_well_indexed_queues_nothing(self):
         a, store = self._action([1, 2], indexed=[(1, 5), (2, 3)])
         gui.SemanticSearchAction.reindex_new_and_failed(a)
         a._reindex_queue_thread.join(timeout=5)
-        self.assertEqual(store.dirty, [])
+        self.assertEqual(store.queued, [])
 
     def test_book_without_formats_skipped(self):
         a, store = self._action([9], formats={9: ()})
         gui.SemanticSearchAction.reindex_new_and_failed(a)
         a._reindex_queue_thread.join(timeout=5)
-        self.assertEqual(store.dirty, [])
+        self.assertEqual(store.queued, [])
 
 
 class _ExtractStore:
@@ -456,9 +457,13 @@ class _ExtractStore:
 class _ExtractIndexer:
     def __init__(self):
         self.requests = []
+        self.all_requests = []
 
     def request_attributes(self, book_id=None):
         self.requests.append(book_id)
+
+    def request_attributes_all(self, book_ids):
+        self.all_requests = list(book_ids)
 
 
 class TestExtractActionsOpenNoDialog(unittest.TestCase):
@@ -488,6 +493,38 @@ class TestExtractActionsOpenNoDialog(unittest.TestCase):
         gui.SemanticSearchAction.extract_attributes_menu(a)
         self.assertEqual(store.wiped, ['attr'])
         self.assertEqual(ix.requests, [None])
+        self.assertEqual(shown, [])
+
+    def _confirm(self, answer):
+        @contextlib.contextmanager
+        def _cm():
+            gui2 = _sys.modules['calibre.gui2']
+            orig = getattr(gui2, 'question_dialog', None)
+            gui2.question_dialog = lambda *a, **k: answer
+            try:
+                yield
+            finally:
+                if orig is None:
+                    delattr(gui2, 'question_dialog')
+                else:
+                    gui2.question_dialog = orig
+
+        return _cm()
+
+    def test_extract_all_confirms_and_queues_every_book(self):
+        a, store, ix, shown = self._action(indexed=[(1, 5), (2, 3)])
+        a.gui = object()
+        with self._confirm(True):
+            gui.SemanticSearchAction.extract_attributes_all(a)
+        self.assertEqual(ix.all_requests, [1, 2])
+        self.assertEqual(shown, [])
+
+    def test_extract_all_cancel_queues_nothing(self):
+        a, store, ix, shown = self._action(indexed=[(1, 5), (2, 3)])
+        a.gui = object()
+        with self._confirm(False):
+            gui.SemanticSearchAction.extract_attributes_all(a)
+        self.assertEqual(ix.all_requests, [])
         self.assertEqual(shown, [])
 
 

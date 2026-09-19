@@ -2,8 +2,9 @@
 
 Public API (used by indexer/dialog/attributes):
   VectorStore(db_path, backend=None) -> facade with:
-     add_dirty / add_dirty_many / dirty_book_ids / remove_dirty
-     book_is_indexed / indexed_books / clear_book / upsert_book
+      enqueue_indexing / enqueue_indexing_many / queued_indexing_book_ids / dequeue_indexing
+      enqueue_attrs / enqueue_attrs_all / queued_attrs_book_ids / dequeue_attrs
+      book_is_indexed / indexed_books / clear_book / upsert_book
      insert_chunk / commit
       search(query_vec, limit, min_score, model=None) -> list[SearchResult]
       search_book(query_vec, book_id, min_score=0.0, model=None) -> list[SearchResult]
@@ -33,7 +34,7 @@ next open re-runs it from scratch); the marker is deleted when it finishes.
 Opening a store whose data cannot be read with the currently installed packages
 raises MissingDependencyError.
 
-Schema versioning: the meta tables (books/dirty/attrs_raw/failed plus the
+Schema versioning: the meta tables (books/queue_indexing/queue_attrs/attrs_raw/failed plus the
 models/formats/file_info registries) are versioned with PRAGMA user_version and
 migrated structurally on open. The sqlite chunk tables migrate from the legacy
 single `chunks` table to slim per-model tables whose text lives in a compressed
@@ -43,7 +44,8 @@ by both reads and writes. At user_version 3 the vector blobs become half floats
 store single precision, and the width is derived from user_version, never stored
 per row. v4 moves failed-book records out of meta JSON into the `failed` table;
 it runs deferred at the end of the schema stage, because its user_version bump
-must follow the v3 blob-format flip (both gate on >= 3). Each migration step
+must follow the v3 blob-format flip (both gate on >= 3); v5 renames the indexing queue to
+queue_indexing and adds the persistent attribute-queue table queue_attrs, also deferred to the end of the schema stage. Each migration step
 lives in the migrations/ package (one module per version step) and is imported
 at its call site below.
 
@@ -477,8 +479,13 @@ def ensure_codec_setup(meta: 'MetaStore'):
 # reach it through the migrations/ steps (one self-contained file per version).
 # user_version >= 3 also marks the vector blob format: half floats (2 bytes per
 # component) instead of single precision; v2 and earlier store f32. v4 moves
-# failed-book records from meta JSON into the `failed` table.
-SCHEMA_VERSION = 4
+# failed-book records from meta JSON into the `failed` table. v5 renames the
+# indexing queue to queue_indexing and adds the persistent attribute-queue table
+# queue_attrs, both keyed by book_id with a priority tier (0 default / 100 per-book).
+SCHEMA_VERSION = 5
+
+PRIORITY_DEFAULT = 0    # bulk/default: initial indexing, bulk re-index, whole-library attr pre-processing
+PRIORITY_BOOK = 100     # explicit per-book (re)index / (re)extraction; 1..99 reserved for future tiers
 
 META_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS books(
@@ -488,10 +495,13 @@ CREATE TABLE IF NOT EXISTS books(
     n_chunks INTEGER NOT NULL DEFAULT 0,
     model_id INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS dirty(
+CREATE TABLE IF NOT EXISTS queue_indexing(
     book_id INTEGER PRIMARY KEY,
-    reason TEXT NOT NULL DEFAULT 'added',
-    added_at INTEGER
+    priority INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS queue_attrs(
+    book_id INTEGER PRIMARY KEY,
+    priority INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS attrs_raw(
     book_id INTEGER PRIMARY KEY,
@@ -538,7 +548,7 @@ CREATE INDEX IF NOT EXISTS idx_{name}_book ON {name}(book_id);
 
 
 class MetaStore:
-    """SQLite bookkeeping: dirty queue, indexed-book registry, key/value meta."""
+    """SQLite bookkeeping: indexing/attribute queues, indexed-book registry, key/value meta."""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -627,39 +637,73 @@ class MetaStore:
         with self._lock:
             return self._meta_keys_locked(prefix)
 
-    # -- dirty queue -------------------------------------------------------------
+    # -- indexing queue ------------------------------------------------------------
 
-    def add_dirty(self, book_id: int, reason: str = 'added'):
+    def enqueue_indexing(self, book_id: int, priority: int = PRIORITY_DEFAULT):
         with self._lock:
             self.conn.execute(
-                'INSERT INTO dirty(book_id, reason, added_at) VALUES(?,?,?) '
-                'ON CONFLICT(book_id) DO UPDATE SET reason=excluded.reason, added_at=excluded.added_at',
-                (book_id, reason, int(time.time())),
+                'INSERT INTO queue_indexing(book_id, priority) VALUES(?,?) '
+                'ON CONFLICT(book_id) DO UPDATE SET priority=MAX(queue_indexing.priority, excluded.priority)',
+                (book_id, priority),
             )
             self.conn.commit()
 
-    def add_dirty_many(self, book_ids, reason: str = 'added'):
-        """Queue many books in a single commit (per-book add_dirty fsyncs do not scale)."""
+    def enqueue_indexing_many(self, book_ids, priority: int = PRIORITY_DEFAULT):
+        """Queue many books in a single commit (per-book enqueue fsyncs do not scale)."""
         if not book_ids:
             return
-        ts = int(time.time())
         with self._lock:
             self.conn.executemany(
-                'INSERT INTO dirty(book_id, reason, added_at) VALUES(?,?,?) '
-                'ON CONFLICT(book_id) DO UPDATE SET reason=excluded.reason, added_at=excluded.added_at',
-                [(b, reason, ts) for b in book_ids],
+                'INSERT INTO queue_indexing(book_id, priority) VALUES(?,?) '
+                'ON CONFLICT(book_id) DO UPDATE SET priority=MAX(queue_indexing.priority, excluded.priority)',
+                [(b, priority) for b in book_ids],
             )
             self.conn.commit()
 
-    def dirty_book_ids(self):
-        """Queued book ids, newest first (descending id: calibre assigns ids in insertion order)."""
+    def queued_indexing_book_ids(self):
+        """Queued book ids, highest priority first then newest (descending id: calibre assigns ids in insertion order)."""
         with self._lock:
-            rows = self.conn.execute('SELECT book_id FROM dirty ORDER BY book_id DESC').fetchall()
+            rows = self.conn.execute('SELECT book_id FROM queue_indexing ORDER BY priority DESC, book_id DESC').fetchall()
         return [r[0] for r in rows]
 
-    def remove_dirty(self, book_id: int):
+    def dequeue_indexing(self, book_id: int):
         with self._lock:
-            self.conn.execute('DELETE FROM dirty WHERE book_id=?', (book_id,))
+            self.conn.execute('DELETE FROM queue_indexing WHERE book_id=?', (book_id,))
+            self.conn.commit()
+
+    # -- attribute queue -----------------------------------------------------------
+
+    def enqueue_attrs(self, book_id: int):
+        """Force attribute re-extraction for one book (per-book tier, jumps ahead of bulk work)."""
+        with self._lock:
+            self.conn.execute(
+                'INSERT INTO queue_attrs(book_id, priority) VALUES(?,?) '
+                'ON CONFLICT(book_id) DO UPDATE SET priority=MAX(queue_attrs.priority, excluded.priority)',
+                (book_id, PRIORITY_BOOK),
+            )
+            self.conn.commit()
+
+    def enqueue_attrs_all(self, book_ids):
+        """Force attribute re-extraction for a whole-library batch (default tier)."""
+        if not book_ids:
+            return
+        with self._lock:
+            self.conn.executemany(
+                'INSERT INTO queue_attrs(book_id, priority) VALUES(?,?) '
+                'ON CONFLICT(book_id) DO UPDATE SET priority=MAX(queue_attrs.priority, excluded.priority)',
+                [(b, PRIORITY_DEFAULT) for b in book_ids],
+            )
+            self.conn.commit()
+
+    def queued_attrs_book_ids(self):
+        """Books pending forced attribute extraction, per-book tier first then newest."""
+        with self._lock:
+            rows = self.conn.execute('SELECT book_id FROM queue_attrs ORDER BY priority DESC, book_id DESC').fetchall()
+        return [r[0] for r in rows]
+
+    def dequeue_attrs(self, book_id: int):
+        with self._lock:
+            self.conn.execute('DELETE FROM queue_attrs WHERE book_id=?', (book_id,))
             self.conn.commit()
 
     # -- books registry ------------------------------------------------------------
@@ -1574,9 +1618,9 @@ class VectorStore:
         actually run. The lancedb 'index' stage is pending while any table with rows
         lacks its vector index or has a long unindexed tail; it needs no marker,
         because the index state lives in the LanceDB dataset manifest. The meta
-        schema (v4: failed records out of meta JSON) is pending until user_version
-        reaches SCHEMA_VERSION; it runs at the end of the 'schema' stage, after the
-        chunk migrations have settled the blob format."""
+        schema (v4: failed records out of meta JSON; v5: queue tables) is pending
+        until user_version reaches SCHEMA_VERSION; it runs at the end of the
+        'schema' stage, after the chunk migrations have settled the blob format."""
         want = self._wanted_backend()
         stages = []
         if self.backend.pending_work() or self._meta_version() < SCHEMA_VERSION:
@@ -1645,11 +1689,18 @@ class VectorStore:
         # so flipping to SCHEMA_VERSION earlier would skip the f16 conversion while
         # search already reads half-float widths.
         cancelled()
-        if self._meta_version() < SCHEMA_VERSION:
+        if self._meta_version() < 4:
             from .migrations.v4 import upgrade as v4_upgrade
 
             say('schema', 'moving failed-book records to their own table')
             v4_upgrade(self.meta)
+            did = True
+        cancelled()
+        if self._meta_version() < SCHEMA_VERSION:
+            from .migrations.v5 import upgrade as v5_upgrade
+
+            say('schema', 'renaming the indexing queue and adding the attribute queue')
+            v5_upgrade(self.meta)
             did = True
         src, dst = self._pending_transfer()
         if dst is not None and dst != src:
@@ -2025,17 +2076,29 @@ class VectorStore:
     def meta_keys(self, prefix=''):
         return self.meta.meta_keys(prefix)
 
-    def add_dirty(self, book_id, reason='added'):
-        self.meta.add_dirty(book_id, reason)
+    def enqueue_indexing(self, book_id, priority=PRIORITY_DEFAULT):
+        self.meta.enqueue_indexing(book_id, priority)
 
-    def add_dirty_many(self, book_ids, reason='added'):
-        self.meta.add_dirty_many(book_ids, reason)
+    def enqueue_indexing_many(self, book_ids, priority=PRIORITY_DEFAULT):
+        self.meta.enqueue_indexing_many(book_ids, priority)
 
-    def dirty_book_ids(self):
-        return self.meta.dirty_book_ids()
+    def queued_indexing_book_ids(self):
+        return self.meta.queued_indexing_book_ids()
 
-    def remove_dirty(self, book_id):
-        self.meta.remove_dirty(book_id)
+    def dequeue_indexing(self, book_id):
+        self.meta.dequeue_indexing(book_id)
+
+    def enqueue_attrs(self, book_id):
+        self.meta.enqueue_attrs(book_id)
+
+    def enqueue_attrs_all(self, book_ids):
+        self.meta.enqueue_attrs_all(book_ids)
+
+    def queued_attrs_book_ids(self):
+        return self.meta.queued_attrs_book_ids()
+
+    def dequeue_attrs(self, book_id):
+        self.meta.dequeue_attrs(book_id)
 
     def book_is_indexed(self, book_id):
         return self.meta.book_is_indexed(book_id)

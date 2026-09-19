@@ -260,7 +260,7 @@ class TestAttrPhase(unittest.TestCase):
             r = inner(*a, **kw)
             if not state['added']:
                 state['added'] = True
-                vs.add_dirty(9, 'reindex')
+                vs.enqueue_indexing(9)
             return r
 
         llm.generate_structured_output = gen
@@ -309,7 +309,7 @@ class TestForcedAttrExtraction(unittest.TestCase):
     def test_request_without_book_id_forces_nothing(self):
         vs, ix, *_ = self._make()
         ix.request_attributes()
-        self.assertEqual(ix._forced_attrs, set())
+        self.assertEqual(vs.queued_attrs_book_ids(), [])
         vs.close()
 
     def test_request_attributes_forces_stored_book(self):
@@ -358,7 +358,7 @@ class TestForcedAttrExtraction(unittest.TestCase):
         ix.request_attributes(7)
         ix._process_attributes(ix._attr_phase_books(settings), settings, llm=FakeLLM({'gender': 'male'}))
         self.assertEqual(vs.get_attrs(7)['gender'], 'male')
-        self.assertEqual(ix._forced_attrs, set())
+        self.assertEqual(vs.queued_attrs_book_ids(), [])
         self.assertEqual(done[0][0], 1)
         vs.close()
 
@@ -368,7 +368,7 @@ class TestForcedAttrExtraction(unittest.TestCase):
         ix.request_attributes(7)
         ix._process_attributes(ix._attr_phase_books(settings), settings, llm=FailingLLM())
         self.assertEqual(vs.failed_book_ids('attr'), [7])
-        self.assertEqual(ix._forced_attrs, set())
+        self.assertEqual(vs.queued_attrs_book_ids(), [])
         vs.close()
 
     def test_phase_interrupts_on_new_forced_request(self):
@@ -402,7 +402,7 @@ class TestForcedAttrExtraction(unittest.TestCase):
         completed = ix._process_attributes([3, 1], settings, llm=FakeLLM({'gender': 'f'}))
         self.assertTrue(completed)
         self.assertEqual(vs.get_attrs(3)['gender'], 'f')
-        self.assertEqual(ix._forced_attrs, set())
+        self.assertEqual(vs.queued_attrs_book_ids(), [])
         vs.close()
 
     def test_forced_failed_book_jumps_front_during_running_phase(self):
@@ -435,7 +435,7 @@ class TestForcedAttrExtraction(unittest.TestCase):
         vs.close()
 
     def test_stale_phase_list_missing_forced_book_restarts(self):
-        # a forced book that is in _forced_attrs but NOT in the phase list being processed
+        # a forced book that is in the attribute queue but NOT in the phase list being processed
         # (the list was built before the request landed) must still trigger a restart —
         # otherwise the request is silently dropped from this pass and only runs later
         vs, ix, settings, statuses, done = self._make()
@@ -451,6 +451,19 @@ class TestForcedAttrExtraction(unittest.TestCase):
         completed = ix._process_attributes(stale_phase, settings, llm=llm)
         self.assertFalse(completed)  # must restart to include the forced book first
         self.assertEqual(ix._attr_phase_books(settings), [X, 20, 10])
+        vs.close()
+
+    def test_request_attributes_all_queues_whole_library(self):
+        # whole-library force enqueues every indexed book at the default tier; a
+        # per-book request still jumps ahead of it
+        vs, ix, settings, *_ = self._make()
+        for bid in (1, 2, 3):
+            _index_book(vs, bid)
+            vs.set_attrs(bid, {'gender': 'f', 'tropes': []})  # complete -> not normally pending
+        ix.request_attributes_all([1, 2, 3])
+        self.assertEqual(ix._attr_phase_books(settings), [3, 2, 1])
+        ix.request_attributes(2)  # per-book force jumps to the front
+        self.assertEqual(ix._attr_phase_books(settings), [2, 3, 1])
         vs.close()
 
 
@@ -490,10 +503,10 @@ class TestReconcile(unittest.TestCase):
 
     def test_removed_dirty_book_dropped(self):
         vs, ix = self._make([1])
-        vs.add_dirty(3)
+        vs.enqueue_indexing(3)
         ix.reconcile()
         # book 3 vanished from the library; book 1 (present, unindexed) is queued
-        self.assertNotIn(3, vs.dirty_book_ids())
+        self.assertNotIn(3, vs.queued_indexing_book_ids())
 
     def test_preexisting_orphans_swept(self):
         # rows left behind by older versions: attrs_raw + fileinfo with no books/dirty row
@@ -521,7 +534,7 @@ class TestReconcile(unittest.TestCase):
         vs.set_file_info(3, 'EPUB', 100, 1234)
         vs.set_failed(3, 'index', 'no meaningful text extracted (0 chars from EPUB)')
         ix.reconcile()
-        self.assertNotIn(3, vs.dirty_book_ids())
+        self.assertNotIn(3, vs.queued_indexing_book_ids())
         self.assertEqual(vs.failed_book_ids('index'), [3])
         vs.close()
 
@@ -647,7 +660,7 @@ class TestResumeReconcile(unittest.TestCase):
             status_cb=lambda d: None,
             attr_writer=FakeWriter(),
         )
-        vs.add_dirty(1)
+        vs.enqueue_indexing(1)
         ix.pause()
         ix.start()
         try:
@@ -656,7 +669,7 @@ class TestResumeReconcile(unittest.TestCase):
         finally:
             ix.stop()
             ix.join(timeout=5)
-        self.assertEqual(vs.dirty_book_ids(), [1])
+        self.assertEqual(vs.queued_indexing_book_ids(), [1])
         self.assertFalse(vs.book_is_indexed(1))
         vs.close()
 
@@ -681,7 +694,7 @@ class TestProcessOneUnexpectedError(unittest.TestCase):
         ix = indexer.Indexer(
             store=vs, get_new_api=lambda: api, settings_provider=lambda: settings, status_cb=statuses.append
         )
-        vs.add_dirty(58)
+        vs.enqueue_indexing(58)
         orig_extract = indexer.extract_book_pages
         orig_chunks = indexer.chunks_from_pages
 
@@ -699,7 +712,7 @@ class TestProcessOneUnexpectedError(unittest.TestCase):
         entries = {e['book_id']: e['error'] for e in vs.failed_entries('index')}
         self.assertIn(58, entries)
         self.assertIn('internal error', entries[58])
-        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertNotIn(58, vs.queued_indexing_book_ids())
         self.assertIn('error', [s['state'] for s in statuses])
         vs.close()
 
@@ -724,7 +737,7 @@ class TestZeroChunkGuard(unittest.TestCase):
         ix = indexer.Indexer(
             store=vs, get_new_api=lambda: api, settings_provider=lambda: settings, status_cb=statuses.append
         )
-        vs.add_dirty(bid)
+        vs.enqueue_indexing(bid)
         return vs, ix, statuses
 
     def test_no_text_fails_book(self):
@@ -738,7 +751,7 @@ class TestZeroChunkGuard(unittest.TestCase):
         entries = {e['book_id']: e['error'] for e in vs.failed_entries('index')}
         self.assertIn(58, entries)
         self.assertIn('no meaningful text extracted (0 chars from EPUB)', entries[58])
-        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertNotIn(58, vs.queued_indexing_book_ids())
         self.assertFalse(vs.book_is_indexed(58))
         # file info recorded so reconcile does not auto-retry an unchanged file
         self.assertEqual(vs.get_file_info(58)['fmt'], 'EPUB')
@@ -757,7 +770,7 @@ class TestZeroChunkGuard(unittest.TestCase):
         entries = {e['book_id']: e['error'] for e in vs.failed_entries('index')}
         self.assertIn(58, entries)
         self.assertIn('no meaningful text extracted', entries[58])
-        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertNotIn(58, vs.queued_indexing_book_ids())
         self.assertFalse(vs.book_is_indexed(58))
         vs.close()
 
@@ -775,7 +788,7 @@ class TestZeroChunkGuard(unittest.TestCase):
         entries = {e['book_id']: e['error'] for e in vs.failed_entries('index')}
         self.assertIn(58, entries)
         self.assertIn('chunking produced no chunks from', entries[58])
-        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertNotIn(58, vs.queued_indexing_book_ids())
         self.assertFalse(vs.book_is_indexed(58))
         vs.close()
 
@@ -801,7 +814,7 @@ class TestZeroChunkGuard(unittest.TestCase):
             embed_client_mod.EmbedClient = orig_cl
         self.assertEqual(vs.failed_book_ids(), [])
         self.assertTrue(vs.book_is_indexed(58))
-        self.assertNotIn(58, vs.dirty_book_ids())
+        self.assertNotIn(58, vs.queued_indexing_book_ids())
         self.assertIn('done', [s['state'] for s in statuses])
         vs.close()
 

@@ -193,7 +193,7 @@ HELP_ATTR_MODE = _(
 HELP_AUTO_ATTR = _(
     'When enabled, the plugin runs LLM attribute extraction automatically once a book finishes indexing — '
     'indexing and attributes run as one pipeline (all embeddings first, then all attribute calls), reported in '
-    'the same status dialog. Disable this to only extract when you click "Extract attributes..." from the menu.'
+    'the same status dialog. Disable this to only extract when you click "Extract attributes for new & failed books" from the menu.'
 )
 
 HELP_ATTR_ENABLED = _(
@@ -226,7 +226,7 @@ HELP_ATTR_LANGUAGE = _(
 )
 HELP_ATTR_TABLE = _(
     "Attribute fields extracted by the LLM into calibre custom columns. Toggle 'Enabled', edit names, "
-    "types and descriptions, then run 'Extract attributes...' from the Semantic search menu. Changing "
+    "types and descriptions, then run 'Extract attributes for new & failed books' from the Semantic search menu. Changing "
     "the schema marks affected books for re-extraction.\n\n"
     'Extraction needs a text-to-text AI provider configured under Preferences > Plugins > AI Provider '
     '(separate from the embedding model). Search and indexing work without it.'

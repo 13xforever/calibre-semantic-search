@@ -153,11 +153,19 @@ class _LifecycleOps:
         self.assertTrue({901, 903} <= set(s.attr_book_ids()))
         s.clear_attrs(903)
         self.assertEqual(s.get_attrs(903), {})
-        # -- dirty queue ------------------------------------------------------------------
-        s.add_dirty(904, 'added')
-        self.assertIn(904, s.dirty_book_ids())
-        s.remove_dirty(904)
-        self.assertNotIn(904, s.dirty_book_ids())
+        # -- indexing queue ------------------------------------------------------------------
+        s.enqueue_indexing(904)
+        self.assertIn(904, s.queued_indexing_book_ids())
+        s.dequeue_indexing(904)
+        self.assertNotIn(904, s.queued_indexing_book_ids())
+        # -- attribute queue ------------------------------------------------------------------
+        s.enqueue_attrs_all([906, 907])
+        self.assertEqual(s.queued_attrs_book_ids(), [907, 906])
+        s.enqueue_attrs(906)  # per-book tier outranks the whole-library batch
+        self.assertEqual(s.queued_attrs_book_ids(), [906, 907])
+        s.dequeue_attrs(906)
+        s.dequeue_attrs(907)
+        self.assertEqual(s.queued_attrs_book_ids(), [])
         # -- failed books ---------------------------------------------------------------
         s.wipe_failed('index')  # start from a known state (scenario fixtures may seed rows)
         s.wipe_failed('attr')
@@ -215,7 +223,7 @@ class _LifecycleOps:
         self.assertEqual(s.book_chunks_text(905), ['book 905 chunk 1'])
         self.assertEqual(s.get_attrs(901)['title'], 'Ops Book One')
         self.assertEqual(s.get_attrs(903), {})
-        self.assertNotIn(904, s.dirty_book_ids())
+        self.assertNotIn(904, s.queued_indexing_book_ids())
         self.assertNotIn(901, s.file_info_book_ids())
         self.assertEqual(s.failed_entries('index'), [{'book_id': 901, 'kind': 'index', 'error': 'boom again'}])
         self.assertEqual(s.failed_book_ids('attr'), [])
@@ -287,7 +295,9 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
         self.assertEqual(s.get_file_info(1), {'fmt': 'EPUB', 'size': 717102, 'mtime_s': 1598092103})
         self.assertEqual(s.get_file_info(2)['mtime_s'], 1209541068)
         self.assertEqual(s.meta_keys('fileinfo:'), [])
-        self.assertEqual(sorted(s.dirty_book_ids()), [50, 51])
+        with s.meta._lock:  # pre-finalize: the legacy dirty rows still sit in the old table
+            legacy_dirty = sorted(r[0] for r in c.execute('SELECT book_id FROM dirty').fetchall())
+        self.assertEqual(legacy_dirty, [50, 51])
         self.assertEqual(s.get_attrs(1), {'title': 'Legacy Book One'})
         # migrated DB has no stored pause state -> starts paused by default
         self.assertEqual(s.get_meta('indexing_status', 'paused'), 'paused')
@@ -323,6 +333,15 @@ class TestSqliteLegacyV0(_LifecycleOps, unittest.TestCase):
         self.assertEqual(s.failed_entries('attr'), [{'book_id': 1, 'kind': 'attr', 'error': 'llm timeout'}])
         self.assertIsNone(s.get_meta('failed'))
         self.assertIsNone(s.get_meta('attr_failed'))
+        # v5 renamed dirty -> queue_indexing: legacy rows map to the default tier and the
+        # old table (with its reason/added_at columns) is dropped
+        with s.meta._lock:
+            qcols = {r[1] for r in c.execute('PRAGMA table_info(queue_indexing)').fetchall()}
+            qprio = dict(c.execute('SELECT book_id, priority FROM queue_indexing').fetchall())
+            has_dirty = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dirty'").fetchone() is not None
+        self.assertEqual(qcols, {'book_id', 'priority'})
+        self.assertEqual(qprio, {50: 0, 51: 0})
+        self.assertFalse(has_dirty)
         self.assertFalse(s.needs_finalize())
         res = s.search([1.0] * self.LEGACY_DIM, limit=5)
         self.assertEqual((res[0].book_id, res[0].chunk_no), (1, 0))
@@ -885,8 +904,14 @@ class TestFailedTableUpgrade(_MigrateOps, unittest.TestCase):
         self.assertEqual(s.failed_entries('attr'), [{'book_id': 602, 'kind': 'attr', 'error': 'llm timeout'}])
         self.assertIsNone(s.get_meta('failed'))
         self.assertIsNone(s.get_meta('attr_failed'))
-        # only the v4 step ran in this pass — no chunk-table migration
-        self.assertEqual(stages, [('schema', 'moving failed-book records to their own table')])
+        # only the meta-schema steps (v4 + v5) ran in this pass — no chunk-table migration
+        self.assertEqual(
+            stages,
+            [
+                ('schema', 'moving failed-book records to their own table'),
+                ('schema', 'renaming the indexing queue and adding the attribute queue'),
+            ],
+        )
         self._check(s)  # data intact
 
     def test_latest_db_has_no_schema_work(self):

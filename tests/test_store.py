@@ -267,12 +267,12 @@ class TestVectorStore(_SearchBookMixin, _DeleteChunkMixin, unittest.TestCase):
 
     def test_dirty_queue(self):
         s = self.s
-        s.add_dirty(1, 'added')
-        s.add_dirty(2, 'changed')
+        s.enqueue_indexing(1)
+        s.enqueue_indexing(2)
         # newest first: descending book id (calibre assigns ids in insertion order)
-        self.assertEqual(s.dirty_book_ids(), [2, 1])
-        s.remove_dirty(1)
-        self.assertEqual(s.dirty_book_ids(), [2])
+        self.assertEqual(s.queued_indexing_book_ids(), [2, 1])
+        s.dequeue_indexing(1)
+        self.assertEqual(s.queued_indexing_book_ids(), [2])
 
     def test_clear_book(self):
         s = self.s
@@ -310,17 +310,41 @@ class TestVectorStore(_SearchBookMixin, _DeleteChunkMixin, unittest.TestCase):
         self.assertEqual(s.get_attrs(4), {})
         self.assertEqual(s.attr_book_ids(), [5])
 
-    def test_add_dirty_many(self):
+    def test_enqueue_indexing_many(self):
         s = self.s
-        s.add_dirty_many([1, 2, 3], 'reindex')
-        self.assertEqual(s.dirty_book_ids(), [3, 2, 1])
-        # same upsert semantics as add_dirty: no duplicates, reason updated
-        s.add_dirty(2, 'changed')
-        self.assertEqual(sorted(s.dirty_book_ids()), [1, 2, 3])
-        s.remove_dirty(2)
-        self.assertEqual(sorted(s.dirty_book_ids()), [1, 3])
-        s.add_dirty_many([], 'x')  # empty is a no-op, not an error
-        self.assertEqual(sorted(s.dirty_book_ids()), [1, 3])
+        s.enqueue_indexing_many([1, 2, 3])
+        self.assertEqual(s.queued_indexing_book_ids(), [3, 2, 1])
+        # upsert keeps the highest priority tier: no duplicates on re-enqueue
+        s.enqueue_indexing(2)
+        self.assertEqual(sorted(s.queued_indexing_book_ids()), [1, 2, 3])
+        s.dequeue_indexing(2)
+        self.assertEqual(sorted(s.queued_indexing_book_ids()), [1, 3])
+        s.enqueue_indexing_many([])  # empty is a no-op, not an error
+        self.assertEqual(sorted(s.queued_indexing_book_ids()), [1, 3])
+
+    def test_queue_indexing_priority(self):
+        s = self.s
+        # default-tier books are ordered newest-first; a per-book (high) tier jumps ahead
+        s.enqueue_indexing(1)
+        s.enqueue_indexing(2)
+        s.enqueue_indexing(3, store.PRIORITY_BOOK)
+        self.assertEqual(s.queued_indexing_book_ids(), [3, 2, 1])
+        # re-enqueueing a high-tier book at the default tier must not downgrade it
+        s.enqueue_indexing(3)
+        self.assertEqual(s.queued_indexing_book_ids(), [3, 2, 1])
+
+    def test_attr_queue(self):
+        s = self.s
+        # whole-library (default) batch first, then a per-book force jumps to the front
+        s.enqueue_attrs_all([1, 2, 3])
+        self.assertEqual(s.queued_attrs_book_ids(), [3, 2, 1])
+        s.enqueue_attrs(2)
+        self.assertEqual(s.queued_attrs_book_ids(), [2, 3, 1])
+        # a whole-library enqueue never downgrades an existing per-book row
+        s.enqueue_attrs_all([2])
+        self.assertEqual(s.queued_attrs_book_ids(), [2, 3, 1])
+        s.dequeue_attrs(2)
+        self.assertEqual(s.queued_attrs_book_ids(), [3, 1])
 
     def test_attrs_fields(self):
         s = self.s
