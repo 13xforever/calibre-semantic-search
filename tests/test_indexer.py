@@ -405,6 +405,54 @@ class TestForcedAttrExtraction(unittest.TestCase):
         self.assertEqual(ix._forced_attrs, set())
         vs.close()
 
+    def test_forced_failed_book_jumps_front_during_running_phase(self):
+        # a book that FAILED attribute extraction is not normally pending; re-extracting
+        # it mid-phase must restart the phase with it first (same as any forced request)
+        vs, ix, settings, statuses, done = self._make()
+        for bid in (10, 20, 30):
+            _index_book(vs, bid)  # pending (no attrs)
+        X = 5
+        _index_book(vs, X)
+        vs.set_failed(X, 'attr', 'old failure')
+        self.assertEqual(ix._attr_phase_books(settings), [30, 20, 10])
+        llm = FakeLLM({'gender': 'f'})
+        inner = llm.generate_structured_output
+        state = {'forced': False}
+
+        def gen(*a, **kw):
+            r = inner(*a, **kw)
+            if not state['forced']:
+                state['forced'] = True
+                ix.request_attributes(X)  # user re-extracts the failed book mid-phase
+            return r
+
+        llm.generate_structured_output = gen
+        completed = ix._process_attributes(ix._attr_phase_books(settings), settings, llm=llm)
+        self.assertFalse(completed)
+        # the first book finished before the request arrived; restarting puts X first
+        self.assertEqual(vs.get_attrs(30)['gender'], 'f')
+        self.assertEqual(ix._attr_phase_books(settings), [X, 20, 10])
+        vs.close()
+
+    def test_stale_phase_list_missing_forced_book_restarts(self):
+        # a forced book that is in _forced_attrs but NOT in the phase list being processed
+        # (the list was built before the request landed) must still trigger a restart —
+        # otherwise the request is silently dropped from this pass and only runs later
+        vs, ix, settings, statuses, done = self._make()
+        for bid in (10, 20):
+            _index_book(vs, bid)  # pending
+        X = 5
+        _index_book(vs, X)
+        vs.set_failed(X, 'attr', 'old failure')
+        ix.request_attributes(X)  # X is now forced
+        # simulate a phase list computed before request_attributes(X): it has no X
+        stale_phase = [20, 10]
+        llm = FakeLLM({'gender': 'f'})
+        completed = ix._process_attributes(stale_phase, settings, llm=llm)
+        self.assertFalse(completed)  # must restart to include the forced book first
+        self.assertEqual(ix._attr_phase_books(settings), [X, 20, 10])
+        vs.close()
+
 
 class TestReconcile(unittest.TestCase):
     def setUp(self):

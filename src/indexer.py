@@ -229,9 +229,10 @@ class Indexer(threading.Thread):
         work is batched before any LLM calls (the two use different models).
         Returns True if the phase ran to completion, False if it was interrupted —
         by a pause or shutdown, or because new higher-priority work appeared
-        (dirty re-index entries, or a forced re-extraction requested while the
-        phase is running) — so the main loop can re-prioritize. The remaining
-        books are picked up on a later pass with a fresh list.
+        (dirty re-index entries, or a forced re-extraction that is not yet reflected
+        in this list — requested while running, or landed after the list was built)
+        — so the main loop can re-prioritize. The remaining books are picked up on
+        a later pass with a fresh list.
         """
         if llm is None:
             try:
@@ -250,6 +251,7 @@ class Indexer(threading.Thread):
 
         total = len(pending)
         errors: list[tuple[int, str]] = []
+        pending_set = set(pending)
         with self._forced_lock:
             forced_snapshot = set(self._forced_attrs)
         for i, bid in enumerate(pending):
@@ -258,8 +260,13 @@ class Indexer(threading.Thread):
             if self.store.dirty_book_ids():
                 return False  # new (re)indexing work has priority; resume after it drains
             with self._forced_lock:
-                if self._forced_attrs - forced_snapshot:
-                    return False  # a forced re-extraction was requested; restart so it goes first
+                forced_now = set(self._forced_attrs)
+            # Restart when a forced request is not reflected in this list: either it
+            # arrived after the snapshot, or the list was built before it landed (so a
+            # forced book is missing from it entirely). Re-derive the phase so the
+            # forced book goes first instead of being dropped for this pass.
+            if (forced_now - forced_snapshot) or (forced_now - pending_set):
+                return False  # a forced re-extraction must go first; restart to include it
             self._status('attributes', bid, done=i + 1, total=total)
 
             def progress(d, t, _bid=bid, _i=i):
