@@ -1,6 +1,7 @@
 import os as _os
 import sys as _sys
 import unittest
+from unittest import mock
 
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from util import load
@@ -74,7 +75,7 @@ class TestEstimateTokens(unittest.TestCase):
 
     def test_cjk_is_denser_than_cyrillic(self):
         self.assertGreater(chunker.estimate_tokens('中' * 100), chunker.estimate_tokens('x' * 100))
-        self.assertEqual(chunker.estimate_tokens('中' * 1000), 1200)
+        self.assertEqual(chunker.estimate_tokens('中' * 1000), 1450)
 
     def test_mixed_scripts(self):
         # 350 latin (100 tokens) + 1000 cyrillic (667 tokens)
@@ -143,7 +144,7 @@ class TestOversizedParagraph(unittest.TestCase):
 
     def test_splitter_preserves_text_exactly(self):
         para = self._big_para()
-        pieces = chunker._split_to_budget(para, 4032 - 150 * 1.2, 1000)
+        pieces = chunker._split_to_budget(para, 4032 - 150 * chunker.DENSE_TOKENS_PER_CHAR, 1000)
         self.assertEqual(''.join(pieces), para)
 
     def test_giant_cjk_paragraph_is_split_and_capped(self):
@@ -171,7 +172,7 @@ class TestOversizedParagraph(unittest.TestCase):
             self.assertLessEqual(chunker.estimate_tokens(c.text), 4032)
 
     def test_cjk_chunks_respect_token_cap(self):
-        paras = ['中' * 800 for _ in range(6)]  # 800 CJK chars = 960 tokens each
+        paras = ['中' * 800 for _ in range(6)]  # 800 CJK chars = 1160 tokens each
         chunks = chunker.group_paragraphs(paras, [[] for _ in paras], 100000, 0, max_tokens=2000)
         self.assertGreater(len(chunks), 1)
         for c in chunks:
@@ -210,6 +211,55 @@ class TestPageToParagraphs(unittest.TestCase):
         html = '<body><script>var x=1;</script><style>.a{}</style><p>Visible text</p></body>'
         paras, paths = chunker.page_to_paragraphs(html)
         self.assertEqual(paras, ['Visible text'])
+
+
+class TestParsePageEncoding(unittest.TestCase):
+    """Pages without a charset declaration must not be decoded as windows-1252
+    when the lenient str-parse fails: calibre's libxml2 raises 'internal error'
+    on certain non-ASCII characters, and calibre strips <meta charset> from its
+    parsed trees, so bare UTF-8 bytes would otherwise be misread (CJK text
+    becomes cp1252 mojibake). Well-formed pages are recovered via strict XML;
+    the final byte fallback carries an explicit UTF-8 declaration."""
+
+    PAGE = (
+        '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="ja">'
+        '<head><title>t</title></head>'
+        '<body><p>\u300c\u8a71\u3053\u3046\u300d\u306b\u9ad8\u901f\u3067\u8fd4\u3057\u305f\u3002'
+        '<ruby>\u50b7<rt>\u3046</rt></ruby>\u3000\u96fb\u78c1\u5c04\u51fa\u6a5f\u578b \u2019\U0001F600</p></body></html>'
+    )
+
+    def _assert_clean(self, root):
+        text = ''.join(root.itertext())
+        self.assertIn('\u300c\u8a71\u3053\u3046\u300d', text)
+        self.assertIn('\u96fb\u78c1\u5c04\u51fa\u6a5f\u578b', text)
+        # cp1252 mojibake markers: 'ã' and C1 control characters
+        self.assertNotIn('\u00e3', text)
+        self.assertFalse(any(0x80 <= ord(c) <= 0x9f for c in text))
+
+    def test_well_formed_cjk_page_without_charset(self):
+        root = chunker.parse_page(self.PAGE)
+        self._assert_clean(root)
+
+    def test_str_parse_failure_still_yields_clean_text(self):
+        # Simulate the 'internal error' calibre's libxml2 raises on str input:
+        # only the str call fails; byte calls behave as they really do.
+        real_fromstring = chunker.lhtml.fromstring
+
+        def flaky(source):
+            if isinstance(source, str):
+                raise chunker.etree.XMLSyntaxError('internal error', None, 0, 0)
+            return real_fromstring(source)
+
+        with mock.patch.object(chunker.lhtml, 'fromstring', flaky):
+            root = chunker.parse_page(self.PAGE)
+        self._assert_clean(root)
+
+    def test_bytes_fallback_declares_utf8(self):
+        # The prolog is what makes the final fallback decode as UTF-8 in every
+        # libxml2 build; without it, undeclared bytes default to windows-1252.
+        raw = self.PAGE.encode('utf-8')
+        root = chunker.lhtml.fromstring(b'<?xml version="1.0" encoding="utf-8"?>' + raw)
+        self._assert_clean(root)
 
 
 class TestInlineRuns(unittest.TestCase):

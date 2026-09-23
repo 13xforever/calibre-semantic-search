@@ -24,12 +24,18 @@ def parse_page(html: str):
     """Parse a spine page into an element tree.
 
     The lenient HTML parser is tried first (pages may carry malformed markup),
-    then the same document as raw UTF-8 bytes in HTML mode, then strict XML.
-    The byte fallbacks are required because calibre's bundled libxml2 (2.15.x)
-    raises 'internal error' when parsing unicode *str* input containing certain
-    non-ASCII characters (e.g. U+2019 or emoji); the same document parses fine
-    as bytes. Namespace declarations are always kept: stripping them breaks
-    prefixed attributes such as ``epub:type`` on otherwise well-formed pages.
+    then strict XML, then the same document as raw UTF-8 bytes in HTML mode.
+    The non-HTML fallbacks are required because calibre's bundled libxml2
+    (2.15.x) raises 'internal error' when parsing unicode *str* input
+    containing certain non-ASCII characters (e.g. U+2019 or emoji). The XML
+    step precedes the byte one: pages produced by extract_book_pages are
+    tostring output, hence well-formed XML needing no charset hint, whereas
+    the HTML parser given bare bytes with no declared encoding decodes high
+    bytes as windows-1252 — and calibre strips <meta charset> from its parsed
+    trees — which would silently mangle CJK text. The final byte fallback
+    therefore carries an explicit UTF-8 declaration. Namespace declarations
+    are always kept: stripping them breaks prefixed attributes such as
+    ``epub:type`` on otherwise well-formed pages.
     """
     try:
         return lhtml.fromstring(html)
@@ -37,9 +43,12 @@ def parse_page(html: str):
         pass
     raw = html.encode('utf-8')
     try:
-        return lhtml.fromstring(raw)
-    except etree.XMLSyntaxError:
         return etree.fromstring(raw)
+    except etree.XMLSyntaxError:
+        pass
+    if not raw.lstrip().startswith(b'<?xml'):
+        raw = b'<?xml version="1.0" encoding="utf-8"?>' + raw
+    return lhtml.fromstring(raw)
 
 
 @dataclass
@@ -59,13 +68,15 @@ class Chunk:
 # tokens keeps chunks inside the model's context window for foreign-language
 # text, at the cost of a few extra chunks. The non-Latin value is calibrated
 # against real BPE tokenizers (llama.cpp embeddings on Russian: ~1.4 chars per
-# token) — BPE handles Cyrillic far worse than Latin, not just a little.
+# token) — BPE handles Cyrillic far worse than Latin, not just a little. The
+# dense value sits above typical BPE output for CJK prose (~1.3-1.5 tokens per
+# char): the real tokenizer depends on the user-configured model, so err high.
 CHARS_PER_TOKEN = 3.5            # Latin text (and fallback)
 NONLATIN_CHARS_PER_TOKEN = 1.5   # Cyrillic, Greek, Arabic, Hebrew, Devanagari, Thai, ...
-DENSE_TOKENS_PER_CHAR = 1.2      # CJK ideographs, kana, hangul: roughly one token per char
+DENSE_TOKENS_PER_CHAR = 1.45     # CJK ideographs, kana, hangul: BPE commonly emits ~1.3-1.5 tokens per char
 CONTEXT_OVERHEAD_TOKENS = 64     # reserved for the model's own wrapper tokens
 
-# Codepoint ranges for scripts that tokenize at ~1 token per character.
+# Codepoint ranges for scripts that tokenize at more than one token per character.
 _DENSE_RANGES = (
     (0x3000, 0x30FF),   # CJK punctuation + Japanese kana
     (0x3400, 0x4DBF),   # CJK extension A
