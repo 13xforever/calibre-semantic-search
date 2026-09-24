@@ -85,6 +85,8 @@ class EmbedClient:
         msg = f'embeddings request failed after {self.max_retries} attempts to {url}: {last_err}'
         if last_detail:
             msg += f'; server said: {last_detail[:300]}'
+        msg += ('; if the embedding server is local (e.g. Unsloth Studio), it may have crashed — '
+                'unload and reload the model there, then retry')
         raise EmbedError(msg)
 
     # A 200 with a bad body (null/short/malformed vectors) is usually transient

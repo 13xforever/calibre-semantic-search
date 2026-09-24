@@ -145,6 +145,8 @@ class TestEmbedClient(unittest.TestCase):
             # the server's error body (read on each retried 5xx) must survive into the final message
             self.assertIn('server said', str(cm.exception))
             self.assertIn('boom', str(cm.exception))
+            # exhausted server-side retries get an actionable hint for local servers
+            self.assertIn('unload and reload the model', str(cm.exception))
         finally:
             _Handler.fail_times = 0
 
