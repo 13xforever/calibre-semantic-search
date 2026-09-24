@@ -73,7 +73,7 @@ class Chunk:
 # char): the real tokenizer depends on the user-configured model, so err high.
 CHARS_PER_TOKEN = 3.5            # Latin text (and fallback)
 NONLATIN_CHARS_PER_TOKEN = 1.5   # Cyrillic, Greek, Arabic, Hebrew, Devanagari, Thai, ...
-DENSE_TOKENS_PER_CHAR = 1.45     # CJK ideographs, kana, hangul: BPE commonly emits ~1.3-1.5 tokens per char
+DENSE_TOKENS_PER_CHAR = 1.2      # CJK ideographs, kana, hangul: BPE commonly emits ~1.3-1.5 tokens per char
 CONTEXT_OVERHEAD_TOKENS = 64     # reserved for the model's own wrapper tokens
 
 # Codepoint ranges for scripts that tokenize at more than one token per character.

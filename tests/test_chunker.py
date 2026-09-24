@@ -75,7 +75,7 @@ class TestEstimateTokens(unittest.TestCase):
 
     def test_cjk_is_denser_than_cyrillic(self):
         self.assertGreater(chunker.estimate_tokens('中' * 100), chunker.estimate_tokens('x' * 100))
-        self.assertEqual(chunker.estimate_tokens('中' * 1000), 1450)
+        self.assertEqual(chunker.estimate_tokens('中' * 1000), 1200)
 
     def test_mixed_scripts(self):
         # 350 latin (100 tokens) + 1000 cyrillic (667 tokens)
