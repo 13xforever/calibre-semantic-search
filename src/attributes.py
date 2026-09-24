@@ -11,30 +11,32 @@ import threading
 from contextlib import contextmanager
 from typing import Annotated, Any, Optional
 
-from .chunker import CHARS_PER_TOKEN, estimate_tokens
+from .chunker import LATIN_TOKENS_PER_CHAR, estimate_tokens
 from .utils import parse_template_kwargs
 
 DEFAULT_CONTEXT_TOKENS = 8192
 OVERHEAD_TOKENS = 1024  # tokens held back for the model's structured output + wrapper; the per-schema prompt size is measured and subtracted separately (see _text_token_budget)
-EST_SAFETY_FACTOR = 1.13  # headroom for estimate_tokens undershooting the model's real tokenizer
+EST_SAFETY_FACTOR = 1.10  # headroom for estimate_tokens undershooting the model's real tokenizer on real book text (rare words, names, mixed scripts)
 MIN_TEXT_CHARS = 2000  # floor so a tiny context limit still yields a usable sample
 STRUCTURED_RETRIES = 2  # re-samples after a model-output failure (invalid JSON or wrong shape) before failing the book
 
 
-def text_budget_chars(context_tokens: int) -> int:
+def text_budget_chars(context_tokens: int, scale: float = 1.0) -> int:
     """Book-text character budget per LLM call, derived from the model's context limit."""
-    return max(MIN_TEXT_CHARS, int((context_tokens - OVERHEAD_TOKENS) * CHARS_PER_TOKEN))
+    return max(MIN_TEXT_CHARS, int((context_tokens - OVERHEAD_TOKENS) / (LATIN_TOKENS_PER_CHAR * scale)))
 
 
-def _text_token_budget(context_tokens: int, fields) -> int:
+def _text_token_budget(context_tokens: int, fields, scale: float = 1.0) -> int:
     """Book-text token budget per LLM call for a schema and model window.
 
     Holds back a safety-scaled slice of the window, then subtracts the actual
     prompt size for THIS schema (which grows with user-added fields/descriptions)
     and the output/wrapper reserve. estimate_tokens can undershoot the model's
-    real tokenizer, so EST_SAFETY_FACTOR keeps realized messages inside the window."""
-    prefix_est = estimate_tokens(_prompt_for('', fields))
-    return max(1, int(context_tokens / EST_SAFETY_FACTOR) - prefix_est - OVERHEAD_TOKENS)
+    real tokenizer, so EST_SAFETY_FACTOR keeps realized messages inside the
+    window; `scale` stretches estimates further for models that tokenize denser
+    than the rate table (Settings.attr_token_scale)."""
+    prefix_est = estimate_tokens(_prompt_for('', fields)) * scale
+    return max(1, int((context_tokens - OVERHEAD_TOKENS) / (EST_SAFETY_FACTOR * scale)) - prefix_est)
 
 
 def column_key(label: str) -> str:
@@ -538,7 +540,7 @@ def extract_book_attributes(book_id: int, new_api, store, settings, llm=None, pr
     chunks = _chunks_for_book(store, book_id)
     if not chunks:
         return {}
-    max_tok = _text_token_budget(settings.attr_context_tokens, fields)
+    max_tok = _text_token_budget(settings.attr_context_tokens, fields, settings.attr_token_scale)
 
     values: dict[str, Any] = {}
     with _with_template_kwargs(llm, settings.attr_template_kwargs):

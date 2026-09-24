@@ -489,9 +489,10 @@ class Indexer(threading.Thread):
             )
             return
 
-        eff_target = min(settings.target_chars, max_chunk_chars(settings.embed_context_tokens))
-        # hard per-chunk token cap so non-Latin scripts stay inside the model's context
-        max_tokens = settings.embed_context_tokens - CONTEXT_OVERHEAD_TOKENS
+        eff_target = min(settings.target_chars, max_chunk_chars(settings.embed_context_tokens, settings.embed_token_scale))
+        # hard per-chunk token cap so non-Latin scripts stay inside the model's context;
+        # embed_token_scale stretches estimates for models denser than the rate table
+        max_tokens = int((settings.embed_context_tokens - CONTEXT_OVERHEAD_TOKENS) / settings.embed_token_scale)
         if kind == 'pages':
             chunks = chunks_from_pages(payload, eff_target, settings.overlap_chars, max_tokens=max_tokens)
         else:

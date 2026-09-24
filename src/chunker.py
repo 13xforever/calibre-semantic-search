@@ -64,16 +64,17 @@ class Chunk:
         return ' > '.join(self.chapter_path)
 
 
-# Chars-per-token by script class. Deliberately conservative: over-estimating
-# tokens keeps chunks inside the model's context window for foreign-language
-# text, at the cost of a few extra chunks. The non-Latin value is calibrated
-# against real BPE tokenizers (llama.cpp embeddings on Russian: ~1.4 chars per
-# token) — BPE handles Cyrillic far worse than Latin, not just a little. The
-# dense value sits above typical BPE output for CJK prose (~1.3-1.5 tokens per
-# char): the real tokenizer depends on the user-configured model, so err high.
-CHARS_PER_TOKEN = 3.5            # Latin text (and fallback)
-NONLATIN_CHARS_PER_TOKEN = 1.5   # Cyrillic, Greek, Arabic, Hebrew, Devanagari, Thai, ...
-DENSE_TOKENS_PER_CHAR = 1.2      # CJK ideographs, kana, hangul: BPE commonly emits ~1.3-1.5 tokens per char
+# Tokens-per-char by script class, calibrated against the Qwen3.8-27B tokenizer
+# (measured on prose: Latin 0.195, Cyrillic 0.28, CJK 0.62 — BPE merges adjacent
+# ideographs, so dense text runs well under one token per char). Values are rounded
+# up; the Arabic tier is unmeasured and kept conservative. Over-estimating keeps
+# chunks inside the model's context window at the cost of a few extra chunks; for
+# models that tokenize denser than Qwen, the user's token-scale setting stretches
+# these rates (see Settings.embed_token_scale / attr_token_scale).
+LATIN_TOKENS_PER_CHAR = 0.20     # Latin text (and fallback: digits, punctuation)
+NONLATIN_TOKENS_PER_CHAR = 0.40  # Cyrillic, Greek, Armenian, Hebrew, Georgian, Devanagari, Thai
+ARABIC_TOKENS_PER_CHAR = 0.60    # Arabic script (unmeasured; conservative tier)
+DENSE_TOKENS_PER_CHAR = 0.70     # CJK ideographs, kana, hangul
 CONTEXT_OVERHEAD_TOKENS = 64     # reserved for the model's own wrapper tokens
 
 # Codepoint ranges for scripts that tokenize at more than one token per character.
@@ -86,25 +87,28 @@ _DENSE_RANGES = (
     (0xFF00, 0xFFEF),   # fullwidth forms
     (0x20000, 0x2EBEF),  # CJK extension B+
 )
+# Arabic-script codepoints get their own conservative tier.
+_ARABIC_RANGES = (
+    (0x0600, 0x06FF),   # Arabic
+    (0x0750, 0x077F),   # Arabic supplement
+    (0xFB50, 0xFDFF),   # Arabic presentation forms A
+    (0xFE70, 0xFEFF),   # Arabic presentation forms B
+)
 # Other non-Latin space-separated scripts with fewer chars per token than Latin.
 _NONLATIN_RANGES = (
     (0x0370, 0x03FF),   # Greek
     (0x0400, 0x052F),   # Cyrillic
     (0x0530, 0x058F),   # Armenian
     (0x0590, 0x05FF),   # Hebrew
-    (0x0600, 0x06FF),   # Arabic
-    (0x0750, 0x077F),   # Arabic supplement
     (0x0900, 0x097F),   # Devanagari
     (0x0E00, 0x0E7F),   # Thai
     (0x10A0, 0x10FF),   # Georgian
-    (0xFB50, 0xFDFF),   # Arabic presentation forms A
-    (0xFE70, 0xFEFF),   # Arabic presentation forms B
 )
 
 
-def _script_counts(text: str) -> tuple[int, int]:
-    """Count (dense, non-latin) chars in `text` per the ranges above."""
-    dense = nonlatin = 0
+def _script_counts(text: str) -> tuple[int, int, int]:
+    """Count (dense, arabic, non-latin) chars in `text` per the ranges above."""
+    dense = arabic = nonlatin = 0
     for ch in text:
         cp = ord(ch)
         if cp < 0x370:
@@ -114,18 +118,24 @@ def _script_counts(text: str) -> tuple[int, int]:
                 dense += 1
                 break
         else:
-            for lo, hi in _NONLATIN_RANGES:
+            for lo, hi in _ARABIC_RANGES:
                 if lo <= cp <= hi:
-                    nonlatin += 1
+                    arabic += 1
                     break
-    return dense, nonlatin
+            else:
+                for lo, hi in _NONLATIN_RANGES:
+                    if lo <= cp <= hi:
+                        nonlatin += 1
+                        break
+    return dense, arabic, nonlatin
 
 
 def estimate_tokens(text: str) -> int:
     """Script-aware token estimate for `text` (conservative; see constants above)."""
-    dense, nonlatin = _script_counts(text)
-    latin = len(text) - dense - nonlatin
-    total = dense * DENSE_TOKENS_PER_CHAR + nonlatin / NONLATIN_CHARS_PER_TOKEN + latin / CHARS_PER_TOKEN
+    dense, arabic, nonlatin = _script_counts(text)
+    latin = len(text) - dense - arabic - nonlatin
+    total = (dense * DENSE_TOKENS_PER_CHAR + arabic * ARABIC_TOKENS_PER_CHAR
+             + nonlatin * NONLATIN_TOKENS_PER_CHAR + latin * LATIN_TOKENS_PER_CHAR)
     return max(1, int(total + 0.5))
 
 
@@ -143,8 +153,9 @@ def _split_to_budget(text: str, max_tokens: float, max_chars: int) -> list[str]:
     cur_tok = 0.0
     hard_cut = max(1, min(int(max_tokens / DENSE_TOKENS_PER_CHAR), max_chars))
     for w in re.findall(r'\S+\s*', text):
-        d, nl = _script_counts(w)
-        w_tok = d * DENSE_TOKENS_PER_CHAR + nl / NONLATIN_CHARS_PER_TOKEN + (len(w) - d - nl) / CHARS_PER_TOKEN
+        d, a, nl = _script_counts(w)
+        w_tok = (d * DENSE_TOKENS_PER_CHAR + a * ARABIC_TOKENS_PER_CHAR + nl * NONLATIN_TOKENS_PER_CHAR
+                 + (len(w) - d - a - nl) * LATIN_TOKENS_PER_CHAR)
         if cur and (len(cur) + len(w) > max_chars or cur_tok + w_tok > max_tokens):
             pieces.append(cur)
             cur, cur_tok = '', 0.0
@@ -162,13 +173,14 @@ def _split_to_budget(text: str, max_tokens: float, max_chars: int) -> list[str]:
 MIN_CHUNK_CHARS = 200
 
 
-def max_chunk_chars(context_tokens: int) -> int:
+def max_chunk_chars(context_tokens: int, scale: float = 1.0) -> int:
     """Largest chunk size (chars, assuming Latin text) within the model's input limit.
 
     Non-Latin scripts are additionally protected by the per-chunk token cap in
-    group_paragraphs (max_tokens), since their chars-per-token is lower.
+    group_paragraphs (max_tokens), since their tokens-per-char is higher. `scale`
+    stretches the estimate for models that tokenize denser than the rate table.
     """
-    return max(MIN_CHUNK_CHARS, int((context_tokens - CONTEXT_OVERHEAD_TOKENS) * CHARS_PER_TOKEN))
+    return max(MIN_CHUNK_CHARS, int((context_tokens - CONTEXT_OVERHEAD_TOKENS) / (LATIN_TOKENS_PER_CHAR * scale)))
 
 
 def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], target_chars: int, overlap_chars: int, max_tokens: int | None = None) -> list[Chunk]:
@@ -228,7 +240,7 @@ def group_paragraphs(paragraphs: list[str], chapter_paths: list[list[str]], targ
         if not p:
             continue
         add_len = len(p) + 2
-        add_tok = (para_toks[i] + 2 / CHARS_PER_TOKEN) if para_toks is not None else 0.0
+        add_tok = (para_toks[i] + 2 * LATIN_TOKENS_PER_CHAR) if para_toks is not None else 0.0
         over_tokens = para_toks is not None and cur_tok + add_tok > max_tokens
         if cur_parts and start_idx is not None and (cur_len + add_len > target_chars or over_tokens):
             text = '\n\n'.join(cur_parts).strip()

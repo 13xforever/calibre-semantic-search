@@ -171,6 +171,15 @@ HELP_EMBED_CONTEXT = _(
     "set it to your model's max sequence length to avoid oversized-chunk errors."
 )
 
+HELP_EMBED_TOKEN_SCALE = _(
+    "Multiplier applied to the built-in token estimates when sizing chunks for this embedding model.\n"
+    "The default of 1.25 is calibrated for Qwen3-Embedding-8B against the built-in (Qwen) rate table; "
+    "use ~1.0 for other Qwen-family embedding models.\n"
+    "Starting points for other families: Llama 3.x ~1.3–1.5 (higher for CJK-heavy libraries), "
+    "DeepSeek / bge-m3 ~1.2 — then adjust against real behaviour: raise it if you get context-overflow "
+    "errors while indexing, lower it to get larger chunks."
+)
+
 HELP_MAX_CHUNKS = _(
     'Safety cap on the number of chunks per book (0 = unlimited). Useful to keep indexing time and '
     'disk usage down for very long books.'
@@ -237,6 +246,16 @@ HELP_CONTEXT = _(
     "LM Studio for the model). The sample size (sampled mode) and group size (fulltext mode) are derived "
     "from this: a fixed overhead is reserved for the prompt and output, and the remainder is the book text "
     "per call. Set it to your model's max context, e.g. 8192 for llama3.1."
+)
+
+HELP_ATTR_TOKEN_SCALE = _(
+    "Multiplier applied to the built-in token estimates when sizing attribute-extraction samples/groups "
+    "for this text-to-text LLM.\n"
+    "The default of 1.0 matches the built-in rate table, which is calibrated for Qwen chat models "
+    "(Qwen3 / Qwen3.8).\n"
+    "Starting points for other families: Llama 3.x ~1.25–1.4, DeepSeek ~1.0–1.2 — then adjust against "
+    "real behaviour: raise it if extraction fails with context-overflow errors, lower it to reduce the "
+    "number of LLM calls."
 )
 
 HELP_TEMPLATE_KWARGS = _(
@@ -325,6 +344,11 @@ class SettingsWidget(QDialog):
         self.i_embed_ctx.setRange(128, 131072)
         self.i_embed_ctx.setSingleStep(128)
         self.i_embed_ctx.setValue(self.s.embed_context_tokens)
+        self.i_embed_scale = QDoubleSpinBox()
+        self.i_embed_scale.setRange(0.5, 3.0)
+        self.i_embed_scale.setSingleStep(0.05)
+        self.i_embed_scale.setDecimals(2)
+        self.i_embed_scale.setValue(self.s.embed_token_scale)
         self.i_maxchunks = QSpinBox()
         self.i_maxchunks.setRange(0, 100000)
         self.i_maxchunks.setValue(self.s.max_chunks_per_book)
@@ -346,6 +370,7 @@ class SettingsWidget(QDialog):
         f2.addRow(_('Target chunk size (chars):'), self.i_target)
         f2.addRow(_('Overlap (chars):'), self.i_overlap)
         f2.addRow(_('Embedding context limit (tokens):'), self.i_embed_ctx)
+        f2.addRow(_('Embedding token scale:'), self.i_embed_scale)
         f2.addRow(_('Max chunks per book:'), self.i_maxchunks)
         f2.addRow(_('Minimum match score (search):'), self.i_min_score)
         f2.addRow(_('Attribute extraction mode:'), self.i_attrmode)
@@ -373,6 +398,16 @@ class SettingsWidget(QDialog):
         ctx_row.addWidget(self.e_ctx)
         ctx_row.addStretch(1)
         av.addLayout(ctx_row)
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel(_('Token estimate scale:')))
+        self.e_attr_scale = QDoubleSpinBox()
+        self.e_attr_scale.setRange(0.5, 3.0)
+        self.e_attr_scale.setSingleStep(0.05)
+        self.e_attr_scale.setDecimals(2)
+        self.e_attr_scale.setValue(self.s.attr_token_scale)
+        scale_row.addWidget(self.e_attr_scale)
+        scale_row.addStretch(1)
+        av.addLayout(scale_row)
         tk_row = QHBoxLayout()
         tk_row.addWidget(QLabel(_('Extra template kwargs (JSON):')))
         self.e_template_kwargs = QLineEdit(self.s.attr_template_kwargs)
@@ -450,6 +485,7 @@ class SettingsWidget(QDialog):
         B(HELP_TARGET, self.i_target, f2.labelForField(self.i_target))
         B(HELP_OVERLAP, self.i_overlap, f2.labelForField(self.i_overlap))
         B(HELP_EMBED_CONTEXT, self.i_embed_ctx, f2.labelForField(self.i_embed_ctx))
+        B(HELP_EMBED_TOKEN_SCALE, self.i_embed_scale, f2.labelForField(self.i_embed_scale))
         B(HELP_MAX_CHUNKS, self.i_maxchunks, f2.labelForField(self.i_maxchunks))
         B(HELP_MIN_SCORE, self.i_min_score, f2.labelForField(self.i_min_score))
         B(HELP_ATTR_MODE, self.i_attrmode, f2.labelForField(self.i_attrmode))
@@ -459,6 +495,7 @@ class SettingsWidget(QDialog):
                 item.setToolTip(key)
         B(HELP_ATTR_TABLE, self.attr_table)
         B(HELP_CONTEXT, self.e_ctx)
+        B(HELP_ATTR_TOKEN_SCALE, self.e_attr_scale)
         B(HELP_TEMPLATE_KWARGS, self.e_template_kwargs)
         B(HELP_AUTO_ATTR, self.e_auto_attr)
         for dep, (_status_fn, _inst, _uninst, purpose) in self._dep_funcs.items():
@@ -708,10 +745,12 @@ class SettingsWidget(QDialog):
         s.target_chars = self.i_target.value()
         s.overlap_chars = self.i_overlap.value()
         s.embed_context_tokens = self.i_embed_ctx.value()
+        s.embed_token_scale = self.i_embed_scale.value()
         s.max_chunks_per_book = self.i_maxchunks.value()
         s.search_min_score = self.i_min_score.value()
         s.attr_mode = self.i_attrmode.currentText()
         s.attr_context_tokens = self.e_ctx.value()
+        s.attr_token_scale = self.e_attr_scale.value()
         s.attr_template_kwargs = raw_kwargs
         s.auto_extract_attributes = bool(self.e_auto_attr.isChecked())
         attrs = []

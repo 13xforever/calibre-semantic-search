@@ -14,7 +14,10 @@ class TestMaxChunkChars(unittest.TestCase):
         self.assertGreater(chunker.max_chunk_chars(8192), chunker.max_chunk_chars(512))
 
     def test_derivation(self):
-        self.assertEqual(chunker.max_chunk_chars(8192), int((8192 - 64) * chunker.CHARS_PER_TOKEN))
+        self.assertEqual(chunker.max_chunk_chars(8192), int((8192 - 64) / chunker.LATIN_TOKENS_PER_CHAR))
+
+    def test_scale_shrinks_cap(self):
+        self.assertLess(chunker.max_chunk_chars(8192, 2.0), chunker.max_chunk_chars(8192, 1.0))
 
     def test_floor(self):
         self.assertGreaterEqual(chunker.max_chunk_chars(0), chunker.MIN_CHUNK_CHARS)
@@ -67,24 +70,32 @@ class TestGroupParagraphs(unittest.TestCase):
 
 class TestEstimateTokens(unittest.TestCase):
     def test_latin(self):
-        self.assertEqual(chunker.estimate_tokens('x' * 350), 100)
+        self.assertEqual(chunker.estimate_tokens('x' * 350), 70)
 
     def test_cyrillic_is_denser_than_latin(self):
         self.assertGreater(chunker.estimate_tokens('а' * 350), chunker.estimate_tokens('x' * 350))
-        self.assertEqual(chunker.estimate_tokens('а' * 1000), 667)
+        self.assertEqual(chunker.estimate_tokens('а' * 1000), 400)
+
+    def test_arabic_is_denser_than_cyrillic(self):
+        self.assertGreater(chunker.estimate_tokens('ا' * 100), chunker.estimate_tokens('а' * 100))
+        self.assertEqual(chunker.estimate_tokens('ا' * 1000), 600)
 
     def test_cjk_is_denser_than_cyrillic(self):
         self.assertGreater(chunker.estimate_tokens('中' * 100), chunker.estimate_tokens('x' * 100))
-        self.assertEqual(chunker.estimate_tokens('中' * 1000), 1200)
+        self.assertEqual(chunker.estimate_tokens('中' * 1000), 700)
 
     def test_mixed_scripts(self):
-        # 350 latin (100 tokens) + 1000 cyrillic (667 tokens)
-        self.assertEqual(chunker.estimate_tokens('x' * 350 + 'а' * 1000), 767)
+        # 350 latin (70 tokens) + 1000 cyrillic (400 tokens)
+        self.assertEqual(chunker.estimate_tokens('x' * 350 + 'а' * 1000), 470)
+
+    def test_mixed_with_arabic(self):
+        # 1000 cyrillic (400 tokens) + 500 arabic (300 tokens)
+        self.assertEqual(chunker.estimate_tokens('а' * 1000 + 'ا' * 500), 700)
 
 
 class TestTokenCap(unittest.TestCase):
     def test_cyrillic_chunks_respect_token_cap(self):
-        paras = ['б' * 500 for _ in range(12)]  # 500 cyrillic chars = 333 tokens each
+        paras = ['б' * 500 for _ in range(12)]  # 500 cyrillic chars = 200 tokens each
         chunks = chunker.group_paragraphs(paras, [[] for _ in paras], 100000, 0, max_tokens=450)
         self.assertGreater(len(chunks), 1)
         for c in chunks:
@@ -97,16 +108,16 @@ class TestOversizedParagraph(unittest.TestCase):
     sent as one request."""
 
     def _big_para(self):
-        return ('тестовое слово для проверки разбиения текста на части в русской книге ' * 130).strip()
+        return ('тестовое слово для проверки разбиения текста на части в русской книге ' * 170).strip()
 
     def _big_cjk_para(self):
         # CJK text has no word boundaries: the whole paragraph is one unbreakable run,
         # so it must go through the hard-cut path, not word packing
-        return '这是一段用于测试超长段落切分行为的中文文本，包含标点符号。' * 175
+        return '这是一段用于测试超长段落切分行为的中文文本，包含标点符号。' * 220
 
     def _big_mixed_para(self):
         # Cyrillic and Latin words interleaved (names, loanwords) — mixed per-char costs
-        return ('тестовое слово levinson english word ' * 300).strip()
+        return ('тестовое слово levinson english word ' * 500).strip()
 
     def test_giant_paragraph_is_split_and_capped(self):
         para = self._big_para()
@@ -124,7 +135,7 @@ class TestOversizedParagraph(unittest.TestCase):
             self.assertLessEqual(len(c.text), 1000 + 150 + 2)
 
     def test_unbreakable_run_is_hard_cut(self):
-        chunks = chunker.group_paragraphs(['а' * 9500], [[]], 1000, 150, max_tokens=4032)
+        chunks = chunker.group_paragraphs(['а' * 12000], [[]], 1000, 150, max_tokens=4032)
         self.assertGreater(len(chunks), 1)
         for c in chunks:
             self.assertLessEqual(chunker.estimate_tokens(c.text), 4032)
@@ -172,7 +183,7 @@ class TestOversizedParagraph(unittest.TestCase):
             self.assertLessEqual(chunker.estimate_tokens(c.text), 4032)
 
     def test_cjk_chunks_respect_token_cap(self):
-        paras = ['中' * 800 for _ in range(6)]  # 800 CJK chars = 1160 tokens each
+        paras = ['中' * 800 for _ in range(6)]  # 800 CJK chars = 560 tokens each
         chunks = chunker.group_paragraphs(paras, [[] for _ in paras], 100000, 0, max_tokens=2000)
         self.assertGreater(len(chunks), 1)
         for c in chunks:
@@ -186,7 +197,7 @@ class TestOversizedParagraph(unittest.TestCase):
         self.assertEqual([c.text for c in a], [c.text for c in b])
 
     def test_plain_text_passthrough(self):
-        text = ('中' * 500 + '\n\n' + '中' * 500)
+        text = ('中' * 800 + '\n\n' + '中' * 800)
         chunks = chunker.split_plain_text(text, 100000, 0, max_tokens=900)
         self.assertGreater(len(chunks), 1)
 

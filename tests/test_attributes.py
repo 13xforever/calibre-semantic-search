@@ -350,8 +350,11 @@ class TestBudget(unittest.TestCase):
     def test_derivation_formula(self):
         self.assertEqual(
             attributes.text_budget_chars(8192),
-            int((8192 - attributes.OVERHEAD_TOKENS) * attributes.CHARS_PER_TOKEN),
+            int((8192 - attributes.OVERHEAD_TOKENS) / attributes.LATIN_TOKENS_PER_CHAR),
         )
+
+    def test_scale_shrinks_budget(self):
+        self.assertLess(attributes.text_budget_chars(8192, 2.0), attributes.text_budget_chars(8192, 1.0))
 
     def test_floor_for_tiny_context(self):
         self.assertGreaterEqual(attributes.text_budget_chars(0), attributes.MIN_TEXT_CHARS)
@@ -359,10 +362,13 @@ class TestBudget(unittest.TestCase):
 
 class TestTokenBudget(unittest.TestCase):
     def test_latin_estimate(self):
-        self.assertEqual(attributes.estimate_tokens('x' * 350), 100)
+        self.assertEqual(attributes.estimate_tokens('x' * 350), 70)
 
     def test_cyrillic_estimate(self):
-        self.assertEqual(attributes.estimate_tokens('ж' * 1000), 667)
+        self.assertEqual(attributes.estimate_tokens('ж' * 1000), 400)
+
+    def test_arabic_estimate(self):
+        self.assertEqual(attributes.estimate_tokens('ا' * 1000), 600)
 
     def test_sample_all_fits(self):
         chunks = ['ж' * 100 for _ in range(3)]  # 40 tokens each
@@ -370,13 +376,13 @@ class TestTokenBudget(unittest.TestCase):
         self.assertEqual(out, '\n\n'.join(chunks))
 
     def test_sample_cyrillic_respects_token_budget(self):
-        chunks = ['ж' * 1200 for _ in range(10)]  # 800 tokens each
+        chunks = ['ж' * 1200 for _ in range(10)]  # 480 tokens each
         out = attributes.sample_text(chunks, max_tokens=1700)
         self.assertIn('ж', out)
         self.assertLessEqual(attributes.estimate_tokens(out), 1700 + 5)
 
     def test_map_split_token_budget(self):
-        chunks = ['ж' * 1200 for _ in range(4)]  # 800 tokens each
+        chunks = ['ж' * 1200 for _ in range(4)]  # 480 tokens each
         groups = attributes._split_for_map(chunks, group_tokens=1700)
         self.assertEqual(len(groups), 2)
         for g in groups:
@@ -408,6 +414,21 @@ class TestTextTokenBudget(unittest.TestCase):
         prefix = attributes.estimate_tokens(attributes._prompt_for('', f))
         self.assertLess(b * attributes.EST_SAFETY_FACTOR + prefix, ctx)
 
+    def test_scale_shrinks_budget(self):
+        f = self._fields()
+        self.assertLess(
+            attributes._text_token_budget(163840, f, 2.0),
+            attributes._text_token_budget(163840, f, 1.0),
+        )
+
+    def test_worst_case_stays_under_window_with_scale(self):
+        ctx = 163840
+        f = self._fields()
+        scale = 1.5
+        b = attributes._text_token_budget(ctx, f, scale)
+        prefix = attributes.estimate_tokens(attributes._prompt_for('', f)) * scale
+        self.assertLess(b * attributes.EST_SAFETY_FACTOR * scale + prefix, ctx)
+
 
 class TestBalancedSplit(unittest.TestCase):
     """fulltext groups are balanced (not full,full,...,leftover) and stay within budget."""
@@ -421,7 +442,7 @@ class TestBalancedSplit(unittest.TestCase):
         self.assertEqual(flat, chunks)
 
     def test_groups_are_evenly_sized(self):
-        chunks = ['a' * 1000 for _ in range(40)]  # ~286 est tokens each
+        chunks = ['a' * 1000 for _ in range(40)]  # ~200 est tokens each
         groups = attributes._split_for_map(chunks, group_tokens=5000)
         ests = [attributes.estimate_tokens(g) for g in groups]
         self.assertGreater(len(groups), 1)
@@ -431,7 +452,7 @@ class TestBalancedSplit(unittest.TestCase):
         chunks = ['a' * 1000 for _ in range(40)]
         budget = 5000
         groups = attributes._split_for_map(chunks, group_tokens=budget)
-        for g in groups:  # each chunk (~286) is far under the budget
+        for g in groups:  # each chunk (~200) is far under the budget
             self.assertLessEqual(attributes.estimate_tokens(g), budget)
 
 

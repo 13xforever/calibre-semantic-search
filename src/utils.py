@@ -89,10 +89,12 @@ class Settings:
     target_chars: int = 1000
     overlap_chars: int = 150
     embed_context_tokens: int = 8192  # embedding model max input (tokens); caps the chunk size
+    embed_token_scale: float = 1.25  # multiplier on token estimates for chunk sizing; default calibrated for Qwen3-Embedding-8B vs the Qwen rate table
     max_chunks_per_book: int = 0  # 0 = unlimited
     search_min_score: float = 0.2  # only show search results with score >= this (0..1)
     attr_mode: str = 'sampled'  # sampled | fulltext (map-reduce)
     attr_context_tokens: int = 8192  # model context window (tokens); sample/group sizes derive from this
+    attr_token_scale: float = 1.0  # multiplier on token estimates for attribute group sizing; the rate table is calibrated to Qwen chat models
     attr_template_kwargs: str = ''  # JSON object passed through as chat_template_kwargs to OpenAI-compatible providers; '' = nothing extra
     auto_extract_attributes: bool = True  # run LLM attribute extraction automatically after indexing
     attributes: list[AttrField] = field(default_factory=lambda: [f.clone() for f in DEFAULT_ATTRIBUTES])
@@ -108,7 +110,7 @@ def _settings_from_dict(data: dict[str, Any]) -> Settings:
     embed = data.get('embed')
     if isinstance(embed, dict):
         ans.embed = EmbedSettings(**{k: v for k, v in embed.items() if k in {f.name for f in fields(EmbedSettings)}})
-    for key in ('vector_backend', 'format_priority', 'target_chars', 'overlap_chars', 'embed_context_tokens', 'max_chunks_per_book', 'search_min_score', 'attr_mode', 'attr_context_tokens', 'attr_template_kwargs', 'auto_extract_attributes'):
+    for key in ('vector_backend', 'format_priority', 'target_chars', 'overlap_chars', 'embed_context_tokens', 'embed_token_scale', 'max_chunks_per_book', 'search_min_score', 'attr_mode', 'attr_context_tokens', 'attr_token_scale', 'attr_template_kwargs', 'auto_extract_attributes'):
         if key in data:
             setattr(ans, key, data[key])
     if ans.vector_backend == 'auto':
