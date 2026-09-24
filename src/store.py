@@ -333,6 +333,7 @@ RECOMPRESS_KEY = 'recompress'  # JSON progress of a pending/in-flight sqlite cod
 # whole table is one batch and this is what keeps the progress bar and cancel alive.
 RECOMPRESS_PROGRESS_EVERY = 50_000
 VEC_MIGRATE_KEY = 'vec_migrate'  # JSON progress of an in-flight f32->f16 vector conversion (migrations.v3; deleted with the final user_version flip)
+INDEX_TARGET_PREFIX = 'index_target_rows:'  # per-lancedb-table rows/partition target of the last index build (migrations.lance_v1 gates on it; the manifest records no usable partition count)
 
 
 def _set_hidden(path):
@@ -1179,6 +1180,22 @@ class SqliteVectorBackend:
         return out
 
 
+def safe_partition_target(dim: int) -> int:
+    """Rows per IVF partition that keeps lance's SQ remap inside u32 index space.
+
+    lancedb 0.38 / lance 11 remap an existing IVF_HNSW_SQ index during optimize()
+    using Arrow fixed-size-list child indices (u32), so a partition whose
+    rows * dimension exceeds 2**32 - 1 aborts the compaction with a RustPanic
+    (lancedb#2866; upstream fix unmerged). Halving the limit leaves headroom for
+    k-means imbalance."""
+    return max(1, (2**32 - 1) // dim // 2)
+
+
+def partition_count(n: int, dim: int) -> int:
+    """IVF partition count for `n` rows of dimension `dim` (at least one)."""
+    return max(1, -(-n // safe_partition_target(dim)))
+
+
 class LanceVectorBackend:
     """Vectors + chunk text in LanceDB (optional dependency).
 
@@ -1189,6 +1206,7 @@ class LanceVectorBackend:
     name = 'lancedb'
 
     def __init__(self, meta: MetaStore):
+        os.environ.setdefault('RUST_BACKTRACE', '1')  # readable backtraces when a lance panic surfaces
         import lancedb  # lazy: optional dependency
 
         self.meta = meta
@@ -1207,12 +1225,16 @@ class LanceVectorBackend:
     # Vectors are stored as half floats (the same lossy storage the sqlite backend
     # uses), so an IVF_HNSW_SQ index over them is worth building only once a table
     # has enough rows; below that, a flat scan wins. The index state lives in the
-    # LanceDB dataset manifest, so no meta marker is needed: an interrupted build
-    # simply leaves "no index" behind and the next open detects it again.
+    # LanceDB dataset manifest, so an interrupted build simply leaves "no index"
+    # behind and the next open detects it again. The one exception is the partition
+    # target: lance's manifest records no usable partition count, so every build
+    # also records its rows/partition target in meta (INDEX_TARGET_PREFIX + table).
+    # That marker is what migrations.lance_v1 uses to spot legacy indexes whose
+    # partitions overflow the u32 SQ-remap limit.
 
     INDEX_TYPE = 'IvfHnswSq'  # as reported by IndexConfig.index_type
-    MERGE_TAIL_ROWS = 1000  # re-merge once this many rows wait unindexed (flat-scan tail cost)
-    PARTITION_TARGET_ROWS = 1_048_576  # LanceDB's default IVF partition size
+    MERGE_TAIL_ROWS = 100_000  # re-merge once this many rows wait unindexed (flat-scan tail cost)
+    NPROBES = 100  # IVF partitions probed per search (harmless when it exceeds the partition count)
 
     def _our_index(self, t):
         """The IndexConfig of our vector index on table `t`, or None."""
@@ -1244,6 +1266,31 @@ class LanceVectorBackend:
                 return True
         return False
 
+    def migration_pending(self) -> bool:
+        """True when a lancedb-side index migration is pending (migrations.lance_v1)."""
+        from .migrations.lance_v1 import needs_upgrade
+
+        return needs_upgrade(self)
+
+    def _dim(self, t) -> int:
+        """Vector dimension of table `t` (from its schema)."""
+        return t.schema.field('vector').type.list_size
+
+    def _create_vector_index(self, t, n: int, name: str):
+        """Build our IVF_HNSW_SQ index over `n` rows and record its partition target."""
+        from lancedb.index import IvfHnswSq
+
+        dim = self._dim(t)
+        t.create_index(
+            'vector',
+            config=IvfHnswSq(
+                distance_type='cosine',
+                num_partitions=partition_count(n, dim),
+                ef_construction=150,
+            ),
+        )
+        self.meta.set_meta(INDEX_TARGET_PREFIX + name, str(safe_partition_target(dim)))
+
     def finalize_index(self, say=None):
         """Build / incrementally update the vector index of every table that needs it.
 
@@ -1254,7 +1301,10 @@ class LanceVectorBackend:
         (arrow-data slice assertion; lancedb 0.38 / lance 11), while compaction without an
         index is fine at any scale. A stale one is refreshed with optimize(), which also
         compacts and prunes fragments — both followed by an aggressive prune so the space
-        of replaced fragments is reclaimed immediately."""
+        of replaced fragments is reclaimed immediately. Oversized legacy indexes are
+        repaired up front by migrations.lance_v1; if optimize() still hits lance's u32
+        SQ-remap overflow (a partition grew past the limit after the build), it is caught
+        below and the index is rebuilt from scratch with safe partitions."""
         for name in sorted(self._table_names()):
             t = self._open_named(name)
             if t is None:
@@ -1275,21 +1325,33 @@ class LanceVectorBackend:
                 # of small fragments panics in lance 11 (arrow-data slice assertion)
                 t.optimize()
                 t.optimize(cleanup_older_than=timedelta(0))
-                from lancedb.index import IvfHnswSq
-
-                t.create_index(
-                    'vector',
-                    config=IvfHnswSq(
-                        distance_type='cosine',
-                        num_partitions=max(1, n // self.PARTITION_TARGET_ROWS),
-                        ef_construction=150,
-                    ),
-                )
+                self._create_vector_index(t, n, name)
             elif (getattr(cfg, 'num_unindexed_rows', 0) or 0) >= self.MERGE_TAIL_ROWS:
                 if say is not None:
                     say('index', f'updating vector index for {name} ({cfg.num_unindexed_rows:,} new rows)')
-                t.optimize()
-                t.optimize(cleanup_older_than=timedelta(0))
+                try:
+                    t.optimize()
+                    t.optimize(cleanup_older_than=timedelta(0))
+                except Exception as e:
+                    if type(e).__name__ != 'RustPanic':
+                        raise
+                    # lance's u32 SQ-remap overflow (lancedb#2866): the compaction aborted
+                    # without committing, so the dataset should still be at its previous
+                    # version — verify that before rebuilding the index from scratch
+                    if say is not None:
+                        say('index', f'rebuilding vector index for {name} after a lance panic')
+                    t = self._open_named(name)
+                    if t.count_rows() != n:
+                        raise RuntimeError(
+                            f'{name}: row count changed ({n:,} -> {t.count_rows():,}) during an aborted '
+                            'optimize; refusing to rebuild the index'
+                        ) from e
+                    old = self._our_index(t)
+                    if old is not None:
+                        t.drop_index(old.name)
+                    t.optimize()
+                    t.optimize(cleanup_older_than=timedelta(0))
+                    self._create_vector_index(t, n, name)
 
     def _table_name(self, model: str) -> str:
         return model_table_name(normalize_model(model or ''))
@@ -1425,7 +1487,7 @@ class LanceVectorBackend:
     def _ann_page(self, t, vec, offset):
         """One page of table `t`'s ANN results (distance order). refine re-scores the
         candidates against the stored vectors, correcting the lossy half-float / SQ index."""
-        return t.search(vec).metric('cosine').limit(self.SEARCH_PAGE).offset(offset).refine_factor(1).to_list()
+        return t.search(vec).metric('cosine').nprobes(self.NPROBES).limit(self.SEARCH_PAGE).offset(offset).refine_factor(1).to_list()
 
     def search(self, query_vec, limit: int, min_score: float, model: str | None = None) -> list[SearchResult]:
         """Top-`limit` books by their best chunk's cosine similarity (one result per book).
@@ -1616,8 +1678,9 @@ class VectorStore:
         the conversion finishes. A marker whose target package is
         missing blocks the open in __init__, so here it always means the work can
         actually run. The lancedb 'index' stage is pending while any table with rows
-        lacks its vector index or has a long unindexed tail; it needs no marker,
-        because the index state lives in the LanceDB dataset manifest. The meta
+        lacks its vector index or has a long unindexed tail (manifest state, no marker
+        needed), or while a lancedb-side migration is pending (lance_v1: oversized IVF
+        partitions, gated by the per-table index_target_rows markers). The meta
         schema (v4: failed records out of meta JSON; v5: queue tables) is pending
         until user_version reaches SCHEMA_VERSION; it runs at the end of the
         'schema' stage, after the chunk migrations have settled the blob format."""
@@ -1631,7 +1694,7 @@ class VectorStore:
             stages.append('backend')
         if self.backend_name == 'sqlite' and self.meta.get_meta(RECOMPRESS_KEY) is not None:
             stages.append('codec')
-        if self.backend_name == 'lancedb' and self.backend.index_pending():
+        if self.backend_name == 'lancedb' and (self.backend.index_pending() or self.backend.migration_pending()):
             stages.append('index')
         return stages
 
@@ -1715,10 +1778,18 @@ class VectorStore:
             did = True
         # evaluated live: a transfer that just finished lands here in the same pass
         cancelled()
-        if self.backend_name == 'lancedb' and self.backend.index_pending():
-            say('index', 'building vector index')
-            self.backend.finalize_index(say)
-            did = True
+        if self.backend_name == 'lancedb' and (self.backend.index_pending() or self.backend.migration_pending()):
+            if self.backend.migration_pending():
+                from .migrations.lance_v1 import upgrade as lance_v1_upgrade
+
+                say('index', 'repairing oversized vector index partitions')
+                lance_v1_upgrade(self.backend, say)
+                did = True
+            cancelled()
+            if self.backend.index_pending():
+                say('index', 'building vector index')
+                self.backend.finalize_index(say)
+                did = True
         cancelled()
         with self.meta._lock:
             av = self.meta.conn.execute('PRAGMA auto_vacuum').fetchone()[0]

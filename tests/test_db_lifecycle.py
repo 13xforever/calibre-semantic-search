@@ -5,6 +5,10 @@ Three scenarios, each exercising the full operation surface:
 2. a brand-new sqlite DB (created at the latest schema)
 3. a lancedb backend (no migrations; created at the latest shape)
 
+Plus targeted scenarios for the lancedb-side migration step (migrations.lance_v1:
+oversized IVF partition repair, marker- and legacy-rule-driven detection) and the
+reactive RustPanic fallback in finalize_index.
+
 For each: insert embeddings for a few books, attributes, search, dirty queue,
 file info, removal of stale data (removed book + abandoned model table), and
 persistence across a reopen.
@@ -479,6 +483,194 @@ class TestLanceDb(_LifecycleOps, unittest.TestCase):
             attr = ctypes.windll.kernel32.GetFileAttributesW(d)
             self.assertNotEqual(attr, -1)
             self.assertTrue(attr & 0x2)
+
+
+class TestLanceIndexMigration(_LifecycleOps, unittest.TestCase):
+    """Scenario 3b: lancedb-side migration v1 (oversized IVF partition repair) and the
+    reactive RustPanic fallback in finalize_index.
+
+    DIM is 4096 (the real embedding dimension): at small dims the pre-fix ~1M-row
+    partitions never overflow lance's u32 SQ-remap limit, so only here can the legacy
+    detection rule be exercised. Not skipped when lancedb is missing — it is a hard
+    test dependency."""
+
+    DIM = 4096
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, 'semantic-search.db')
+        self.s = None
+
+    def tearDown(self):
+        if self.s is not None:
+            self.s.close()
+        self.tmp.cleanup()
+
+    def _indexed_store(self, n=9):
+        s = store.VectorStore(self.path, backend='lancedb')
+        self.s = s
+        for i in range(n):
+            s.insert_chunk(1, _C(i, f'chunk {i}', ['Ch', f'S{i}'], i, i + 1, i * 10), self.MODEL, store.l2_normalize([1.0] * self.DIM))
+        s.commit(1)
+        s.upsert_book(1, 'EPUB', n, self.MODEL)
+        s.finalize_schema()
+        return s
+
+    def _table(self, s):
+        return s.backend._open_table(self.MODEL)
+
+    def test_partition_math(self):
+        for dim in (8, 384, 4096, 8192):
+            target = store.safe_partition_target(dim)
+            self.assertGreaterEqual(target, 1)
+            self.assertLessEqual(target * dim, (2**32 - 1) // 2)
+            for n in (0, 1, 1000, 1_000_000, 5_000_000, 100_000_000):
+                k = store.partition_count(n, dim)
+                self.assertGreaterEqual(k, 1)
+                if n:
+                    self.assertLessEqual(n // k, target)  # average partition stays under the safe target
+
+    def test_build_records_partition_target(self):
+        s = self._indexed_store()
+        tname = s.backend._table_name(self.MODEL)
+        self.assertEqual(s.get_meta(store.INDEX_TARGET_PREFIX + tname), str(store.safe_partition_target(self.DIM)))
+        self.assertFalse(s.needs_finalize())
+
+    def test_v1_repairs_oversized_index(self):
+        s = self._indexed_store()
+        t = self._table(s)
+        tname = s.backend._table_name(self.MODEL)
+        n_before = t.count_rows()
+        # simulate a legacy build whose partitions overflow the u32 SQ-remap limit
+        s.set_meta(store.INDEX_TARGET_PREFIX + tname, str(2**31))
+        self.assertIn('index', s.pending_stages())
+        # patch at class level: _open_named() returns a fresh table object each call
+        dropped = []
+        LanceTable = type(t)
+        orig_drop = LanceTable.drop_index
+        LanceTable.drop_index = lambda self, name: (dropped.append(name), orig_drop(self, name))[1]
+        try:
+            stages = []
+            s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        finally:
+            LanceTable.drop_index = orig_drop
+        self.assertTrue(any('repairing oversized vector index for' in d for _, d in stages))
+        self.assertEqual(len(dropped), 1)
+        # rebuilt with safe partitions, marker rewritten, data intact
+        t2 = s.backend._open_table(self.MODEL)
+        self.assertEqual(s.get_meta(store.INDEX_TARGET_PREFIX + tname), str(store.safe_partition_target(self.DIM)))
+        self.assertIsNotNone(s.backend._our_index(t2))
+        self.assertEqual(t2.count_rows(), n_before)
+        self.assertEqual(s.pending_stages(), [])
+        res = s.search([1.0] * self.DIM, limit=5, min_score=-1.0)
+        self.assertEqual([r.book_id for r in res], [1])
+        # idempotent: a second pass does nothing
+        stages = []
+        s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        self.assertFalse(any(st == 'index' for st, _ in stages))
+
+    def test_v1_legacy_rule_without_marker(self):
+        s = self._indexed_store()
+        t = self._table(s)
+        tname = s.backend._table_name(self.MODEL)
+        s.delete_meta(store.INDEX_TARGET_PREFIX + tname)
+        # small real table: the legacy estimate (n // max(1, n // 1M)) is far under the limit
+        self.assertNotIn('index', s.pending_stages())
+        LanceTable = type(t)
+        orig_count = LanceTable.count_rows
+        try:
+            # a legacy single-partition build of that size overflows at dim 4096
+            LanceTable.count_rows = lambda self, *a, **k: 2_000_000
+            self.assertIn('index', s.pending_stages())
+        finally:
+            LanceTable.count_rows = orig_count
+
+    def test_reactive_panic_fallback(self):
+        s = self._indexed_store(7)
+        t = self._table(s)
+        tname = s.backend._table_name(self.MODEL)
+        n_before = t.count_rows()
+        orig_tail = store.LanceVectorBackend.MERGE_TAIL_ROWS
+        store.LanceVectorBackend.MERGE_TAIL_ROWS = 3
+        try:
+            for i in range(7, 10):
+                s.insert_chunk(1, _C(i, f'chunk {i}', ['Ch', f'S{i}'], i, i + 1, i * 10), self.MODEL, store.l2_normalize([1.0] * self.DIM))
+            s.commit(1)
+            self.assertIn('index', s.pending_stages())
+            # simulate lance's u32 overflow aborting the indexed compaction
+            RustPanic = type('RustPanic', (Exception,), {})
+            calls = {'n': 0}
+            LanceTable = type(t)
+            orig_optimize = LanceTable.optimize
+
+            def boom(self, *a, **k):
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    raise RustPanic('rust future panicked: unknown error')
+                return orig_optimize(self, *a, **k)
+
+            LanceTable.optimize = boom
+            dropped = []
+            orig_drop = LanceTable.drop_index
+            LanceTable.drop_index = lambda self, name: (dropped.append(name), orig_drop(self, name))[1]
+            try:
+                stages = []
+                s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+            finally:
+                LanceTable.optimize = orig_optimize
+                LanceTable.drop_index = orig_drop
+        finally:
+            store.LanceVectorBackend.MERGE_TAIL_ROWS = orig_tail
+        self.assertTrue(any('rebuilding vector index for' in d for _, d in stages))
+        self.assertEqual(len(dropped), 1)
+        # rebuilt with safe partitions, data intact
+        t2 = s.backend._open_table(self.MODEL)
+        self.assertEqual(s.get_meta(store.INDEX_TARGET_PREFIX + tname), str(store.safe_partition_target(self.DIM)))
+        self.assertIsNotNone(s.backend._our_index(t2))
+        self.assertEqual(t2.count_rows(), n_before + 3)
+        self.assertEqual(s.pending_stages(), [])
+        res = s.search([1.0] * self.DIM, limit=5, min_score=-1.0)
+        self.assertEqual([r.book_id for r in res], [1])
+        # idempotent: a second pass does nothing
+        stages = []
+        s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        self.assertFalse(any(st == 'index' for st, _ in stages))
+
+    def test_non_panic_error_propagates(self):
+        s = self._indexed_store(7)
+        t = self._table(s)
+        orig_tail = store.LanceVectorBackend.MERGE_TAIL_ROWS
+        store.LanceVectorBackend.MERGE_TAIL_ROWS = 3
+        try:
+            for i in range(7, 10):
+                s.insert_chunk(1, _C(i, f'chunk {i}', ['Ch', f'S{i}'], i, i + 1, i * 10), self.MODEL, store.l2_normalize([1.0] * self.DIM))
+            s.commit(1)
+            LanceTable = type(t)
+            orig_optimize = LanceTable.optimize
+
+            def boom(self, *a, **k):
+                raise RuntimeError('boom')
+
+            LanceTable.optimize = boom
+            dropped = []
+            orig_drop = LanceTable.drop_index
+            LanceTable.drop_index = lambda self, name: (dropped.append(name), orig_drop(self, name))[1]
+            try:
+                with self.assertRaises(RuntimeError):
+                    s.finalize_schema()
+            finally:
+                LanceTable.optimize = orig_optimize
+                LanceTable.drop_index = orig_drop
+            # the index was left in place and the tail is still pending (retryable)
+            self.assertEqual(dropped, [])
+            self.assertIsNotNone(s.backend._our_index(t))
+            self.assertIn('index', s.pending_stages())
+        finally:
+            store.LanceVectorBackend.MERGE_TAIL_ROWS = orig_tail
+        stages = []
+        s.finalize_schema(progress=lambda st, d: stages.append((st, d)))
+        self.assertFalse(any('rebuilding' in d for _, d in stages))
+        self.assertEqual(s.pending_stages(), [])
 
 
 class _MigrateOps:

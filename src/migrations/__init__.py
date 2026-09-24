@@ -6,6 +6,13 @@ v2.py  single `chunks` table -> slim per-model chunk tables; runs deferred
        in VectorStore.finalize_schema before indexing starts.
 v3.py  float32 -> float16 vector blobs (invalid vectors dropped, their books
        queued for re-indexing); chained after v2 in the same finalize pass.
+v4.py  failed-book records out of meta JSON into their own table; runs in the
+       'schema' stage once user_version >= 4.
+v5.py  indexing queue renamed, attribute queue added (current SCHEMA_VERSION).
+lance_v1.py  lancedb-side step (not part of the sqlite user_version series):
+       drops and rebuilds IVF_HNSW_SQ indexes whose partitions overflow lance's
+       u32 SQ-remap limit; runs in the 'index' stage, gated by the per-table
+       index_target_rows meta markers.
 
 Each upgrade() brings the whole database from one version to the next (touching
 exactly the parts that differ between those versions) and is structural and

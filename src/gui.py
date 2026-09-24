@@ -512,7 +512,13 @@ class SemanticSearchAction(InterfaceAction):
         except FinalizeCancelled:
             pass  # the library was switched away; the new startup owns things now
         except Exception as e:
-            self._finalize_sig.emit(store, e)
+            import traceback
+
+            from calibre.log import logger
+
+            tb = traceback.format_exc()
+            logger.error('semantic search: database finalize failed\n%s', tb)
+            self._finalize_sig.emit(store, (e, tb))
 
     def _emit_finalize_progress(self, stage, detail):
         # called from the finalize thread; marshal to the GUI thread via signal
@@ -524,10 +530,13 @@ class SemanticSearchAction(InterfaceAction):
         if error is not None:
             from calibre.gui2 import error_dialog
 
+            exc, tb = error if isinstance(error, tuple) else (error, '')
+            where = f'\n(last progress: {self._last_finalize[0]}: {self._last_finalize[1]})' if self._last_finalize else ''
+            tail = '\n'.join(tb.splitlines())[-1500:] if tb else ''
             error_dialog(
                 self.gui,
                 'Semantic search',
-                f'Search database migration failed:\n{error!r}\n\nRestart calibre to retry.',
+                f'Search database migration failed:\n{exc!r}{where}\n\nRestart calibre to retry.' + (f'\n\n{tail}' if tail else ''),
                 show=True,
             )
             return
